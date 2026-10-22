@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 import uuid
 
@@ -32,19 +33,40 @@ _T_IMPORT_DONE = time.monotonic()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("agent.server")
 
-# The earliest point this module can observe, so process age includes the imports
-# above. monotonic, not time.time(): the wall clock inherits its base from the image
-# the microVM is restored from, so time.time() at import can be minutes off —
-# measured once at 777 s of "process age" inside a kernel up for 25 s.
-_START = _T_IMPORT_START
-# Identifies the process serving a request, generated per start-up. AgentCore has no
-# instance-level API, so self-reporting is the only way to see turnover at all. It is
-# per PROCESS, not per microVM. Note what it cannot do: prove isolation. Anything
-# baked into the image or snapshot is copied to every restore — the kernel boot_id is
-# identical across concurrent sessions for exactly that reason — so only post-start
-# writes distinguish environments (verified separately: concurrent sessions cannot
-# see each other's files).
-_INSTANCE = uuid.uuid4().hex[:8]
+# Identity and age of the compute serving a request, both established on the first
+# request rather than at import.
+#
+# Deriving either at import is wrong on Runtime V2, which starts an instance by restoring
+# a snapshot taken once per version: anything computed before the snapshot is copied
+# identically into every instance. Measured — two V2 instances that were demonstrably
+# separate (independent per-process counters, neither seeing the other's marker file)
+# reported the same import-time uuid, and /proc/uptime read ~92.6 s on both because it
+# dates the snapshot's kernel rather than the restore. On V1 the same code reported
+# distinct uuids and a true ~18.5 s kernel age. State written after the restore is the
+# only thing that distinguishes instances, so that is when these are taken.
+#
+# The cost on V1 is nil: the first request arrives moments after start-up, so process age
+# still includes the imports it used to be measured from. What neither value can do is
+# prove isolation; concurrent sessions not seeing each other's files is what does that.
+_instance_id: str | None = None
+_serving_since: float | None = None
+_identity_lock = threading.Lock()
+
+
+def _mark_serving() -> None:
+    global _instance_id, _serving_since
+    if _instance_id is not None:
+        return
+    with _identity_lock:
+        if _instance_id is None:
+            _serving_since = time.monotonic()
+            _instance_id = uuid.uuid4().hex[:8]
+
+
+def _instance() -> str:
+    """This instance's id, generated on first use and fixed for its lifetime."""
+    _mark_serving()
+    return _instance_id  # type: ignore[return-value]
 
 
 def _kernel_uptime() -> float | None:
@@ -103,7 +125,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
     # after workload_token so both paths use the one value — reading the headers separately
     # here is how the two drifted.
     if agui.is_agui_request(payload):
-        log.info("dispatch: agui  instance=%s session=%s", _INSTANCE, sid[:24])
+        log.info("dispatch: agui  instance=%s session=%s", _instance(), sid[:24])
         return await agui.handle(request, payload, workload_token)
 
     now = time.monotonic()
@@ -115,12 +137,12 @@ async def handle_invocations(request: web.Request) -> web.Response:
     if action == "status":
         return web.json_response({
             "ready": True,
-            "instance": _INSTANCE,
-            # This process's age. Not the microVM's — a process starts after the
-            # microVM does — and not "how long you have been served" either.
-            "uptime": round(now - _START, 1),
-            # The microVM's own age, from the kernel. This is the only field that
-            # answers "how long has this compute been running".
+            "instance": _instance(),
+            # How long this instance has been serving, from its first request. Not the
+            # microVM's age, and not "how long you have been served" either.
+            "uptime": round(now - (_serving_since or now), 1),
+            # The kernel's own age. True on V1; on V2 it dates the snapshot's kernel
+            # rather than this restore, so read it as a lower bound there.
             "kernelUptime": _kernel_uptime(),
             # How long THIS session has been served by THIS process, counted from its
             # first request. Independent of when the microVM booted.
@@ -220,7 +242,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             return web.json_response({"error": str(e)})
 
     if action == "chat":
-        log.info("dispatch: chat  instance=%s session=%s", _INSTANCE, sid[:24])
+        log.info("dispatch: chat  instance=%s session=%s", _instance(), sid[:24])
         # A caller that cannot name the user — the A2A adapter forwards a bearer and nothing
         # else — gets the actor derived from the token instead of defaulting to "anonymous",
         # which would fail the ownership check and ask for consent forever.
@@ -273,14 +295,20 @@ def _log_startup_breakdown() -> None:
     cold starts is reading CloudWatch anyway.
 
     kernel age is the microVM's; the gap between it and this process's age is what
-    AgentCore spent booting and pulling the image before we got control."""
+    AgentCore spent booting and pulling the image before we got control.
+
+    On Runtime V2 this describes the snapshot build, not a restore: it runs before the
+    snapshot is taken, so every restored instance inherits the figures rather than
+    producing its own. No instance id is reported for the same reason — one generated
+    here would be identical across every instance. Restored instances report their own
+    identity through /status instead."""
     kernel = _kernel_uptime()
-    proc = time.monotonic() - _START
+    proc = time.monotonic() - _T_IMPORT_START
     imports = _T_IMPORT_DONE - _T_IMPORT_START
     before_us = round(kernel - proc, 1) if kernel is not None else None
     log.info(
-        "startup breakdown: microVM=%ss process=%.1fs imports=%.1fs before-our-code=%ss "
-        "instance=%s", kernel, proc, imports, before_us, _INSTANCE,
+        "startup breakdown: microVM=%ss process=%.1fs imports=%.1fs before-our-code=%ss",
+        kernel, proc, imports, before_us,
     )
 
 
