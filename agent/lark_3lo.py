@@ -86,6 +86,9 @@ def _belongs_to(token: str, actor_id: str) -> bool:
     every later turn would act as them. Checking at the point of use closes that
     regardless of how the token got there. Fails closed: an owner we cannot establish
     is not accepted."""
+    # A cache key, not password storage: it exists so the raw token is never a dict key.
+    # SHA-256 is the right choice — an access token is high-entropy random, so a fast hash
+    # is not brute-forceable the way a human password would be.
     digest = hashlib.sha256(token.encode()).hexdigest()[:32]
     if _VERIFIED.get(digest) == actor_id:
         return True
@@ -137,7 +140,8 @@ def _fetch_vaulted(workload_token: str, state_actor: str, force: bool = False,
     resp = _agentcore.get_resource_oauth2_token(**kwargs)
     # Whether a grant came back, which is the difference between "acts as the user" and
     # "asks for consent again" — and the two callers disagree on it, see the open item in
-    # docs/agentcore-behavior.md.
+    # docs/agentcore-behavior.md. The token itself is never logged: accessToken is read only
+    # for its truthiness, and the alternative branch logs a consent session id.
     log.info("vault fetch: provider=%s state=%r force=%s -> %s",
              kwargs["resourceCredentialProviderName"], state_actor, force,
              "token" if resp.get("accessToken") else
