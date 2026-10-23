@@ -137,6 +137,9 @@ async def handle_invocations(request: web.Request) -> web.Response:
     if action == "status":
         return web.json_response({
             "ready": True,
+            # Set by provision.sh at deploy time — the running container has no other way to know 
+            # its own platformVersion, which is a control-plane field, not an AgentCore-injected one.
+            "platformVersion": os.environ.get("AGENT_PLATFORM_VERSION", "unknown"),
             "instance": _instance(),
             # How long this instance has been serving, from its first request. Not the
             # microVM's age, and not "how long you have been served" either.

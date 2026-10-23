@@ -216,8 +216,12 @@ def _microvm_line(session_id: str, data: dict | None) -> str:
         return "运行中（旧镜像，未上报实例信息）"
     # Two distinct figures, both meaningful; the process's own uptime is neither, and
     # is deliberately not shown. kernelUptime is the microVM's age (from the kernel,
-    # the only trustworthy source); sessionAge is how long it has served this session.
+    # the only trustworthy source on V1 — on V2 it dates the snapshot, not this restore);
+    # sessionAge is how long it has served this session.
     parts = []
+    pv = data.get("platformVersion")
+    if pv and pv != "unknown":
+        parts.append(pv)
     kup = data.get("kernelUptime")
     if kup is not None:
         parts.append(f"已运行 {_secs(kup)}")

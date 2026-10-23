@@ -229,8 +229,12 @@ phase2_runtime() {
     uv run python - <<'PYEOF'
 import json, os
 e = os.environ
+platform_version = "V2"
 env = {
     "BEDROCK_MODEL_ID": e["MODEL"],
+    # Not visible to the container any other way — platformVersion is a control-plane
+    # field on the Runtime resource, not something AgentCore injects at runtime.
+    "AGENT_PLATFORM_VERSION": platform_version,
     # Conversation state. Without the table the agent still answers, but history dies
     # with the container — so a missing output here is a real regression, not an option.
     "CHECKPOINT_TABLE": e["CKPT_TABLE"],
@@ -277,7 +281,7 @@ print(json.dumps({
     # module-scope event loop and its MCP sessions survive a restore; and anything derived
     # at import is snapshot-shared, which is why server.py takes its instance identity on
     # the first request. Creation now takes 120-150 s rather than seconds.
-    "platformVersion": "V2",
+    "platformVersion": platform_version,
     "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": e["IMAGE"]}},
     "roleArn": e["ROLE"],
     "networkConfiguration": net,

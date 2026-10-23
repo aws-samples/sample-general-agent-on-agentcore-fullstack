@@ -184,6 +184,20 @@ def test_microvm_line_reports_kernel_age_and_session_age():
     assert inv.call_args.kwargs["budget"] == index._PROBE_SECONDS
 
 
+def test_microvm_line_reports_platform_version():
+    line, _ = _microvm_line_with(
+        {"instance": "abc12345", "platformVersion": "V2", "kernelUptime": 30, "sessionAge": 5})
+    assert "V2" in line
+
+
+def test_microvm_line_omits_platform_version_when_unreported():
+    """An older image answers status with no platformVersion key at all — must not
+    print the literal "unknown" the agent falls back to when the env var is unset."""
+    line, _ = _microvm_line_with(
+        {"instance": "abc12345", "platformVersion": "unknown", "kernelUptime": 30, "sessionAge": 5})
+    assert "unknown" not in line
+
+
 def test_microvm_line_uses_one_unit_so_the_two_are_comparable():
     """Both durations in seconds: the point is to subtract them (equal → this microVM
     started for you; age >> sessionAge → an existing one took over)."""
