@@ -1274,6 +1274,136 @@ def test_summarisation_rewrites_state_so_the_checkpoint_shrinks():
     assert "RemoveMessage" in src and "REMOVE_ALL_MESSAGES" in src
 
 
+def test_the_summariser_sees_the_whole_slice_and_stays_off_the_chat():
+    """The library trims to 4,000 tokens by default, which an agentic tail cannot fit;
+    and the summary call runs inside the graph, so untagged it streams like an answer."""
+    mw = [m for m in agent_core._middleware()
+          if type(m).__name__ == "SummarizationMiddleware"][0]
+    assert mw.trim_tokens_to_summarize is None
+    assert "nostream" in mw.model.tags
+    assert mw.model.metadata.get("emit-messages") is False
+    assert mw.model.timeout == agent_core._SUMMARY_TIMEOUT
+
+
+class _SummaryModel(BaseChatModel):
+    """Answers every summary request with one recognisable line, streamed or not."""
+
+    text: str = "SUMMARY-OF-EARLIER-WORK"
+    calls: int = 0
+
+    @property
+    def _llm_type(self):
+        return "summary"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kw):
+        self.__dict__["calls"] = self.calls + 1
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=self.text))])
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kw):
+        self.__dict__["calls"] = self.calls + 1
+        yield ChatGenerationChunk(message=AIMessageChunk(content=self.text))
+
+
+def _agentic_history(results: int = 3, chars: int = 30_000) -> list:
+    """One request followed by tool calls whose results dwarf the old 4,000-token trim —
+    the shape that came back empty and lost a real thread."""
+    out = [HumanMessage("earlier request")]
+    for i in range(results):
+        out.append(AIMessage(content="", tool_calls=[
+            {"name": "_dummy_tool", "args": {}, "id": f"h{i}", "type": "tool_call"}]))
+        out.append(ToolMessage(content="x" * chars, tool_call_id=f"h{i}", name="_dummy_tool"))
+    out.append(AIMessage(content="done with the earlier request"))
+    return out
+
+
+def _summarising_session(summary_model, answer="the answer"):
+    """A real graph with the production summariser and steering, over a seeded thread."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
+        base = agent_core._middleware()                 # images + steering
+    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 1000), \
+         mock.patch.object(agent_core, "_SUMMARIZE_KEEP", 2):
+        summariser = agent_core._summarization(summary_model)
+    graph = agent_core.create_agent(
+        model=_ScriptedModel(turns=[{"text": [answer]}]), tools=[_dummy_tool],
+        middleware=base + [summariser], checkpointer=InMemorySaver())
+    thread = f"t{next(_thread_seq)}"
+    config = {"configurable": {"thread_id": thread}}
+    graph.update_state(config, {"messages": _agentic_history()})
+    return {"graph": graph, "tool_texts": [], "config": config}, thread
+
+
+@pytest.mark.parametrize("tagged", [True, False])
+def test_a_tool_heavy_thread_is_really_summarised_and_none_of_it_reaches_the_card(tagged):
+    """Untagged too: the stream filter alone must keep the summary model's tokens and the
+    summary message off the card, in case a later change drops the tag."""
+    summary = _SummaryModel(tags=["nostream"] if tagged else None)
+    session, _ = _summarising_session(summary)
+    card = FakeCard()
+    with _patch_notify(card, []):
+        text = agent_core._stream_to_chat(session, "next question", "oc_1")
+    assert text == "the answer"
+    assert all("SUMMARY" not in u and "Here is a summary" not in u for u in card.updates)
+    head = session["graph"].get_state(session["config"]).values["messages"][0]
+    assert agent_core._is_summary(head)
+    assert summary.calls >= 1
+    assert "SUMMARY-OF-EARLIER-WORK" in head.content
+    assert agent_core._SUMMARY_FALLBACK not in head.content
+
+
+def test_a_steered_message_is_not_echoed_onto_the_card():
+    """Steering writes a HumanMessage from a node, which the stream replays."""
+    session, thread = _summarising_session(_SummaryModel(tags=["nostream"]))
+    agent_core.steer(thread, "STEERED-IN")
+    card = FakeCard()
+    with _patch_notify(card, []):
+        text = agent_core._stream_to_chat(session, "next question", "oc_1")
+    assert "STEERED-IN" not in text
+
+
+def _summary_update(text):
+    from langchain_core.messages import RemoveMessage
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), HumanMessage(
+        content=f"Here is a summary of the conversation to date:\n\n{text}",
+        additional_kwargs={"lc_source": "summarization"})]}
+
+
+@pytest.mark.parametrize("outcome", ["fallback", "raises"])
+def test_a_failed_summary_keeps_the_history_instead_of_replacing_it(outcome):
+    """Applying the fallback line is what deleted 114 messages; an exception would fail
+    the turn and every one after it. Either way the thread is left as it was."""
+    import asyncio
+    mw = agent_core._summarization(_SummaryModel())
+    base = type(mw).__mro__[1]
+    if outcome == "fallback":
+        patch = mock.patch.object(base, "abefore_model", mock.AsyncMock(
+            return_value=_summary_update(agent_core._SUMMARY_FALLBACK)))
+    else:
+        patch = mock.patch.object(base, "abefore_model",
+                                  mock.AsyncMock(side_effect=RuntimeError("throttled")))
+    with patch:
+        assert asyncio.run(mw.abefore_model({"messages": []}, None)) is None
+
+
+def test_a_real_summary_is_applied():
+    import asyncio
+    mw = agent_core._summarization(_SummaryModel())
+    update = _summary_update("what happened so far")
+    with mock.patch.object(type(mw).__mro__[1], "abefore_model",
+                           mock.AsyncMock(return_value=update)):
+        assert asyncio.run(mw.abefore_model({"messages": []}, None)) is update
+
+
+def test_the_transcript_shows_the_summary_as_a_note_not_as_the_user():
+    head = _summary_update("what happened so far")["messages"][1]
+    tup = mock.Mock(checkpoint={"channel_values": {"messages": [head, HumanMessage("hi")]}})
+    saver = mock.Mock(aget_tuple=mock.AsyncMock(return_value=tup))
+    with mock.patch.object(agent_core, "_checkpointer", return_value=saver):
+        roles = [m["role"] for m in agent_core.transcript("lark:ou_x")["messages"]]
+    assert roles == ["summary", "user"]
+
+
 # --------------------------- AG-UI (browser path) ----------------------------
 # The browser talks to the Runtime directly here, so the one invariant that matters is that
 # nothing it sends can name a user: threadId decides whose conversation and whose files.

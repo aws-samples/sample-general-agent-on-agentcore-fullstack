@@ -2,9 +2,11 @@ aiohttp>=3.10.0
 aws-opentelemetry-distro>=0.10.0
 # langchain for create_agent: langgraph.prebuilt.create_react_agent is deprecated in
 # LangGraph 1.0 and goes away in 2.0.
-langchain>=1.4.0
+langchain>=1.4.7,<2
 langgraph>=1.2.0
-langchain-aws>=1.7.0
+# 1.9.0 maps Bedrock's "input is too long" to ContextOverflowError, which is what lets the
+# summariser retry an oversized history with its middle cut out.
+langchain-aws>=1.9.0
 # AgentCoreMemorySaver (graph state, blob events) + AgentCoreMemoryStore (conversational
 # events). Not part of bedrock-agentcore, which ships a Strands integration only.
 langgraph-checkpoint-aws>=1.2.0

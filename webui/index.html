@@ -225,6 +225,7 @@ async function restore() {
   if (data.truncated) say('think', '（仅显示最近的对话）');
   for (const m of msgs) {
     if (m.role === 'user') say('me', m.content || '');
+    else if (m.role === 'summary') say('think', '（更早的对话已压缩为摘要）');
     else if (m.role === 'assistant') sayMarkdown(m.content || '');
     else if (m.role === 'toolCall') {
       const t = toolCard(m.id || uuid());

@@ -147,6 +147,26 @@ _model = _CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
 # forever. Late, because summarising early discards detail the user can still refer to.
 _SUMMARIZE_AT_TOKENS = int(os.environ.get("SUMMARIZE_AT_TOKENS", "120000"))  # 0 disables
 _SUMMARIZE_KEEP = int(os.environ.get("SUMMARIZE_KEEP_MESSAGES", "20"))
+# What langchain's SummarizationMiddleware writes in place of a summary when it could not
+# make one; applying it would replace the whole history with this line.
+_SUMMARY_FALLBACK = "Previous conversation was too long to summarize."
+# A summary of ~100k tokens of history is one long non-cached call; botocore's 60 s read
+# timeout would cut it off.
+_SUMMARY_TIMEOUT = int(os.environ.get("SUMMARY_TIMEOUT_SECONDS", "300"))
+
+
+def _is_summary(message) -> bool:
+    """The message SummarizationMiddleware puts at the head of the thread."""
+    return (isinstance(message, HumanMessage)
+            and (message.additional_kwargs or {}).get("lc_source") == "summarization")
+
+
+def _summary_is_usable(update) -> bool:
+    """False when the update would replace the history with the fallback line."""
+    for m in (update or {}).get("messages", []):
+        if _is_summary(m):
+            return not _text_of(m).rstrip().endswith(_SUMMARY_FALLBACK)
+    return True
 
 
 # --------------------------- steering a running turn -------------------------
@@ -245,16 +265,64 @@ def _middleware() -> list:
                     dict(_ImageMiddleware.__dict__))()
     if not _SUMMARIZE_AT_TOKENS:
         return [pictures, steering]
-    from langchain.agents.middleware import SummarizationMiddleware
-    return [pictures, steering, SummarizationMiddleware(
+    return [pictures, steering, _summarization(_CachingChatBedrockConverse(
+        model=_MODEL_ID, region_name=_REGION,
         # Caching deliberately off for this one: the summary call happens once per
         # threshold crossing and is never re-read, so a cachePoint would only buy a
         # 1.25-2x write premium.
-        model=_CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
-                                         cache_ttl=""),
+        cache_ttl="",
+        # The summary is generated inside the graph, so without these its tokens stream
+        # into the chat like an answer: `nostream` keeps it out of LangGraph's messages
+        # stream (the Lark card), `emit-messages` out of AG-UI (the web page).
+        tags=["nostream"], metadata={"emit-messages": False},
+        timeout=_SUMMARY_TIMEOUT))]
+
+
+def _summarization(model):
+    """SummarizationMiddleware that never discards history it failed to summarise.
+
+    `trim_tokens_to_summarize=None`: the library default trims what it summarises to the
+    last 4,000 tokens starting at a human message, and an agentic tail — one request
+    followed by many tool results — has none in that window, so the trim comes back empty
+    and the fallback line replaces the whole history (measured on a real thread: 114
+    messages lost). The full slice fits the model's window; on overflow the middleware
+    retries with the middle cut out.
+
+    A failed or fallback summary skips this turn's compaction instead of applying it: the
+    thread is still within the model's window, and the next turn tries again. Named like
+    the base class so the graph node and checkpoints keep their names."""
+    from langchain.agents.middleware import SummarizationMiddleware as _Base
+
+    def _kept(update):
+        if _summary_is_usable(update):
+            return update
+        log.warning("summarisation produced no summary; keeping the history as is")
+        telemetry.count("summarize_failed", reason="fallback")
+        return None
+
+    class SummarizationMiddleware(_Base):
+        def before_model(self, state, runtime):  # noqa: ANN001 — the framework's signature
+            try:
+                return _kept(super().before_model(state, runtime))
+            except Exception as e:  # noqa: BLE001 — a failed summary must not fail the turn
+                log.exception("summarisation failed; keeping the history as is")
+                telemetry.count("summarize_failed", reason=type(e).__name__)
+                return None
+
+        async def abefore_model(self, state, runtime):  # noqa: ANN001 — same
+            try:
+                return _kept(await super().abefore_model(state, runtime))
+            except Exception as e:  # noqa: BLE001 — same
+                log.exception("summarisation failed; keeping the history as is")
+                telemetry.count("summarize_failed", reason=type(e).__name__)
+                return None
+
+    return SummarizationMiddleware(
+        model=model,
         trigger=("tokens", _SUMMARIZE_AT_TOKENS),
         keep=("messages", _SUMMARIZE_KEEP),
-    )]
+        trim_tokens_to_summarize=None,
+    )
 
 
 # session_id -> {graph, config, stack, created, ...}. One microVM ≈ one session.
@@ -928,6 +996,14 @@ def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
                     if on_tool_result is not None:
                         on_tool_result(chunk.name, _message_text(chunk))
                     continue
+                # Only the model's own words are an answer. A node's output is replayed
+                # on this stream too, so the summary and any steered message — both
+                # HumanMessages written by middleware — would otherwise be typed onto
+                # the card; and a middleware's internal model call is not the reply.
+                if not isinstance(chunk, AIMessage):
+                    continue
+                if (_meta or {}).get("lc_source") == "summarization":
+                    continue
                 # Strands emitted no tool-result event and LangGraph does; what both
                 # give us is the tool call as it *starts*, which is what matters here:
                 # a call to a system with no grant is certain to be refused, so seeing
@@ -1120,7 +1196,10 @@ def transcript(actor_id: str, mem_sid: str = "") -> dict:
     tail = history[-_TRANSCRIPT_LIMIT:]
     out = []
     for m in tail:
-        if isinstance(m, HumanMessage):
+        if _is_summary(m):
+            # Written by summarisation, not by the user; the page shows it as a note.
+            out.append({"role": "summary", "content": _text_of(m)})
+        elif isinstance(m, HumanMessage):
             out.append({"role": "user", "content": _text_of(m)})
         elif isinstance(m, AIMessage):
             for call in getattr(m, "tool_calls", None) or []:
