@@ -437,6 +437,33 @@ def process_approval_event(ev: dict, context=None) -> None:
     _dispatch_turn(user_id, actor_id, message, open_id, context=context)
 
 
+_CARRIED_NAMES = {"img": "图片", "image": "图片", "file": "文件", "media": "视频",
+                  "audio": "语音", "sticker": "表情"}
+
+
+def _words_and_attachments(msg_type: str, content: dict) -> tuple[str, list[str]]:
+    """What the user actually typed, and what else the message carried.
+
+    A screenshot with a caption arrives as `post`, whose content is a list of paragraphs
+    of tagged elements — the caption is in there, but not under `text`, which is why
+    reading `content["text"]` for every type silently lost the whole message."""
+    if msg_type == "post":
+        words, carried = [], []
+        for paragraph in content.get("content") or []:
+            for element in paragraph or []:
+                tag = element.get("tag")
+                # A link's label is part of the sentence; `at` is handled by the mention
+                # stripping below, so it is neither words nor an attachment.
+                if tag in ("text", "a"):
+                    words.append(element.get("text", ""))
+                elif tag and tag != "at":
+                    carried.append(tag)
+        return " ".join(w for w in words if w), carried
+    if msg_type in ("image", "file", "media", "audio", "sticker"):
+        return "", [msg_type]
+    return content.get("text", ""), []
+
+
 # ------------------------------- chat commands ------------------------------
 
 _HELP = "\n".join([
@@ -603,7 +630,7 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         content = json.loads(content_str)
     except Exception:
         content = {}
-    text = content.get("text", "") if msg_type == "text" else content.get("text", "")
+    text, carried = _words_and_attachments(msg_type, content)
 
     # strip @mentions in group chats
     if message.get("chat_type") == "group":
@@ -622,7 +649,15 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         )
         return
 
-    agent_message = text.strip() or "hi"
+    agent_message = text.strip()
+    if carried:
+        # Said out loud, because the alternative is a model that answers as though it had
+        # seen the picture. Nothing here can read one yet.
+        note = "、".join(_CARRIED_NAMES.get(c, c) for c in dict.fromkeys(carried))
+        if not agent_message:
+            lark.send_message(chat_id, f"我收到了你的{note}，但还看不了，先用文字说说?")
+            return
+        agent_message += f"\n\n[附带了{note}，你看不到其内容]"
 
     reply = run_command(agent_message, user_id, actor_id)
     if reply is not None:

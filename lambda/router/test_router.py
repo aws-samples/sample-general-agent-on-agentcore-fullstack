@@ -184,6 +184,37 @@ def test_microvm_line_reports_kernel_age_and_session_age():
     assert inv.call_args.kwargs["budget"] == index._PROBE_SECONDS
 
 
+# --- Reading what the user sent ---------------------------------------------
+# A caption sent with a screenshot arrives as `post`, not `text`. Reading content["text"]
+# for every type dropped it, and the "hi" fallback then presented the empty result to the
+# model as a greeting — so the agent cheerfully answered a message nobody had sent.
+
+
+def test_a_caption_sent_with_a_screenshot_is_not_lost():
+    """The payload Lark really delivers, taken from a message this bug was reported on."""
+    import index
+    content = {"title": "", "content": [
+        [{"tag": "text", "text": "我给你添加了一个 deliver_file 工具", "style": []}],
+        [{"tag": "img", "image_key": "img_v3_0216o_b46b56ab", "width": 531, "height": 641}]]}
+    text, carried = index._words_and_attachments("post", content)
+    assert text == "我给你添加了一个 deliver_file 工具"
+    assert carried == ["img"]
+
+
+def test_a_link_label_counts_as_words_but_a_mention_does_not():
+    import index
+    content = {"content": [[{"tag": "at", "user_id": "ou_x"},
+                            {"tag": "text", "text": "see"},
+                            {"tag": "a", "text": "this page", "href": "https://x"}]]}
+    assert index._words_and_attachments("post", content) == ("see this page", [])
+
+
+def test_an_image_only_message_yields_no_words_to_invent():
+    import index
+    assert index._words_and_attachments("image", {"image_key": "img_1"}) == ("", ["image"])
+    assert index._words_and_attachments("text", {"text": "plain"}) == ("plain", [])
+
+
 def test_microvm_line_reports_platform_version():
     line, _ = _microvm_line_with(
         {"instance": "abc12345", "platformVersion": "V2", "kernelUptime": 30, "sessionAge": 5})
