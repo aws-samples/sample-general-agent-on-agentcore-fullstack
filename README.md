@@ -1,4 +1,19 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 # General Agent on AgentCore — a full-stack agent sample
+
+<p align="center">
+  <img alt="Model platform" src="https://img.shields.io/badge/Model%20platform-Amazon%20Bedrock-ff9900?style=flat-square&logo=amazonaws&logoColor=white">
+  <img alt="Agent framework" src="https://img.shields.io/badge/Agent%20framework-LangGraph-1c3c3c?style=flat-square">
+  <img alt="Runtime" src="https://img.shields.io/badge/Runtime-AgentCore%20V2-ff9900?style=flat-square&logo=amazonaws&logoColor=white">
+  <img alt="Identity" src="https://img.shields.io/badge/Identity-AgentCore%20Token%20Vault-ff9900?style=flat-square&logo=amazonaws&logoColor=white">
+  <img alt="Channel" src="https://img.shields.io/badge/Channel-Lark%20%C2%B7%20Web%20%C2%B7%20A2A-00d6b9?style=flat-square">
+  <img alt="Tools" src="https://img.shields.io/badge/Tools-MCP-6f42c1?style=flat-square">
+  <img alt="IaC" src="https://img.shields.io/badge/IaC-CDK%20%28Python%29-ff9900?style=flat-square&logo=amazonaws&logoColor=white">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.13-3776ab?style=flat-square&logo=python&logoColor=white">
+  <img alt="Node" src="https://img.shields.io/badge/Node-24-339933?style=flat-square&logo=nodedotjs&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT--0-3da639?style=flat-square">
+</p>
 
 A general-purpose agent on **Amazon Bedrock AgentCore**, reachable from **Lark (Feishu) chat**, a web page, and peer agents over A2A.
 

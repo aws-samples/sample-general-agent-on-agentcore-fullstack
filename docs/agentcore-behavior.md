@@ -90,11 +90,22 @@ All measured in this account on 2026-09-17 against a throwaway rig (bucket + S3 
 
 ## Runtime platform version V2
 
-V2 starts an instance by restoring a memory snapshot taken once per agent runtime version. This project runs V1; the measurements below bound what a migration would cost.
+V2 starts an instance by restoring a memory snapshot taken once per agent runtime version. The agent runtime here runs V2; the three MCP servers run on V1, since their startup is already trivial and a snapshot buys them nothing.
 
 - **`platformVersion` is a per-runtime field** (`V1` | `V2`, default V1) on `CreateAgentRuntime`/`UpdateAgentRuntime`. The documented tooling gaps — neither CloudFormation/CDK nor the `agentcore` CLI can set it — do not constrain this repo, which drives the control plane directly for every runtime (`acp` in `scripts/provision.sh`).
 - **The capability combinations this repo depends on are available on V2.** `A2A` + `CUSTOM_JWT` + `requestHeaderAllowlist`, and `MCP` + a custom `requestHeaderAllowlist`, both reach `READY` and serve traffic; `GetAgentRuntime` returns the requested configuration unmodified. AWS documents no platform-version gating on these fields, but documents no compatibility either, so this is measurement rather than inference.
 - **Creation takes 120–150 s against seconds on V1, and the cost belongs to the snapshot machinery.** Two runtimes differing by an order of magnitude in container startup work (≈12 s of Python imports versus a Node image with none) completed in the same window. Reducing container startup time will not reduce creation time. V1 pays the equivalent cost at every cold start; V2 pays it once per version.
+- **Quantified.**
+
+  | | V1 | V2 |
+  |---|---|---|
+  | Cost | ~19 s (measured above) | 120–150 s |
+  | Paid | at every cold start | once, at creation of the version |
+  | Who pays | every user whose session expired (`idleRuntimeSessionTimeout`, 15 min default) | nobody, after creation |
+  | Break-even | — | ~6–8 cold starts/version (120÷19≈6.3, 150÷19≈7.9) |
+  | Per-instance restore latency | is the cold start itself | not measured — `/proc/uptime` is snapshot-derived, not real elapsed time (below) |
+
+  Any version serving real multi-user traffic clears 6–8 cold starts almost immediately, so the comparison favors V2 quickly; what it does not establish is how long one V2 restore itself takes, since no trustworthy clock for that was found.
 - **Restored instances do not re-execute startup code.** A startup log line emitted by the container appears in the `build-logs-*` stream for the snapshot build and in no `runtime-logs-*` stream.
 - **Environment variables are capped at 2.5 KB for container deployments** (1.5 KB for direct code), against 4 KB on V1. The agent runtime currently carries 21 variables totalling 1,690 bytes. MCP server URLs are the largest entries at roughly 220 bytes each, so the remaining headroom is about four more.
 - **A log stream does not identify an instance, on either platform version.** Five sequential invocations carrying two distinct `runtimeSessionId` values produced five `runtime-logs-*` streams, and a V1 runtime on the same image behaved identically. Streams are per-invocation; instance reuse and session affinity cannot be inferred from them.
