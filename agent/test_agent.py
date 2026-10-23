@@ -1001,6 +1001,55 @@ def test_context_size_is_the_latest_calls_billed_input_not_an_estimate():
     assert (out["contextTokens"], out["cachedTokens"]) == (9147, 5049)
 
 
+def _compactable(turns: int, summary: str):
+    """A real agent graph with `turns` finished turns, and the summary model replaced."""
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ans"]}]),
+                                    tools=[], checkpointer=InMemorySaver(),
+                                    middleware=agent_core._middleware()[:2])
+    config = {"configurable": {"thread_id": f"c{next(_thread_seq)}"}}
+    for i in range(turns):
+        agent_core._run(graph.ainvoke({"messages": [HumanMessage(f"q{i}")]}, config=config))
+    session = {"graph": graph, "config": config}
+    return (session, mock.patch.object(agent_core, "_get_session", return_value=session),
+            mock.patch.object(agent_core, "_summary_model",
+                              return_value=FakeListChatModel(responses=[summary])))
+
+
+def test_compact_replaces_the_older_turns_with_a_summary_and_the_thread_goes_on():
+    session, got, model = _compactable(turns=6, summary="Earlier: q0 to q2 were asked.")
+    with got, model, mock.patch.object(agent_core, "_COMPACT_KEEP", 4):
+        out = agent_core.compact("lark:ou_x", "t")
+    msgs = agent_core._run(session["graph"].aget_state(session["config"])).values["messages"]
+    assert out["compacted"] > 0 and out["kept"] == sum(1 for m in msgs if not agent_core._is_summary(m))
+    assert agent_core._is_summary(msgs[0]) and "q0 to q2" in agent_core._text_of(msgs[0])
+    # Nothing pending: the next turn starts from the summary, as on a live thread.
+    assert agent_core._run(session["graph"].aget_state(session["config"])).next == ()
+    agent_core._run(session["graph"].ainvoke({"messages": [HumanMessage("next")]},
+                                              config=session["config"]))
+
+
+def test_compact_refuses_a_fallback_summary_rather_than_erase_the_history():
+    """The failure the threshold path was fixed for — a history replaced by the fallback
+    line — must not come back through the manual door."""
+    session, got, model = _compactable(turns=6, summary=agent_core._SUMMARY_FALLBACK)
+    before = agent_core._run(session["graph"].aget_state(session["config"])).values["messages"]
+    with got, model, mock.patch.object(agent_core, "_COMPACT_KEEP", 4):
+        out = agent_core.compact("lark:ou_x", "t")
+    after = agent_core._run(session["graph"].aget_state(session["config"])).values["messages"]
+    assert out == {"compacted": 0, "reason": "failed"}
+    assert [m.id for m in after] == [m.id for m in before]
+
+
+def test_compact_leaves_a_short_thread_and_a_running_turn_alone():
+    session, got, model = _compactable(turns=1, summary="s")
+    with got, model, mock.patch.object(agent_core, "_COMPACT_KEEP", 4):
+        assert agent_core.compact("lark:ou_x", "t")["reason"] == "short"
+    with mock.patch.object(agent_core, "thread_busy", return_value=True):
+        assert agent_core.compact("lark:ou_x", "t") == {"compacted": 0, "reason": "busy"}
+
+
 def test_the_tool_overview_keeps_assembly_order_and_names_the_missing_grants():
     session = {"tool_source": {"lark_whoami": "lark", "approval_list": "approval",
                                "run_code": "code"},

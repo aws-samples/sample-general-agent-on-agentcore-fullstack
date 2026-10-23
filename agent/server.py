@@ -199,6 +199,16 @@ async def handle_invocations(request: web.Request) -> web.Response:
 
     # The tool list is per session — it depends on which servers answered and which systems
     # the user has granted — so only the container serving this user can say what it is.
+    if action == "compact":
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        try:
+            return web.json_response(await asyncio.get_event_loop().run_in_executor(
+                None, agent_core.compact, actor_id, payload.get("memorySessionId", ""),
+                workload_token))
+        except Exception as e:
+            log.exception("compact failed")
+            return web.json_response({"compacted": 0, "reason": "error", "error": str(e)})
+
     if action == "tools":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         try:

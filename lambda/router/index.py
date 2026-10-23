@@ -258,6 +258,27 @@ def _tools_text(data: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _compact_text(data: dict | None) -> str:
+    data = data or {}
+    if data.get("compacted"):
+        return (f"已压缩：较早的 {data['compacted']} 条消息合并为一段摘要，"
+                f"保留最近 {data.get('kept', 0)} 条。下一次请求起上下文会变小，"
+                "发送 /status 可查看。")
+    return {
+        "busy": "这一轮还在回答中，等它结束后再压缩。",
+        "short": "对话还很短，没有需要压缩的内容。",
+        "failed": "这次没能生成摘要，对话保持原样，可以稍后再试。",
+        "identity": "身份校验未通过，无法读取这段对话。",
+    }.get(data.get("reason", ""), "压缩没有完成，对话保持原样。")
+
+
+# Commands that keep the user waiting long enough to look broken. Lark shows nothing
+# while a command runs — a chat turn gets a reaction, a command does not — so these say
+# they have started. The web page has its own spinner.
+_SLOW_COMMANDS = {"/compact": "正在把较早的对话压缩成摘要…",
+                  "/tools": "正在汇总当前可用的工具…"}
+
+
 def _microvm_line(session_id: str, data: dict | None) -> str:
     """One line describing the microVM currently bound to this session id.
 
@@ -564,6 +585,7 @@ _HELP = "\n".join([
     "  /model       当前模型与上下文设置",
     "  /tools       当前可用的工具，按来源分组",
     "  /new         开启新的对话（切换运行实例）",
+    "  /compact     把较早的对话压缩成摘要（保留最近几条）",
     "  /reset       重置对话记录（运行实例不变）",
     "  /clear       清除对话记录（运行实例不变）",
     "  /reconnect   切换运行实例（对话记录保留）",
@@ -674,6 +696,17 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
         rt_sid = info.get("sessionId", "") or identity.get_or_create_session(user_id)
         return {"text": _model_text(probe_agent(rt_sid, user_id, actor_id))}
 
+    if cmd == "/compact":
+        rt_sid = identity.get_or_create_session(user_id)
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        try:
+            data = invoke_agent(rt_sid, user_id, actor_id, "", action="compact",
+                                mem_sid=mem_sid)
+        except Exception:  # noqa: BLE001 — a command must answer, not raise
+            logger.warning("compact failed for %s", actor_id, exc_info=True)
+            data = {"compacted": 0, "reason": "error"}
+        return {"text": _compact_text(data)}
+
     if cmd == "/tools":
         rt_sid = identity.get_or_create_session(user_id)
         mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
@@ -772,6 +805,9 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
     if not (agent_message or attachments):
         return
 
+    notice = _SLOW_COMMANDS.get(agent_message.strip().split(" ")[0].lower())
+    if notice:
+        lark.send_message(chat_id, notice)
     reply = run_command(agent_message, user_id, actor_id)
     if reply is not None:
         link = reply.get("link")

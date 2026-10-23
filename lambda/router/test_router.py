@@ -382,6 +382,14 @@ def test_tools_are_grouped_by_where_they_came_from_with_the_grant_they_need():
     assert "代码执行：run_code" in lines
 
 
+def test_compact_says_what_happened_in_every_case():
+    import index
+    assert "较早的 12 条" in index._compact_text({"compacted": 12, "kept": 6})
+    for reason, words in (("busy", "回答中"), ("short", "很短"), ("failed", "没能生成摘要"),
+                          ("identity", "身份校验"), ("error", "没有完成")):
+        assert words in index._compact_text({"compacted": 0, "reason": reason}), reason
+
+
 def test_tools_say_why_there_are_none():
     import index
     assert "身份校验未通过" in index._tools_text({"tools": [], "identityError": "x"})

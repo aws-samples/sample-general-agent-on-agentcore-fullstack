@@ -265,7 +265,12 @@ def _middleware() -> list:
                     dict(_ImageMiddleware.__dict__))()
     if not _SUMMARIZE_AT_TOKENS:
         return [pictures, steering]
-    return [pictures, steering, _summarization(_CachingChatBedrockConverse(
+    return [pictures, steering, _summarization(_summary_model())]
+
+
+def _summary_model():
+    """The model that writes summaries, for the threshold and for /compact alike."""
+    return _CachingChatBedrockConverse(
         model=_MODEL_ID, region_name=_REGION,
         # Caching deliberately off for this one: the summary call happens once per
         # threshold crossing and is never re-read, so a cachePoint would only buy a
@@ -275,10 +280,10 @@ def _middleware() -> list:
         # into the chat like an answer: `nostream` keeps it out of LangGraph's messages
         # stream (the Lark card), `emit-messages` out of AG-UI (the web page).
         tags=["nostream"], metadata={"emit-messages": False},
-        timeout=_SUMMARY_TIMEOUT))]
+        timeout=_SUMMARY_TIMEOUT)
 
 
-def _summarization(model):
+def _summarization(model, trigger=None, keep=None):
     """SummarizationMiddleware that never discards history it failed to summarise.
 
     `trim_tokens_to_summarize=None`: the library default trims what it summarises to the
@@ -319,8 +324,8 @@ def _summarization(model):
 
     return SummarizationMiddleware(
         model=model,
-        trigger=("tokens", _SUMMARIZE_AT_TOKENS),
-        keep=("messages", _SUMMARIZE_KEEP),
+        trigger=trigger or ("tokens", _SUMMARIZE_AT_TOKENS),
+        keep=keep or ("messages", _SUMMARIZE_KEEP),
         trim_tokens_to_summarize=None,
     )
 
@@ -376,6 +381,45 @@ def tools_overview(session: dict) -> dict:
             # A system named here has no grant yet; its tools are listed regardless,
             # because servers gate calls, not discovery.
             "ungranted": sorted((session.get("consent") or {}).keys())}
+
+
+# /compact keeps fewer messages than the threshold does: someone asking for it wants the
+# thread smaller now, and the threshold's keep is sized for a thread that is already huge.
+_COMPACT_KEEP = int(os.environ.get("COMPACT_KEEP_MESSAGES", "6"))
+
+
+def compact(actor_id: str, mem_sid: str, workload_token: str = "") -> dict:
+    """Summarise the thread now, through the same middleware the threshold uses — so a
+    summary that comes back as the fallback line is refused here as it is there, rather
+    than replacing the history with nothing.
+
+    Written back with update_state and no node named: measured on a create_agent graph,
+    that leaves no pending step behind, and the next turn starts from the summary."""
+    thread_id = mem_sid or thread_for(actor_id)
+    if thread_busy(thread_id):
+        return {"compacted": 0, "reason": "busy"}
+    session = _get_session(actor_id, "", thread_id, workload_token=workload_token)
+    if session.get("identity_error"):
+        return {"compacted": 0, "reason": "identity"}
+    return _run(_acompact(session["graph"], session["config"]), timeout=_SUMMARY_TIMEOUT + 30)
+
+
+async def _acompact(graph, config) -> dict:
+    messages = (await graph.aget_state(config)).values.get("messages") or []
+    middleware = _summarization(_summary_model(), trigger=("messages", 1),
+                                keep=("messages", _COMPACT_KEEP))
+    # Asked first so "nothing to compact" is not reported as a failed summary. The
+    # cutoff is what the middleware itself would use; langchain is pinned <2 for it.
+    if middleware._determine_cutoff_index(messages) <= 0:
+        return {"compacted": 0, "reason": "short", "messages": len(messages)}
+    update = await middleware.abefore_model({"messages": messages}, None)
+    if not update:
+        return {"compacted": 0, "reason": "failed"}
+    await graph.aupdate_state(config, update)
+    after = (await graph.aget_state(config)).values.get("messages") or []
+    kept = sum(1 for m in after if not _is_summary(m))
+    telemetry.count("compacted")
+    return {"compacted": len(messages) - kept, "kept": kept}
 
 
 async def atools_overview(actor_id: str, mem_sid: str, workload_token: str = "") -> dict:
