@@ -65,11 +65,11 @@ class StorageStack(Stack):
             subnet_configuration=[sandbox_subnets] + ([ec2.SubnetConfiguration(
                 name="public", cidr_mask=24, subnet_type=ec2.SubnetType.PUBLIC)]
                 if nat_gateway else []),
-            gateway_endpoints={
-                "S3": ec2.GatewayVpcEndpointOptions(
-                    service=ec2.GatewayVpcEndpointAwsService.S3),
-            },
         )
+        # Same construct id the `gateway_endpoints` option would use, so the endpoint keeps
+        # its logical id; added explicitly to hold a handle for its policy below.
+        self.s3_endpoint = self.vpc.add_gateway_endpoint(
+            "S3", service=ec2.GatewayVpcEndpointAwsService.S3)
 
         # The sandbox's own security group, and the mount targets' — separated so the file
         # system accepts NFS from the sandbox only, not from anything else in the VPC.
@@ -173,12 +173,42 @@ class StorageStack(Stack):
                 security_groups=[self.mount_sg.security_group_id],
             )
 
-        # The permissions for all of this — creating an Access Point and mounting one —
-        # live on the agent's execution role in the agentcore stack, which is also the Code
-        # Interpreter's execution role. Nothing here vends credentials.
+        # The permissions to create an Access Point and start sessions live on the agent's
+        # execution role (agentcore stack). Mounting lives on the Code Interpreter's own
+        # role below, because the sandbox holds that role's credentials and runs model-written
+        # code: it must not carry the agent's Bedrock, Secrets, Cognito or checkpoint access.
+        self.code_interpreter_role = iam.Role(
+            self, "CodeInterpreterRole",
+            assumed_by=iam.ServicePrincipal(
+                "bedrock-agentcore.amazonaws.com",
+                conditions={"StringEquals": {"aws:SourceAccount": account}}),
+            description="Code Interpreter sandbox: mount this project's S3 Files file system, nothing else")
+        # Both name sets: S3 Files runs on the EFS control plane, so the elasticfilesystem
+        # aliases are what some mount paths check (measured: "S3 Files mount failed: access
+        # denied" without them). The file system policy above already refuses any mount that
+        # names no Access Point.
+        self.code_interpreter_role.add_to_policy(iam.PolicyStatement(
+            actions=["s3files:ClientMount", "s3files:ClientWrite", "s3files:GetAccessPoint",
+                     "elasticfilesystem:ClientMount", "elasticfilesystem:ClientWrite",
+                     "elasticfilesystem:DescribeMountTargets"],
+            resources=[
+                self.file_system.ref,
+                f"{self.file_system.ref}/access-point/*",
+                f"arn:aws:elasticfilesystem:{region}:{account}:file-system/"
+                f"{self.file_system.attr_file_system_id}",
+            ]))
+
+        # Code Interpreter traffic is the only S3 traffic in this VPC, and it needs only the
+        # user-files bucket (the mount's backing store). Without this, any credential or
+        # presigned URL the sandbox obtains reaches any bucket in the region.
+        self.s3_endpoint.add_to_policy(iam.PolicyStatement(
+            principals=[iam.AnyPrincipal()],
+            actions=["s3:*"],
+            resources=[user_files_bucket.bucket_arn, user_files_bucket.arn_for_objects("*")]))
 
         CfnOutput(self, "FileSystemId", value=self.file_system.attr_file_system_id)
         CfnOutput(self, "FileSystemArn", value=self.file_system.ref)
+        CfnOutput(self, "CodeInterpreterRoleArn", value=self.code_interpreter_role.role_arn)
         CfnOutput(self, "SandboxSecurityGroupId",
                   value=self.sandbox_sg.security_group_id)
         CfnOutput(self, "SandboxSubnetIds", value=",".join(

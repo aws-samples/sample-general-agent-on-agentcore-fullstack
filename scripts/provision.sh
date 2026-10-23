@@ -361,10 +361,10 @@ phase_code() {
     echo "  code execution: off (set FILES_STORAGE=true in .env)"; return 0
   fi
   local role subnets sg name existing
-  role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
+  role="$(cfn_out "$PREFIX-storage" CodeInterpreterRoleArn)"
   subnets="$(cfn_out "$PREFIX-storage" SandboxSubnetIds)"
   sg="$(cfn_out "$PREFIX-storage" SandboxSecurityGroupId)"
-  [ -n "$subnets" ] && [ "$subnets" != "None" ] || {
+  [ -n "$subnets" ] && [ "$subnets" != "None" ] && [ -n "$role" ] && [ "$role" != "None" ] || {
     echo "storage stack outputs missing — run --base with FILES_STORAGE=true first"; exit 1; }
   name="${PREFIX//-/_}_code"
 
@@ -375,11 +375,32 @@ phase_code() {
   # No filesystemConfigurations here on purpose: the mount is named per session, so one
   # shared interpreter serves every user with their own Access Point. See docs/architecture.md.
   existing="$(aws bedrock-agentcore-control list-code-interpreters \
-    --query "codeInterpreterSummaries[?name=='$name'].codeInterpreterId" --output text 2>/dev/null | head -1)"
+    --query "codeInterpreterSummaries[?name=='$name' && status!='DELETED' && status!='DELETING'].codeInterpreterId" \
+    --output text 2>/dev/null | head -1)"
   if [ -n "$existing" ] && [ "$existing" != "None" ]; then
-    echo "  reusing $existing"
-    ctx_set code_interpreter_id "$existing"
-    return 0
+    # There is no UpdateCodeInterpreter, so an interpreter whose role, subnets or security
+    # group no longer match is replaced. Files are unaffected (they live in S3 Files);
+    # sessions open on the old one end.
+    if aws bedrock-agentcore-control get-code-interpreter --code-interpreter-id "$existing" \
+         --output json | ROLE="$role" SUBNETS="$subnets" SG="$sg" uv run python -c '
+import json, os, sys
+c = json.load(sys.stdin); v = c["networkConfiguration"].get("vpcConfig", {})
+want = (os.environ["ROLE"], sorted(x for x in os.environ["SUBNETS"].split(",") if x), [os.environ["SG"]])
+sys.exit(0 if (c.get("executionRoleArn"), sorted(v.get("subnets", [])), v.get("securityGroups", [])) == want else 1)'
+    then
+      echo "  reusing $existing"
+      ctx_set code_interpreter_id "$existing"
+      return 0
+    fi
+    echo "  $existing has a stale role or network config — replacing it"
+    aws bedrock-agentcore-control delete-code-interpreter --code-interpreter-id "$existing" >/dev/null
+    for _ in $(seq 1 40); do
+      case "$(aws bedrock-agentcore-control get-code-interpreter --code-interpreter-id "$existing" \
+                --query status --output text 2>/dev/null || echo GONE)" in
+        GONE|DELETED) break ;;
+      esac
+      sleep 6
+    done
   fi
   local cid
   cid="$(acp create_code_interpreter "$(NAME="$name" ROLE="$role" SUBNETS="$subnets" SG="$sg" \

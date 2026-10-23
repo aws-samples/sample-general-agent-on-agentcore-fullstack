@@ -220,9 +220,9 @@ class AgentCoreStack(Stack):
         )
 
         # Code execution: one shared Code Interpreter, one Access Point per user, and the
-        # session mounts that user's Access Point. The agent needs to create the Access
-        # Point on first use and to drive sessions — it never gets mount credentials of its
-        # own, and never S3 access to the bucket. See docs/architecture.md.
+        # session mounts that user's Access Point. The agent creates the Access Point on
+        # first use and drives sessions; the sandbox runs under its own role (storage
+        # stack), so model-written code never holds this one. See docs/architecture.md.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["bedrock-agentcore:StartCodeInterpreterSession",
@@ -245,20 +245,8 @@ class AgentCoreStack(Stack):
                 resources=["*"],
             )
         )
-        # Mounting itself. Without these the session fails to start with "S3 Files mount
-        # failed: access denied" (measured). Both name sets are needed: S3 Files runs on the
-        # EFS control plane, so the elasticfilesystem aliases are what some paths check.
-        # The file system's own resource policy refuses any mount that names no Access Point,
-        # so these permissions cannot reach the file system root.
-        self.execution_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["s3files:ClientMount", "s3files:ClientWrite",
-                         "elasticfilesystem:ClientMount", "elasticfilesystem:ClientWrite",
-                         "elasticfilesystem:DescribeMountTargets"],
-                resources=[f"arn:aws:s3files:{region}:{account}:file-system/*",
-                           f"arn:aws:elasticfilesystem:{region}:{account}:file-system/*"],
-            )
-        )
+        # Mounting is not here: it is the Code Interpreter's own role (storage stack) that
+        # mounts, and this role never does.
 
         # ECR pull (agent image lives in the CDK assets repo).
         self.execution_role.add_to_policy(
