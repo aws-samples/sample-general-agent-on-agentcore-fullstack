@@ -51,6 +51,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 import code_tools
 import delivery
+import images
 import lark_3lo
 import lark_notify
 import memory_tools
@@ -178,6 +179,43 @@ def _thread_of(runtime) -> str:  # noqa: ANN001 — the framework's own type
     return getattr(getattr(runtime, "execution_info", None), "thread_id", "") or ""
 
 
+class _ImageMiddleware:
+    """Puts the pixels into the model call without putting them into the conversation.
+
+    An image costs tokens by area on every request that carries it, and the thread is
+    replayed each turn, so an inlined screenshot would be billed for the life of the
+    conversation. The stored message keeps a handle; the bytes are fetched for the turn
+    the image arrived in and attached here, to the request only. Nothing to evict later,
+    so the cache prefix is never rewritten."""
+
+    name = "images"
+
+    def _attach(self, request):  # noqa: ANN001 — the framework's own type
+        from langgraph.config import get_config
+        try:
+            blocks = ((get_config() or {}).get("configurable") or {}).get("image_blocks")
+        except Exception:  # noqa: BLE001 — no run config means no images to attach
+            return request
+        if not blocks or not request.messages:
+            return request
+        last = request.messages[-1]
+        if not isinstance(last, HumanMessage):
+            return request
+        text = last.content if isinstance(last.content, str) else ""
+        # Same id, so this replaces the message in the request rather than appending to
+        # the thread. The stored copy keeps its placeholders.
+        request.messages = request.messages[:-1] + [HumanMessage(
+            id=last.id,
+            content=([{"type": "text", "text": text}] if text else []) + list(blocks))]
+        return request
+
+    def wrap_model_call(self, request, handler):  # noqa: ANN001 — the framework's signature
+        return handler(self._attach(request))
+
+    async def awrap_model_call(self, request, handler):  # noqa: ANN001 — same
+        return await handler(self._attach(request))
+
+
 class _SteeringMiddleware:
     """Injects messages that arrived mid-turn, at the only boundary where it is legal."""
 
@@ -201,10 +239,14 @@ def _middleware() -> list:
     # framework does, matching how summarisation is imported.
     steering = type("SteeringMiddleware", (AgentMiddleware,),
                     dict(_SteeringMiddleware.__dict__))()
+    # First in the list: the image bytes are attached to the outgoing request only, so
+    # anything after this — summarisation especially — works on the placeholders.
+    pictures = type("ImageMiddleware", (AgentMiddleware,),
+                    dict(_ImageMiddleware.__dict__))()
     if not _SUMMARIZE_AT_TOKENS:
-        return [steering]
+        return [pictures, steering]
     from langchain.agents.middleware import SummarizationMiddleware
-    return [steering, SummarizationMiddleware(
+    return [pictures, steering, SummarizationMiddleware(
         # Caching deliberately off for this one: the summary call happens once per
         # threshold crossing and is never re-read, so a cachePoint would only buy a
         # 1.25-2x write premium.
@@ -734,7 +776,8 @@ def run_chat(actor_id: str, message: str, email: str = "",
 
 def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
                mem_sid: str = "", message_id: str = "", reaction_id: str = "",
-               fresh_session: bool = False, workload_token: str = "") -> dict:
+               fresh_session: bool = False, workload_token: str = "",
+               image_handles: list | None = None) -> dict:
     """Accept the work and answer later.
 
     A real task can outlast any request/response window (InvokeAgentRuntime caps at
@@ -762,10 +805,30 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
 
+    # Handles become text the thread keeps; the bytes are fetched once for this run and
+    # attached to the model call by _ImageMiddleware, so the thread never carries them.
+    # Pictures are shown to the model; anything else is named, and save_attachment is how
+    # the model opens it. Either way the bytes stay out of the thread.
+    image_blocks: list = []
+    attachments = list(image_handles or [])
+    if attachments:
+        pictures = [(h.get("message_id", ""), h.get("key", ""))
+                    for h in attachments if h.get("kind") == images.IMAGE]
+        image_blocks = images.blocks_for(pictures[:images.MAX_PER_MESSAGE])
+        marks = []
+        for i, h in enumerate(attachments, start=1):
+            if h.get("kind") == images.IMAGE:
+                mark = images.placeholder(i, h.get("message_id", ""), h.get("key", ""))
+                marks.append(mark if image_blocks else mark + " (no longer available)")
+            else:
+                marks.append(f"[attachment {i}: {h.get('name') or 'file'} — "
+                             f"call save_attachment({i}) to open it]")
+        message = "\n".join([message, *marks]).strip() if message else " ".join(marks)
+
     def _run_turn() -> None:
         try:
             with telemetry.timed("turn", surface="lark"):
-                answer = _stream_to_chat(s, message, chat_id)
+                answer = _stream_to_chat(s, message, chat_id, image_blocks, attachments)
             idp = _hit_auth_wall(s)
             if idp:
                 telemetry.count("auth_wall", surface="lark", idp=idp)
@@ -823,15 +886,23 @@ def _message_text(msg) -> str:
 _STREAM_END = object()
 
 
-def _run_config(session: dict, channel: delivery.Delivery) -> dict:
-    """The session's config plus the surface this run can deliver a file to.
+def _run_config(session: dict, channel: delivery.Delivery,
+                image_blocks: list | None = None,
+                image_handles: list | None = None) -> dict:
+    """The session's config plus what belongs to this run alone: where a file may be
+    delivered, and the pixels of any image that arrived with the message.
 
     A fresh dict every run: the session is cached per actor and thread and is served to
-    every surface, so a target stored on it would send one surface's file to another's.
+    every surface, so a target stored on it would send one surface's file to another's,
+    and an image left behind would be re-sent with somebody else's question.
     """
     configurable = session["config"]["configurable"]
     return {**session["config"],
-            "configurable": {**configurable, "delivery": channel}}
+            "configurable": {**configurable, "delivery": channel,
+                             # Pixels for the model, handles for use_image — both only
+                             # for this run, and the handles never come from the model.
+                             "image_blocks": image_blocks or [],
+                             "attachments": image_handles or []}}
 
 
 def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
@@ -931,7 +1002,9 @@ async def aiter_on_agent_loop(agen_factory):
         yield item
 
 
-def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
+def _stream_to_chat(session: dict, message: str, chat_id: str,
+                    image_blocks: list | None = None,
+                    image_handles: list | None = None) -> str:
     """Run the turn, typing the answer into a streaming card as it is produced, and
     return the full text. If the card can't be created or an update fails (e.g. the
     cardkit:card:write scope isn't granted), fall back to posting the final text — the
@@ -953,7 +1026,8 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
 
     acc = []
     for delta in _iter_deltas(session["graph"], message,
-                              _run_config(session, delivery.LarkDelivery(chat_id)),
+                              _run_config(session, delivery.LarkDelivery(chat_id),
+                                          image_blocks, image_handles),
                               on_tool_use=_abort_on_ungranted_tool,
                               on_tool_result=lambda name, text: session["tool_texts"].append((name, text))):
         acc.append(delta)

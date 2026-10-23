@@ -59,9 +59,20 @@ class LarkDelivery(Delivery):
                     "Compress it or split it, then send again.")
         return None
 
+    # Sent through im/v1/images so they render in the chat; a file attachment of a png
+    # is something the user has to download before they can look at it.
+    _IMAGES = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
+
     def send_file(self, name: str, data: bytes,
                   cover: Callable[[], bytes | None]) -> str:
         suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if suffix in self._IMAGES:
+            try:
+                key = lark_notify.upload_image(data)
+                if lark_notify.send_image(self.target, key):
+                    return f"Sent {name} to the chat; it shows there."
+            except lark_notify.LarkError as e:
+                return f"{name} was not sent. {e}"
         # The upload's file_type and the message type have to agree: an mp4-typed upload
         # refuses to be sent as `file` ("The type of file upload does not match the type
         # of message being sent"), and `media` will not render without a cover. So a video

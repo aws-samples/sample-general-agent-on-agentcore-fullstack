@@ -1123,9 +1123,45 @@ def test_the_summariser_does_not_pay_for_prompt_caching():
 
 
 def test_summarisation_can_be_disabled_outright():
-    """Steering stays either way — it is what keeps a mid-turn message from being lost."""
+    """Steering and image attachment stay either way — one keeps a mid-turn message from
+    being lost, the other is what lets the model see a screenshot at all."""
     with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        assert [type(m).__name__ for m in agent_core._middleware()] == ["SteeringMiddleware"]
+        assert [type(m).__name__ for m in agent_core._middleware()] == [
+            "ImageMiddleware", "SteeringMiddleware"]
+
+
+def test_the_pixels_reach_the_request_but_never_the_thread():
+    """The whole point: the model sees the image on this turn, and the stored thread keeps
+    only a handle, so the image is not re-billed on every later turn."""
+    from langchain_core.messages import HumanMessage as _HM
+    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "images"][0]
+    stored = _HM(id="m1", content="what is in this? [image 1 msg=om_x key=img_y]")
+    request = type("R", (), {"messages": [stored]})()
+    block = {"type": "image", "base64": "Zm9v", "mime_type": "image/jpeg"}
+    with mock.patch("langgraph.config.get_config",
+                    return_value={"configurable": {"image_blocks": [block]}}):
+        out = mw._attach(request)
+    sent = out.messages[-1]
+    kinds = [b["type"] for b in sent.content]
+    assert kinds == ["text", "image"]
+    # Same id, so this replaces the message in the request rather than growing the thread.
+    assert sent.id == "m1"
+    # The stored message is untouched: still text, still carrying the handle.
+    assert stored.content == "what is in this? [image 1 msg=om_x key=img_y]"
+
+
+def test_a_run_with_no_images_is_left_alone():
+    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "images"][0]
+    from langchain_core.messages import HumanMessage as _HM
+    request = type("R", (), {"messages": [_HM(id="m1", content="just text")]})()
+    with mock.patch("langgraph.config.get_config", return_value={"configurable": {}}):
+        assert mw._attach(request).messages[-1].content == "just text"
+
+
+def test_images_are_attached_before_anything_downstream_can_see_them():
+    """First in the chain on purpose: summarisation runs on the placeholders, never on
+    the bytes, and its token counter charges a flat 85 per image regardless of size."""
+    assert [type(m).__name__ for m in agent_core._middleware()][0] == "ImageMiddleware"
 
 
 def test_summarisation_rewrites_state_so_the_checkpoint_shrinks():

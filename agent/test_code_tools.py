@@ -345,5 +345,53 @@ def test_the_guard_does_not_hide_the_runs_config_from_the_tool(_lark):
     assert _lark["file"].call_args.args[0] == "oc_real"
 
 
+def test_save_attachment_takes_its_handle_from_the_run_not_from_the_model(_lark):
+    """A tenant token can read every chat this bot is in, so a handle the model supplied
+    would let a prompt injection fetch a stranger's file. The run config is the only
+    source, and the model only ever names a position."""
+    box = _DeliverBox()
+    written = {}
+    box.write_bytes = lambda name, data: written.update({"name": name, "size": len(data)})
+    tools = {t.name: t for t in code_tools.tools_for("lark:ou_x", box)}
+    assert list(tools["save_attachment"].args) == ["which"], \
+        "no handle may come from the model"
+
+    with mock.patch.object(code_tools.images.lark_notify, "fetch_message_resource",
+                           return_value=b"PK\x03\x04") as fetched:
+        out = tools["save_attachment"].invoke(
+            {"which": 1},
+            config={"configurable": {"attachments": [
+                {"kind": "file", "key": "file_real", "name": "report.pdf",
+                 "message_id": "om_real"}]}})
+    assert "report.pdf" in out and written["name"] == "report.pdf"
+    # The kind has to travel with the handle: Lark answers 500 if it does not match.
+    assert fetched.call_args.args == ("om_real", "file_real", "file")
+
+    # Nothing in the config means nothing to fetch, whatever the model asks for.
+    out = tools["save_attachment"].invoke({"which": 1}, config={"configurable": {}})
+    assert "Nothing came with this message" in out
+
+
+def test_a_picture_keeps_a_usable_name_when_the_sender_gave_none(_lark):
+    box = _DeliverBox()
+    written = {}
+    box.write_bytes = lambda name, data: written.update({"name": name})
+    tools = {t.name: t for t in code_tools.tools_for("lark:ou_x", box)}
+    with mock.patch.object(code_tools.images.lark_notify, "fetch_message_resource",
+                           return_value=b"\xff\xd8ab"):
+        tools["save_attachment"].invoke(
+            {"which": 1},
+            config={"configurable": {"attachments": [
+                {"kind": "image", "key": "img_1", "message_id": "om_1"}]}})
+    assert written["name"] == "image-1.jpg"
+
+
+def test_an_edited_image_is_sent_so_it_shows_rather_than_downloads(_lark):
+    with mock.patch.object(delivery.lark_notify, "send_image", return_value=True) as shown:
+        out = _deliver(_DeliverBox(), delivery.LarkDelivery("oc_1"), "cropped.png")
+    assert "shows there" in out
+    assert shown.called and not _lark["file"].called
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

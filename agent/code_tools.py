@@ -27,6 +27,7 @@ import os
 import re
 
 import delivery
+import images
 import telemetry
 
 import boto3
@@ -134,6 +135,21 @@ class _Sandbox:
             log.warning("could not stop code session %s", self._session_id, exc_info=True)
         self._session_id = ""
 
+    def write_bytes(self, path: str, data: bytes) -> None:
+        """Put bytes into the workspace, where generated code can work on them.
+
+        `writeFiles` takes a `blob` member, so unlike the read direction this needs no
+        base64 — measured: 4 KB of random bytes arrived in the mount with a matching
+        sha256. It cannot write to the mount directly (that path is refused as
+        traversal), hence the copy, which is documented as working."""
+        self._client.invoke_code_interpreter(
+            codeInterpreterIdentifier=_INTERPRETER_ID, sessionId=self.session_id(),
+            name="writeFiles", arguments={"content": [{"path": path, "blob": data}]})
+        out = self.invoke("executeCommand", {
+            "command": f"cp -- {json.dumps(path)} {json.dumps(_WORKSPACE + '/' + path)}"})
+        if out not in ("(no output)", ""):
+            raise OSError(out)
+
     def file_size(self, path: str) -> int | None:
         """The file's size in bytes, or None if it is not there. Cheap on purpose: it
         decides whether reading the whole thing is worth it."""
@@ -237,6 +253,11 @@ class _DeliverFileArgs(BaseModel):
     path: str = Field(description="The file to send, relative to the workspace root.")
 
 
+class _SaveAttachmentArgs(BaseModel):
+    which: int = Field(default=1, description="Which attachment from the message, 1 for "
+                                              "the first. Not an id — just its position.")
+
+
 
 
 def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
@@ -321,6 +342,21 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
 
         return channel.send_file(name, box.read_bytes(path), cover)
 
+    def save_attachment(which: int = 1, config: RunnableConfig = None) -> str:
+        """Write something the user sent into the workspace, so code can open it."""
+        # Straight from the run config, never parsed out of the conversation: history
+        # also holds the model's own words, so a handle read from text could be one it
+        # invented — and a tenant token can read any chat this bot belongs to.
+        handles = ((config or {}).get("configurable") or {}).get("attachments") or []
+        if not handles:
+            return ("Nothing came with this message. Ask the user to send the file again "
+                    "in the message where they want it used.")
+        if not 1 <= which <= len(handles):
+            return f"This message carried {len(handles)} attachment(s)."
+        h = handles[which - 1]
+        name = images.save_to_workspace(box, h, which)
+        return f"Saved it as {name} in the workspace."
+
     return [
         StructuredTool.from_function(
             func=_guard(run_code), name="run_code",
@@ -359,4 +395,13 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
                 "it. What a surface can carry differs, so read the reply: it says whether "
                 "the file went out, and what to tell them if it could not."),
             args_schema=_DeliverFileArgs),
+        StructuredTool.from_function(
+            func=_guard(save_attachment), name="save_attachment",
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
+                "Write a file the user just sent — a document, a video, a picture — into "
+                "the workspace, so run_code can open it. This is how you read a pdf, "
+                "docx, csv or mp4 they attached: its contents are not in front of you. "
+                "An image you can already see, so reach for it only to change one. Send "
+                "anything you produce back with deliver_file."),
+            args_schema=_SaveAttachmentArgs),
     ]

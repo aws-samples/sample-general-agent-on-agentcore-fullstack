@@ -230,14 +230,20 @@ async def handle_invocations(request: web.Request) -> web.Response:
         # Set on the consent-resume replay: rebuild the session so the just-vaulted
         # token is picked up instead of the cached unauthorized one.
         fresh_session = bool(payload.get("freshSession"))
-        if not (message and chat_id):
-            return web.json_response({"error": "message and chatId required"}, status=400)
+        # Handles, not bytes: the agent fetches the image itself, so nothing large travels
+        # through the router's parked state or its async self-invoke.
+        image_handles = payload.get("images") or []
+        # An image with no caption is a real message, so only the chat is required.
+        if not (message or image_handles) or not chat_id:
+            return web.json_response({"error": "chatId and a message or image required"},
+                                     status=400)
         try:
             # Returns as soon as the work is accepted; the result is pushed to the
             # chat later. Consent still comes back inline (see chat_async).
             result = await asyncio.get_event_loop().run_in_executor(
                 None, agent_core.chat_async, actor_id, message, chat_id, email,
                 mem_sid, msg_id, reaction_id, fresh_session, workload_token,
+                image_handles,
             )
             return web.json_response(result)
         except Exception as e:

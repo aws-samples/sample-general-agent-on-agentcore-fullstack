@@ -185,6 +185,32 @@ def upload_image(data: bytes) -> str:
     return key
 
 
+def fetch_message_resource(message_id: str, key: str, kind: str = "image") -> bytes:
+    """The bytes of something somebody sent, read back from the message that carried it.
+
+    Lark keeps the original, so nothing here has to store one. Two things to know: the
+    `im/v1/images/{key}` endpoint serves only keys this app uploaded and fails for
+    anything received, so a resource has to be addressed through its message; and `kind`
+    must match what the key is — asking for `image` on a file key answers 500."""
+    tok = _tenant_token()
+    if not tok:
+        raise LarkError("no tenant token, so the attachment cannot be read")
+    url = (f"{_API_DOMAIN}/open-apis/im/v1/messages/{message_id}"
+           f"/resources/{key}?type={kind}")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
+            return r.read()
+    except urllib.error.HTTPError as e:
+        # Recalled and deleted messages both land here, and the user can act on that.
+        raise LarkError(f"Lark would not return the attachment: {e.code}") from e
+
+
+def send_image(chat_id: str, image_key: str) -> bool:
+    """Post an image so it renders in the chat rather than arriving as a download."""
+    return _send_media_message(chat_id, "image", {"image_key": image_key})
+
+
 def send_file(chat_id: str, file_key: str) -> bool:
     """Post an uploaded file as an attachment."""
     return _send_media_message(chat_id, "file", {"file_key": file_key})
