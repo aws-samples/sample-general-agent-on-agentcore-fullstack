@@ -108,7 +108,10 @@ Then message the bot. `/help` lists the commands in chat:
 | Command | What it does |
 |---|---|
 | `/auth`, `/auth <idp>` | Authorization status per downstream system; authorize or re-authorize one |
-| `/status` | Identity, both session ids, the microVM serving you, the model it really calls, turns and tool calls |
+| `/status` | Identity, both session ids, the microVM serving you, turns and tool calls, and the context size the last request was billed for |
+| `/model` | The model, region, prompt cache, compaction and system-prompt settings of the container serving you |
+| `/tools` | The tools this conversation really has, grouped by where they came from, with the `/auth` an ungranted system needs |
+| `/compact` | Fold the older part of the thread into a summary now, keeping the last few messages |
 | `/new`, `/reset`, `/reconnect` | Rotate both ids, the thread only, or the runtime instance only |
 | `/clear` | Actually delete this thread's checkpoints |
 
