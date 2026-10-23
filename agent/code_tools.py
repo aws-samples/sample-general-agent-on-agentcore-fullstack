@@ -25,10 +25,11 @@ import logging
 import os
 import re
 
-import lark_notify
+import delivery
 import telemetry
 
 import boto3
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
@@ -44,6 +45,11 @@ _SESSION_TIMEOUT = int(os.environ.get("CODE_SESSION_TIMEOUT_SECONDS", "1800"))
 # One tool result goes into the model's context, so a runaway print must not fill it. Big
 # enough for a real traceback or a printed DataFrame; ~3k tokens at the ceiling.
 _MAX_OUTPUT = int(os.environ.get("CODE_MAX_OUTPUT_CHARS", "12000"))
+# True only when the sandbox's VPC has a NAT; decides what the tool descriptions promise.
+_INTERNET = os.environ.get("CODE_INTERNET", "").strip().lower() == "true"
+_INSTALL_NOTE = (
+    "The sandbox has internet, so a missing package can be pip/npm installed; installs "
+    "last only for this session." if _INTERNET else "Nothing can be installed.")
 
 
 def available() -> bool:
@@ -126,6 +132,13 @@ class _Sandbox:
         except Exception:  # noqa: BLE001 — the session expires on its own anyway
             log.warning("could not stop code session %s", self._session_id, exc_info=True)
         self._session_id = ""
+
+    def file_size(self, path: str) -> int | None:
+        """The file's size in bytes, or None if it is not there. Cheap on purpose: it
+        decides whether reading the whole thing is worth it."""
+        out = self.invoke("executeCommand", {
+            "command": f"stat -c %s -- {json.dumps(_WORKSPACE + '/' + path)} 2>/dev/null"})
+        return int(out) if out.strip().isdigit() else None
 
     def read_bytes(self, path: str) -> bytes:
         """The contents of a workspace file, as bytes, without passing through the model.
@@ -220,17 +233,9 @@ class _DeliverFileArgs(BaseModel):
     path: str = Field(description="The file to send, relative to the workspace root.")
 
 
-# Lark's own ceiling for an uploaded file. Checked here so an oversized send fails with a
-# sentence the model can act on rather than an API error it has to interpret.
-_MAX_DELIVER_BYTES = 30 * 1000 * 1000
-# Only mp4 plays inline; everything else is an attachment. Lark names a handful of types
-# and treats the rest as `stream`.
-_NAMED_TYPES = {"mp4": "mp4", "pdf": "pdf", "doc": "doc", "docx": "doc", "xls": "xls",
-                "xlsx": "xls", "ppt": "ppt", "pptx": "ppt", "opus": "opus"}
 
 
-def tools_for(actor_id: str, sandbox: _Sandbox | None = None,
-              deliver_to: dict | None = None) -> list:
+def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
     """The three code tools bound to this user, or [] when code execution is not deployed.
 
     Absent-not-broken, like search and long-term memory: without an interpreter the agent
@@ -238,12 +243,6 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None,
     if not available():
         return []
     box = sandbox or _Sandbox(actor_id)
-    # Falls back to a DM only when the turn has no chat — the web page and A2A, where
-    # lark_notify._rid_type reads an `ou_` id as "send to the person".
-    open_id = actor_id.split(":", 1)[1] if ":" in actor_id else actor_id
-
-    def _target() -> str:
-        return (deliver_to or {}).get("chat_id") or open_id
 
     def _guard(fn):
         # Counted by name and outcome: "did a tool actually run" is the one question a
@@ -283,42 +282,36 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None,
         return box.invoke("executeCommand",
                           {"command": f"cd {_WORKSPACE} && ls -la -- {json.dumps(path)}"})
 
-    def deliver_file(path: str) -> str:
+    def deliver_file(path: str, config: RunnableConfig = None) -> str:
         # The workspace is this user's own mount, so a traversal reaches no one else's
         # files — but it does reach the sandbox's system paths, which are not ours to send.
         if path.startswith("/") or ".." in path.split("/"):
             return "Give a path inside the workspace, without .. or a leading /."
+        # Which surface this turn came from, injected per run rather than held on the
+        # session, which is shared across surfaces. config is not in the args schema, so
+        # the model neither sees nor sets it.
+        channel = delivery.for_run(config)
         name = os.path.basename(path)
-        suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        data = box.read_bytes(path)
-        if not data:
+        size = box.file_size(path)
+        if size is None:
+            return f"There is no {name} in the workspace — check list_files for the name."
+        if size == 0:
             return f"{name} is empty, so there is nothing to send."
-        if len(data) > _MAX_DELIVER_BYTES:
-            return (f"{name} is {len(data) / 1e6:.1f} MB and Lark accepts 30 MB. "
-                    "Compress it or split it, then send again.")
-        # A video plays inline only as `media`, which Lark will not render without a cover,
-        # so a still frame is cut for it. The upload's file_type and the message type have
-        # to agree — an mp4-typed upload refuses to be sent as `file` ("The type of file
-        # upload does not match the type of message being sent") — hence the re-upload as
-        # `stream` when there is no cover to send it with.
-        if suffix == "mp4":
-            cover = box.invoke("executeCommand", {"command": (
+        # Asked before the bytes are read: a file this surface will refuse should not cost
+        # a base64 round trip first.
+        refused = channel.refusal(name, size)
+        if refused:
+            return refused
+
+        def cover() -> bytes | None:
+            """A still frame, cut only if the surface needs one to render a video."""
+            made = box.invoke("executeCommand", {"command": (
                 f"cd {_WORKSPACE} && FF=$(python3 -c 'import imageio_ffmpeg as f;"
                 f" print(f.get_ffmpeg_exe())') && \"$FF\" -y -i {json.dumps(name)}"
                 " -frames:v 1 -f image2 _cover.jpg >/dev/null 2>&1 && echo ok")})
-            if "ok" in cover:
-                image = lark_notify.upload_image(box.read_bytes("_cover.jpg"))
-                key = image and lark_notify.upload_file(name, data, "mp4")
-                if key and lark_notify.send_media(_target(), key, image):
-                    return f"Sent {name} to the chat; it plays there."
-            log.info("no cover for %s, sending it as an attachment", name)
-        key = lark_notify.upload_file(name, data, _NAMED_TYPES.get(suffix, "stream")
-                                      if suffix != "mp4" else "stream")
-        if not key:
-            return f"Lark would not accept {name}."
-        if lark_notify.send_file(_target(), key):
-            return f"Sent {name} to the chat as an attachment."
-        return f"{name} uploaded but the message would not send."
+            return box.read_bytes("_cover.jpg") if "ok" in made else None
+
+        return channel.send_file(name, box.read_bytes(path), cover)
 
     return [
         StructuredTool.from_function(
@@ -327,7 +320,7 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None,
                 "Run code and get its output. Use this for anything computed rather than "
                 "recalled — data work, file conversion, checking your own arithmetic. "
                 "Files you write persist between turns and across days, so build on them "
-                "instead of regenerating them. Nothing can be installed; Python already has "
+                "instead of regenerating them. " + _INSTALL_NOTE + " Python already has "
                 "pandas, matplotlib, scikit-learn, opencv, moviepy and pydub (audio/video), "
                 "python-docx, python-pptx, openpyxl, pypdf and reportlab."),
             args_schema=_RunCodeArgs),
@@ -336,7 +329,9 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None,
             description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "Run one shell command in the workspace. Use it for the things a shell is "
                 "better at than a program — inspecting files, moving them, checking sizes. "
-                "No internet and no root, so nothing can be installed. Available: jq, "
+                + ("No root, so no system packages (dnf). " if _INTERNET else
+                   "No internet and no root, so nothing can be installed. ")
+                + "Available: jq, "
                 "sqlite3, gcc, make, ImageMagick `convert`. ffmpeg is not on PATH; its path "
                 "is `python3 -c 'import imageio_ffmpeg as f; print(f.get_ffmpeg_exe())'`. "
                 "Not available: git, pandoc, LibreOffice, tesseract, any browser."),
@@ -353,7 +348,7 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None,
                 "Send a file from the workspace to the person you are talking to, so they "
                 "can open it. The workspace is not visible to them, so a file they asked "
                 "for is not delivered until you call this — say what you made, then send "
-                "it. An mp4 plays in the chat; anything else arrives as an attachment. "
-                "Limit 30 MB."),
+                "it. What a surface can carry differs, so read the reply: it says whether "
+                "the file went out, and what to tell them if it could not."),
             args_schema=_DeliverFileArgs),
     ]

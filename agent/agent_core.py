@@ -50,6 +50,7 @@ from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 import code_tools
+import delivery
 import lark_3lo
 import lark_notify
 import memory_tools
@@ -78,8 +79,8 @@ _GOOGLE_SCOPES = os.environ.get(
 _DOWNSTREAMS = {k: v for k, v in {
     "google": (_GOOGLE_MCP_URL, _GOOGLE_PROVIDER, _GOOGLE_SCOPES),
 }.items() if v[0] and v[1]}
-# Short on purpose. Operational facts a model cannot infer — the workspace persists, there
-# is no internet — live in each tool's description, next to what they constrain, instead of
+# Short on purpose. Operational facts a model cannot infer — the workspace persists, whether
+# there is internet — live in each tool's description, next to what they constrain, instead of
 # being paid for on every turn. Debugging heuristics do not belong here at all: they encode
 # one deployment's incident history into a general-purpose agent.
 _SYSTEM = os.environ.get(
@@ -512,12 +513,8 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # cached entry so _close_session can stop it. Nothing is started yet: the session only
     # begins when the model first runs something.
     sandbox = code_tools._Sandbox(actor_id) if code_tools.available() else None
-    # Where a delivered file goes. Mutable and set per turn, because the session is cached
-    # across turns while the chat is not: a file asked for in a group belongs in that
-    # group, or the others there wait for something that went to a DM.
-    deliver_to: dict = {"chat_id": ""}
     if sandbox is not None:
-        tools += code_tools.tools_for(actor_id, sandbox, deliver_to)
+        tools += code_tools.tools_for(actor_id, sandbox)
 
     saver = _checkpointer()
     # langchain.agents.create_agent, not langgraph.prebuilt.create_react_agent: the
@@ -543,7 +540,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         log.warning("could not check for an interrupted turn", exc_info=True)
     return {
         "graph": graph, "stack": stack, "sandbox": sandbox,
-        "config": config, "deliver_to": deliver_to,
+        "config": config,
         "actor_id": actor_id, "mem_sid": mem_sid,
         "created": time.time(),
         # auth_url is Lark's link and doubles as "identity unverified" for the web surfaces;
@@ -708,8 +705,9 @@ def chat_result(actor_id: str, message: str, email: str = "",
     _track(+1, thread_id)
     try:
         with telemetry.timed("turn", surface="sync"):
-            state = _run(s["graph"].ainvoke({"messages": [HumanMessage(message)]},
-                                            config=s["config"]))
+            state = _run(s["graph"].ainvoke(
+                {"messages": [HumanMessage(message)]},
+                config=_run_config(s, delivery.NoDelivery("this channel"))))
     finally:
         _track(-1, thread_id)
     for m in state.get("messages", []):
@@ -759,9 +757,6 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     if s.get("identity_error"):
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
-
-    # Reply and delivery go to the same place, so a file lands where it was asked for.
-    s.get("deliver_to", {})["chat_id"] = chat_id
 
     def _run_turn() -> None:
         try:
@@ -822,6 +817,17 @@ def _message_text(msg) -> str:
 
 
 _STREAM_END = object()
+
+
+def _run_config(session: dict, channel: delivery.Delivery) -> dict:
+    """The session's config plus the surface this run can deliver a file to.
+
+    A fresh dict every run: the session is cached per actor and thread and is served to
+    every surface, so a target stored on it would send one surface's file to another's.
+    """
+    configurable = session["config"]["configurable"]
+    return {**session["config"],
+            "configurable": {**configurable, "delivery": channel}}
 
 
 def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
@@ -942,7 +948,8 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
         return True
 
     acc = []
-    for delta in _iter_deltas(session["graph"], message, session["config"],
+    for delta in _iter_deltas(session["graph"], message,
+                              _run_config(session, delivery.LarkDelivery(chat_id)),
                               on_tool_use=_abort_on_ungranted_tool,
                               on_tool_result=lambda name, text: session["tool_texts"].append((name, text))):
         acc.append(delta)

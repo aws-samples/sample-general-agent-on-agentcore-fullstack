@@ -91,8 +91,11 @@ async def handle(request: web.Request, payload: dict,
     run_input = RunAgentInput(**{**payload,
                                 "threadId": session["mem_sid"],
                                 "runId": payload.get("runId") or session["mem_sid"]})
+    # The page has no way to carry a file yet, and this session is also served to Lark, so
+    # the run says so explicitly rather than inheriting whatever chat was served last.
     agui = LangGraphAgent(name="agentcore-fullstack", graph=session["graph"],
-                          config=session["config"])
+                          config=agent_core._run_config(
+                              session, agent_core.delivery.NoDelivery("the web page")))
     # The graph's MCP sessions live on agent_core's own loop, so the run has to happen
     # there and the events come back over a queue.
     events = agent_core.aiter_on_agent_loop(lambda: agui.run(run_input))

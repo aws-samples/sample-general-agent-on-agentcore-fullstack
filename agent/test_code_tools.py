@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 import code_tools  # noqa: E402
+import delivery  # noqa: E402
 
 _FS = "arn:aws:s3files:ap-northeast-1:1234:file-system/fs-abc"
 
@@ -205,46 +206,57 @@ def test_a_failure_with_no_output_still_says_something():
 
 
 # --- Delivering a file out of the workspace --------------------------------
-# The workspace is invisible to the user, so these cover the two things that are ours to
-# get wrong: where a file is sent, and the upload/message type pairing Lark enforces.
+# Two things are ours to get wrong: which surface a file is sent to, and the upload/message
+# type pairing Lark enforces. The first one bit already — a target stored on the cached
+# session sent a web user's file to whichever Lark chat was served last.
 
 
 class _DeliverBox(_FakeBox):
-    def __init__(self, cover: bool = True):
+    def __init__(self, cover: bool = True, size: int = 10):
         super().__init__()
         self._cover = cover
+        self._size = size
 
     def invoke(self, name, arguments):
         super().invoke(name, arguments)
         return "ok" if self._cover else "(no output)"
 
+    def file_size(self, path):
+        return self._size
+
     def read_bytes(self, path):
-        return b"\0" * 10
+        return b"\0" * self._size
 
 
 @pytest.fixture
 def _lark():
-    with mock.patch.object(code_tools.lark_notify, "upload_file",
+    with mock.patch.object(delivery.lark_notify, "upload_file",
                            return_value="file_k") as up, \
-         mock.patch.object(code_tools.lark_notify, "upload_image",
+         mock.patch.object(delivery.lark_notify, "upload_image",
                            return_value="img_k"), \
-         mock.patch.object(code_tools.lark_notify, "send_media",
+         mock.patch.object(delivery.lark_notify, "send_media",
                            return_value=True) as media, \
-         mock.patch.object(code_tools.lark_notify, "send_file",
+         mock.patch.object(delivery.lark_notify, "send_file",
                            return_value=True) as attach:
         yield {"upload": up, "media": media, "file": attach}
 
 
+def _deliver(box, channel, path="report.pdf"):
+    """Call the tool the way a run does: the surface arrives in the config, not the args."""
+    tools = _tools(box)
+    return tools["deliver_file"].func(
+        path, {"configurable": {"delivery": channel}})
+
+
 def test_a_path_outside_the_workspace_is_refused_before_any_upload(_lark):
-    tools = _tools(_DeliverBox())
     for bad in ("/etc/passwd", "../../etc/passwd"):
-        assert "without .." in tools["deliver_file"].func(bad)
+        assert "without .." in _deliver(_DeliverBox(), delivery.LarkDelivery("oc_1"), bad)
     assert _lark["upload"].call_count == 0
 
 
 def test_an_mp4_is_sent_as_media_so_it_plays(_lark):
-    tools = _tools(_DeliverBox(cover=True))
-    assert "plays" in tools["deliver_file"].func("clip.mp4")
+    out = _deliver(_DeliverBox(cover=True), delivery.LarkDelivery("oc_1"), "clip.mp4")
+    assert "plays" in out
     assert _lark["upload"].call_args.args[2] == "mp4"
     assert _lark["media"].called and not _lark["file"].called
 
@@ -252,24 +264,52 @@ def test_an_mp4_is_sent_as_media_so_it_plays(_lark):
 def test_an_mp4_without_a_cover_is_re_uploaded_as_stream(_lark):
     """Lark refuses to send an mp4-typed upload as `file`, so the type has to change with
     the message. Measured: "The type of file upload does not match the type of message"."""
-    tools = _tools(_DeliverBox(cover=False))
-    assert "attachment" in tools["deliver_file"].func("clip.mp4")
+    out = _deliver(_DeliverBox(cover=False), delivery.LarkDelivery("oc_1"), "clip.mp4")
+    assert "attachment" in out
     assert _lark["upload"].call_args.args[2] == "stream"
     assert _lark["file"].called and not _lark["media"].called
 
 
-def test_a_file_goes_to_the_chat_that_asked_for_it_not_a_dm(_lark):
-    """A file asked for in a group belongs in that group; a DM is the fallback for the
-    surfaces that have no chat at all."""
-    target: dict = {"chat_id": "oc_group"}
-    tools = {t.name: t
-             for t in code_tools.tools_for("lark:ou_x", _DeliverBox(), target)}
-    tools["deliver_file"].func("report.pdf")
+def test_the_file_goes_where_this_run_says_not_where_the_last_one_did(_lark):
+    """The session is shared across surfaces, so the target has to travel with the run."""
+    box = _DeliverBox()
+    _deliver(box, delivery.LarkDelivery("oc_group"))
     assert _lark["file"].call_args.args[0] == "oc_group"
-
-    target["chat_id"] = ""
-    tools["deliver_file"].func("report.pdf")
+    _deliver(box, delivery.LarkDelivery("ou_x"))
     assert _lark["file"].call_args.args[0] == "ou_x"
+
+
+def test_a_surface_that_cannot_carry_files_says_so_instead_of_using_lark(_lark):
+    out = _deliver(_DeliverBox(), delivery.NoDelivery("the web page"))
+    assert "the web page" in out and "Do not claim it was sent" in out
+    assert not _lark["upload"].called and not _lark["file"].called
+
+
+def test_a_run_with_no_surface_refuses_rather_than_guessing(_lark):
+    """Forgetting to set the surface must cost a refusal, never a delivery to the wrong
+    person — that is the whole reason the target is not kept on the session."""
+    tools = _tools(_DeliverBox())
+    out = tools["deliver_file"].func("report.pdf", {"configurable": {}})
+    assert "cannot receive files" in out
+    assert not _lark["upload"].called
+
+
+def test_an_oversized_file_is_refused_before_it_is_read(_lark):
+    box = _DeliverBox(size=31 * 1000 * 1000)
+    out = _deliver(box, delivery.LarkDelivery("oc_1"), "big.mp4")
+    assert "30 MB" in out
+    assert not any("base64" in (a or {}).get("command", "") for _, a in box.calls)
+    assert not _lark["upload"].called
+
+
+def test_a_missing_file_is_named_rather_than_sent_as_empty(_lark):
+    class _Missing(_DeliverBox):
+        def file_size(self, path):
+            return None
+
+    out = _deliver(_Missing(), delivery.LarkDelivery("oc_1"), "nope.txt")
+    assert "no nope.txt" in out
+    assert not _lark["upload"].called
 
 
 if __name__ == "__main__":
