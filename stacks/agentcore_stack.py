@@ -3,8 +3,9 @@
 Scope is deliberately small (this is a from-scratch simple agent, not OpenClaw):
   - Execution role: Bedrock invoke, Cognito admin-auth (mint per-user JWT for
     MCP calls), Secrets read, CloudWatch logs, ECR pull.
-  - Container image: built from ./agent via DockerImageAsset (ARM64), pushed to
-    the CDK assets ECR repo.
+  - Container image: with AGENT_BUILD=local, built from ./agent via DockerImageAsset
+    (ARM64) and pushed to the CDK assets ECR repo; by default it is built in CodeBuild
+    by scripts/provision.sh and this stack holds no image at all.
 
 The Runtime itself is NOT a CloudFormation resource in this account/region
 (verified: no AWS::BedrockAgentCore::Runtime type). It is created out-of-band by
@@ -379,13 +380,18 @@ class AgentCoreStack(Stack):
         )
 
         # --- Container image (ARM64) ------------------------------------------
-        # Built from ./agent. deploy.sh reads this URI to create/update the runtime.
-        self.agent_image = ecr_assets.DockerImageAsset(
-            self,
-            "AgentImage",
-            directory="agent",
-            platform=ecr_assets.Platform.LINUX_ARM64,
-        )
+        # Built here only for AGENT_BUILD=local, from ./agent with the host's Docker.
+        # The default builds it natively in CodeBuild instead (scripts/provision.sh), so a
+        # deploy needs neither Docker nor an ARM64 host; its URI then travels through
+        # .cdk-state.json rather than this stack.
+        self.agent_image = None
+        if (self.node.try_get_context("agent_build") or "codebuild") == "local":
+            self.agent_image = ecr_assets.DockerImageAsset(
+                self,
+                "AgentImage",
+                directory="agent",
+                platform=ecr_assets.Platform.LINUX_ARM64,
+            )
 
         # --- Runtime ARN derived from context (populated by deploy.sh) --------
         runtime_id = self.node.try_get_context("runtime_id") or "PLACEHOLDER"
@@ -394,7 +400,8 @@ class AgentCoreStack(Stack):
         )
 
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
-        CfnOutput(self, "AgentImageUri", value=self.agent_image.image_uri)
+        if self.agent_image is not None:
+            CfnOutput(self, "AgentImageUri", value=self.agent_image.image_uri)
         CfnOutput(self, "UserFilesBucketName", value=self.user_files_bucket.bucket_name)
         CfnOutput(self, "CheckpointTableName", value=self.checkpoint_table.table_name)
         CfnOutput(self, "CheckpointBucketName", value=self.checkpoint_bucket.bucket_name)

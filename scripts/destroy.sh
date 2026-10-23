@@ -45,6 +45,8 @@ if [ "${1:-}" != "--yes" ]; then
   warn "This will DELETE all $PREFIX resources in account $ACCOUNT / $REGION:"
   warn "  + their targets, Runtimes (${RUNTIME_NAMES[*]}),"
   warn "  and CDK stacks (shim, router, storage, agentcore, observability, security)."
+  warn "  Image builds go too: the $PREFIX-* ECR repos and their images, the CodeBuild"
+  warn "  image builder and its role $PREFIX-image-builder-$REGION."
   warn "  With files storage deployed: every user's access point goes too (their files stay"
   warn "  in the bucket until the bucket itself is removed), along with the VPC."
   warn "  Secrets include your Lark credentials ($PREFIX/channels/lark) — re-seedable"
@@ -102,15 +104,25 @@ for proj in $(aws codebuild list-projects --query "projects[?starts_with(@,'$PRE
     || warn "  (CodeBuild project $proj delete failed)"
 done
 
+# The image builder's service role (scripts/lib/codebuild.sh). Not a CDK resource, and
+# named per region, so only this region's is removed.
+CB_ROLE_NAME="$PREFIX-image-builder-$REGION"
+if aws iam get-role --role-name "$CB_ROLE_NAME" >/dev/null 2>&1; then
+  for pol in $(aws iam list-role-policies --role-name "$CB_ROLE_NAME" --query 'PolicyNames' --output text); do
+    aws iam delete-role-policy --role-name "$CB_ROLE_NAME" --policy-name "$pol" >/dev/null 2>&1 || true
+  done
+  aws iam delete-role --role-name "$CB_ROLE_NAME" >/dev/null 2>&1 \
+    && echo "  deleted IAM role $CB_ROLE_NAME" || warn "  (IAM role $CB_ROLE_NAME delete failed)"
+fi
+
 # The CodeBuild source bucket is shared by every AgentCore project in the account
 # (its name carries no project prefix), so delete only our own source keys and
 # leave the bucket alone.
 SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
 if aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1; then
-  for key in "$PREFIX-mcp/source.zip" "${PREFIX//-/_}_agent/source.zip"; do
-    aws s3api delete-object --bucket "$SRC_BUCKET" --key "$key" >/dev/null 2>&1 \
-      && echo "  removed s3://$SRC_BUCKET/$key" || true
-  done
+  # One key per image, <repo>/source.zip, every repo named $PREFIX-*.
+  aws s3 rm "s3://$SRC_BUCKET/" --recursive --exclude '*' --include "$PREFIX-*/source.zip" 2>/dev/null \
+    | sed 's/^delete: /  removed /' || true
 fi
 
 # --- 1c. Log groups (auto-created by runtimes / CodeBuild / Memory) -------

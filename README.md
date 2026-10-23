@@ -87,7 +87,7 @@ Four layers ship switched off, because each adds cost or console work: `WEB_SEAR
 
 ## Quick start
 
-Needs `uv`, Docker, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials.
+Needs `uv`, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. Images build natively on ARM64 in CodeBuild; Docker is needed only with `AGENT_BUILD=local`.
 
 ```bash
 cp .env.example .env    # deployment target + Lark app credentials + your open_id

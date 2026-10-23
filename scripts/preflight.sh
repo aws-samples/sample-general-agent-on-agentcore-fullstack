@@ -13,10 +13,12 @@ cd "$ROOT"
 
 # Command-line env vars win over .env, which wins over defaults (same as deploy.sh).
 _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
+_CLI_BUILD="${AGENT_BUILD:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
+AGENT_BUILD="${_CLI_BUILD:-${AGENT_BUILD:-codebuild}}"
 export AWS_REGION="$REGION"
 # Credentials already in the environment outrank .env's profile — otherwise this
 # would report (and check) an identity other than the one the caller supplied.
@@ -30,15 +32,17 @@ fail() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- tools ---------------------------------------------------------------
 missing=""
-for t in uv docker agentcore aws npx python3; do
+for t in uv agentcore aws npx python3 $([ "$AGENT_BUILD" = "local" ] && echo docker); do
   command -v "$t" >/dev/null || missing="$missing $t"
 done
 [ -z "$missing" ] || fail "missing tools:$missing
   uv: https://docs.astral.sh/uv/   agentcore: npm i -g @aws/agentcore"
 
-# Both runtime images are built from Docker, so a stopped daemon fails the deploy
-# several minutes in rather than here.
-docker info >/dev/null 2>&1 || fail "Docker isn't running — both runtime images are built from it."
+# Images build in CodeBuild unless AGENT_BUILD=local, which builds the agent with this
+# host's Docker — then a stopped daemon would fail the deploy minutes in rather than here.
+if [ "$AGENT_BUILD" = "local" ]; then
+  docker info >/dev/null 2>&1 || fail "Docker isn't running — AGENT_BUILD=local builds the agent image with it."
+fi
 
 # --- credentials ---------------------------------------------------------
 IDENT="$(aws sts get-caller-identity --output json 2>/dev/null)" \
@@ -97,6 +101,7 @@ done
 echo "  account : $ACCOUNT"
 echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
 echo "  model   : $MODEL"
+echo "  build   : $AGENT_BUILD$([ "$AGENT_BUILD" = "local" ] && echo '  (local Docker)' || echo '  (CodeBuild, ARM64 native)')"
 echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"
 echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && echo "  (creates a VPC + S3 Files)" || true)"
 if [ "${FILES_STORAGE:-false}" = "true" ]; then

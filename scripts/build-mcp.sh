@@ -11,8 +11,7 @@
 # required vars, container env, optional DEPLOY_IF gate), so adding a server means
 # adding a directory — not editing this script.
 #
-# Local QEMU cross-builds aren't reliable for ARM64 native artifacts, so use CodeBuild's aarch64 image to build natively.
-# Provisions its own CodeBuild role; reuses the source bucket the agentcore CLI created in this account.
+# Images are built natively on ARM64 in CodeBuild (scripts/lib/codebuild.sh).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
@@ -29,12 +28,10 @@ export AWS_REGION="$REGION"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.86}"   # engine = official lark-cli (not lark-mcp)
-# One CodeBuild project and role for every server — only the source zip differs.
-PROJECT="$PREFIX-mcp-builder"
-SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
-CB_ROLE_NAME="$PREFIX-mcp-builder-role"
 LARK_API_DOMAIN="${LARK_API_DOMAIN:-https://open.larksuite.com}"   # CN: open.feishu.cn
 : "${LARK_APP_ID:?set LARK_APP_ID in .env}"
+
+. scripts/lib/codebuild.sh
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
@@ -54,22 +51,6 @@ else
   done
 fi
 [ ${#SERVERS[@]} -gt 0 ] || { echo "no MCP servers found under mcp-servers/"; exit 1; }
-
-# One role for every server, so ECR push is granted by prefix rather than to a
-# single repository — the loop below builds one repo per server.
-log "CodeBuild service role"
-if ! aws iam get-role --role-name "$CB_ROLE_NAME" >/dev/null 2>&1; then
-  aws iam create-role --role-name "$CB_ROLE_NAME" \
-    --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
-fi
-aws iam put-role-policy --role-name "$CB_ROLE_NAME" --policy-name build \
-  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[
-    {\"Effect\":\"Allow\",\"Action\":[\"logs:CreateLogGroup\",\"logs:CreateLogStream\",\"logs:PutLogEvents\"],\"Resource\":\"arn:aws:logs:$REGION:$ACCOUNT:log-group:/aws/codebuild/$PROJECT*\"},
-    {\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:GetObjectVersion\"],\"Resource\":\"arn:aws:s3:::$SRC_BUCKET/*\"},
-    {\"Effect\":\"Allow\",\"Action\":\"ecr:GetAuthorizationToken\",\"Resource\":\"*\"},
-    {\"Effect\":\"Allow\",\"Action\":[\"ecr:BatchCheckLayerAvailability\",\"ecr:PutImage\",\"ecr:InitiateLayerUpload\",\"ecr:UploadLayerPart\",\"ecr:CompleteLayerUpload\",\"ecr:BatchGetImage\",\"ecr:GetDownloadUrlForLayer\"],\"Resource\":\"arn:aws:ecr:$REGION:$ACCOUNT:repository/$PREFIX-mcp-*\"}]}" >/dev/null
-CB_ROLE_ARN="$(aws iam get-role --role-name "$CB_ROLE_NAME" --query 'Role.Arn' --output text)"
-sleep 8  # let the new role/policy propagate before CodeBuild validates it
 
 # ---- per server ----------------------------------------------------------
 for SERVER in "${SERVERS[@]}"; do
@@ -99,81 +80,10 @@ done
 REPO="$PREFIX-mcp-$SERVER"
 ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO"
 RUNTIME_NAME="${PREFIX//-/_}_$RUNTIME_SUFFIX"   # AgentCore runtime names use underscores
-SRC_KEY="$PREFIX-mcp-$SERVER/source.zip"
-
 printf '\n\033[1;36m### MCP server: %s → %s\033[0m\n' "$SERVER" "$RUNTIME_NAME"
 
-log "ECR repo"
-aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
-  aws ecr create-repository --repository-name "$REPO" >/dev/null
-echo "  $ECR"
-
-log "Upload build source to S3"
-# The agentcore CLI normally creates this bucket, but it may not have run yet in 
-# the target region — create it on demand so the first build in a fresh region works.
-aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1 || \
-  aws s3api create-bucket --bucket "$SRC_BUCKET" \
-    --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
-TMPZIP="$(mktemp -u).zip"   # -u: name only, let zip create it (zip rejects a pre-existing empty file)
-( cd "$DIR" && zip -qr "$TMPZIP" . -x '*.pyc' '__pycache__/*' -x 'test_*' )  # Dockerfile + server.js; tests stay out of the image
-aws s3 cp "$TMPZIP" "s3://$SRC_BUCKET/$SRC_KEY" >/dev/null
-rm -f "$TMPZIP"  # safe-rm-ok
-echo "  s3://$SRC_BUCKET/$SRC_KEY"
-
-log "Create/update CodeBuild project ($PROJECT, ARM64 native)"
-# Build the whole project definition in Python so buildspec embedding is valid JSON.
-PROJ_FILE="$(mktemp).json"
-ECR="$ECR" TAG="$TAG" LARK_CLI_VERSION="$LARK_CLI_VERSION" PROJECT="$PROJECT" \
-SRC_BUCKET="$SRC_BUCKET" SRC_KEY="$SRC_KEY" CB_ROLE_ARN="$CB_ROLE_ARN" \
-python3 <<'PY' > "$PROJ_FILE"
-import json, os
-e = os.environ
-ecr, tag = e["ECR"], e["TAG"]
-buildspec = "\n".join([
-    "version: 0.2",
-    "phases:",
-    "  pre_build:",
-    "    commands:",
-    f"      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin {ecr}",
-    "  build:",
-    "    commands:",
-    f"      - docker build --build-arg LARK_CLI_VERSION={e['LARK_CLI_VERSION']} -t {ecr}:{tag} .",
-    "  post_build:",
-    "    commands:",
-    f"      - docker push {ecr}:{tag}",
-])
-print(json.dumps({
-    "name": e["PROJECT"],
-    "source": {"type": "S3", "location": f"{e['SRC_BUCKET']}/{e['SRC_KEY']}", "buildspec": buildspec},
-    "artifacts": {"type": "NO_ARTIFACTS"},
-    "environment": {"type": "ARM_CONTAINER", "image": "aws/codebuild/amazonlinux2-aarch64-standard:3.0",
-                    "computeType": "BUILD_GENERAL1_MEDIUM", "privilegedMode": True},
-    "serviceRole": e["CB_ROLE_ARN"],
-}))
-PY
-if aws codebuild batch-get-projects --names "$PROJECT" --query 'projects[0].name' --output text 2>/dev/null | grep -q "$PROJECT"; then
-  aws codebuild update-project --cli-input-json "file://$PROJ_FILE" >/dev/null
-else
-  aws codebuild create-project --cli-input-json "file://$PROJ_FILE" >/dev/null
-fi
-rm -f "$PROJ_FILE"  # safe-rm-ok
-
-log "Start build"
-BID="$(aws codebuild start-build --project-name "$PROJECT" --query 'build.id' --output text)"
-echo "  build: $BID"
-ph=""
-while :; do
-  ph="$(aws codebuild batch-get-builds --ids "$BID" --query 'builds[0].buildStatus' --output text)"
-  if [ "$ph" != "IN_PROGRESS" ]; then
-    echo "  build status: $ph"
-    break
-  fi
-  sleep 10
-done
-if [ "$ph" != "SUCCEEDED" ]; then
-  echo "build failed — see CodeBuild logs for $BID"
-  exit 1
-fi
+log "Build $REPO:$TAG (CodeBuild, ARM64 native)"
+cb_build "$REPO" "$DIR" "$TAG" --build-arg "LARK_CLI_VERSION=$LARK_CLI_VERSION"
 
 log "MCP server Runtime ($RUNTIME_NAME)"
 # The per-user Lark token reaches the container in a custom passthrough header —

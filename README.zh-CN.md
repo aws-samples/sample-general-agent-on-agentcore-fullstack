@@ -87,7 +87,7 @@
 
 ## 快速开始
 
-需要 `uv`、Docker、AgentCore CLI(`npm i -g @aws/agentcore`),以及 AWS 凭证。
+需要 `uv`、AgentCore CLI(`npm i -g @aws/agentcore`),以及 AWS 凭证。镜像在 CodeBuild 里以 ARM64 原生构建;只有设置 `AGENT_BUILD=local` 时才需要 Docker。
 
 ```bash
 cp .env.example .env    # 部署目标 + Lark 应用凭证 + 你自己的 open_id

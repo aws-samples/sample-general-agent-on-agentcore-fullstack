@@ -20,7 +20,7 @@ cd "$ROOT"
 
 # Deployment target: command-line env vars win over .env, which wins over defaults.
 _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
-_CLI_FILES="${FILES_STORAGE:-}" _CLI_NAT="${NAT_GATEWAY:-}"
+_CLI_FILES="${FILES_STORAGE:-}" _CLI_NAT="${NAT_GATEWAY:-}" _CLI_BUILD="${AGENT_BUILD:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
@@ -32,6 +32,10 @@ WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
 FILES_STORAGE="${_CLI_FILES:-${FILES_STORAGE:-false}}"
 NAT_GATEWAY="${_CLI_NAT:-${NAT_GATEWAY:-false}}"
 [ "$FILES_STORAGE" = "true" ] || NAT_GATEWAY=false
+# Where the agent image is built: CodeBuild (ARM64 native, no local Docker) unless .env
+# asks for the host's Docker.
+AGENT_BUILD="${_CLI_BUILD:-${AGENT_BUILD:-codebuild}}"
+case "$AGENT_BUILD" in codebuild|local) ;; *) echo "AGENT_BUILD must be codebuild or local, not '$AGENT_BUILD'"; exit 1 ;; esac
 PREFIX="agentcore-fullstack"
 export AWS_REGION="$REGION" UV_LINK_MODE=copy
 # Credentials already in the environment outrank .env's profile.
@@ -40,6 +44,7 @@ export AWS_REGION="$REGION" UV_LINK_MODE=copy
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"
 CDK="npx --yes aws-cdk@2"
+. scripts/lib/codebuild.sh
 
 # Control-plane calls whose parameters are newer than the AWS CLI's bundled service model.
 # Verified against CLI 2.34: it rejects requireServiceS3Endpoint, sessionConfiguration and
@@ -88,6 +93,41 @@ print(f".cdk-state.json: {k} = {v}")
 PY
 }
 
+# The agent image the Runtimes run, in AGENT_IMAGE. Under CodeBuild it is tagged by the
+# content of what the Dockerfile copies, so an unchanged agent is not rebuilt.
+ensure_agent_image() {
+  if [ "$AGENT_BUILD" = "local" ]; then
+    AGENT_IMAGE="$(cfn_out "$PREFIX-agentcore" AgentImageUri)"
+    [ -n "$AGENT_IMAGE" ] && [ "$AGENT_IMAGE" != "None" ] || {
+      echo "missing agent image output — run --base with AGENT_BUILD=local first"; exit 1; }
+    return 0
+  fi
+  local repo="$PREFIX-agent" tag
+  tag="src-$(python3 - <<'PYHASH'
+import glob, hashlib, os
+os.chdir("agent")
+h = hashlib.sha256()
+for f in sorted({"Dockerfile", "requirements.txt", "entrypoint.sh", *glob.glob("*.py")}):
+    if f.startswith("test_"):
+        continue
+    h.update(f.encode() + b"\0" + open(f, "rb").read())
+print(h.hexdigest()[:12])
+PYHASH
+)"
+  if cb_image_exists "$repo" "$tag"; then
+    echo "  agent image $repo:$tag already built — source unchanged"
+    AGENT_IMAGE="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$repo:$tag"
+  else
+    log "Agent image — build $repo:$tag (CodeBuild, ARM64 native)"
+    cb_build "$repo" agent "$tag"
+    AGENT_IMAGE="$CB_IMAGE_URI"
+    # Every source change pushes a new tag; keep the recent ones for rollback, not all.
+    aws ecr put-lifecycle-policy --repository-name "$repo" --lifecycle-policy-text \
+      '{"rules":[{"rulePriority":1,"description":"keep the last 10 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}' >/dev/null
+  fi
+  ctx_set agent_image_uri "$AGENT_IMAGE"
+}
+
 base_cdk_stacks() {
   # First deploy in a region needs the CDK bootstrap stack; it creates an assets
   # bucket/ECR repo and deploy roles, so this step needs broader IAM permissions.
@@ -111,7 +151,7 @@ base_cdk_stacks() {
   else
     echo "  code execution: off"
   fi
-  $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" \
+  $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" \
              --require-approval never --outputs-file cdk.out/outputs.json
   # The web page needs this and CDK assigns it, so it travels through state rather than a
   # cross-stack export — importing it would freeze the router's own exports.
@@ -155,8 +195,8 @@ print(json.dumps({
 
 
 phase2_runtime() {
-  # The agent Runtime is created straight from the control plane, using the ARM64 image
-  # CDK already published to ECR (AgentImageUri).
+  # The agent Runtime is created straight from the control plane, from the ARM64 image
+  # ensure_agent_image built (CodeBuild) or CDK published (AGENT_BUILD=local).
   #
   # The AgentCore CLI used to do this (`agentcore configure` + `agentcore deploy`), but
   # 0.28 removed `configure` and turned `deploy` into "deploy project infrastructure via
@@ -164,12 +204,13 @@ phase2_runtime() {
   # removes the dependency on a fast-moving CLI and matches what build-mcp.sh has always
   # done for the MCP server runtimes. It also lets the authorizer and network mode be set
   # at creation time instead of patched in afterwards.
-  log "Runtime — create/update the agent Runtime from the CDK-published image"
+  ensure_agent_image
+  log "Runtime — create/update the agent Runtime from $AGENT_IMAGE"
 
   local role image model memory shim mcp_arn mcp_url pool client pwsecret ws_url
   local approval_url approval_arn issuer ckpt_table ckpt_bucket google_url google_arn
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
-  image="$(cfn_out "$PREFIX-agentcore" AgentImageUri)"
+  image="$AGENT_IMAGE"
   ckpt_table="$(cfn_out "$PREFIX-agentcore" CheckpointTableName)"
   ckpt_bucket="$(cfn_out "$PREFIX-agentcore" CheckpointBucketName)"
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
@@ -338,7 +379,7 @@ print(json.dumps(p))')" >/dev/null
   # The router's AGENTCORE_RUNTIME_ARN was synthesised before the runtime existed (a
   # PLACEHOLDER), so re-deploy it now that the real id is known.
   log "Router — re-deploy with the real runtime ARN"
-  $CDK deploy "$PREFIX-router" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" --require-approval never
+  $CDK deploy "$PREFIX-router" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" --require-approval never
 
   # AgentCore keeps serving existing sessions from the OLD container, so stored session
   # ids would pin users to the previous image. Drop them: the next message starts a new
@@ -434,8 +475,8 @@ phase_a2a() {
   fi
   local role image rname rid params
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
-  image="$(cfn_out "$PREFIX-agentcore" AgentImageUri)"
-  [ -n "$image" ] || { echo "missing agent image — run --base first"; exit 1; }
+  ensure_agent_image
+  image="$AGENT_IMAGE"
   rname="${PREFIX//-/_}_a2a"
 
   # Same image as the agent, SERVER_MODE=a2a picks the other entrypoint. Only the identity
@@ -506,7 +547,7 @@ phase_webui() {
   if [ "${WEBUI:-false}" != "true" ]; then
     echo "  webui: off (set WEBUI=true in .env)"; return 0
   fi
-  $CDK deploy "$PREFIX-webui" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" \
+  $CDK deploy "$PREFIX-webui" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" \
              --require-approval never
   local url
   url="$(cfn_out "$PREFIX-webui" WebUiUrl)"
@@ -514,7 +555,7 @@ phase_webui() {
   # assigns the domain now — so it travels through .cdk-state.json and the router is
   # re-deployed, the same route the file system id takes.
   ctx_set web_origin "$url"
-  $CDK deploy "$PREFIX-router" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" \
+  $CDK deploy "$PREFIX-router" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" \
              --exclusively --require-approval never
   log "Web chat: $url  (register this domain on the Lark h5 app)"
 }
