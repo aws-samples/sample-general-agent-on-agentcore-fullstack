@@ -60,7 +60,7 @@
 | **会话状态** | 一次对话*内部*记住什么 | DynamoDB checkpoint,每个 superstep 都写入,因此在 15 分钟上限处被截断的一轮对话可以续接 |
 | **长期记忆** | *跨*对话记住什么 | **AgentCore Memory**,通过 `remember`/`recall`——只有当模型判断某个事实值得跨对话保留时才写入 |
 | **持久化存储** | 什么内容在容器之外仍然存在、归谁所有 | **S3 Files**,每个用户一个 Access Point,挂载到 `/mnt/workspace`;隔离边界是 microVM,而不是 Agent 代码 |
-| **工具(Tools)** | 它能做什么、以谁的身份做 | 各自独立 Runtime 上的 **MCP server**——`lark-cli` 和 `google` 以调用者本人身份行事,审批相关操作用应用身份;**Gateway** 提供网络搜索;**Code Interpreter** 运行生成的代码,并用 `deliver_file` 把产物发进聊天 |
+| **工具(Tools)** | 它能做什么、以谁的身份做 | 各自独立 Runtime 上的 **MCP server**——`lark-cli` 和 `google` 以调用者本人身份行事,审批相关操作用应用身份;**Gateway** 提供网络搜索;**Code Interpreter** 运行生成的代码,并用 `deliver_file` 把产物发进聊天、用 `save_attachment` 打开用户发来的文件 |
 | **可观测性** | 它做了什么、是否成功 | **AgentCore Observability** 提供 trace 和日志;一个 CloudWatch dashboard 叠加平台指标与 Agent 自身指标——对话结果、按名称统计的工具调用、自我修复次数 |
 | **运维(Operations)** | 如何部署与销毁 | CloudFormation 覆盖的部分用 CDK,其余用控制面 API 调用,两者都由同一个 `./deploy.sh` 按顺序编排 |
 
