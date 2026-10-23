@@ -512,8 +512,12 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # cached entry so _close_session can stop it. Nothing is started yet: the session only
     # begins when the model first runs something.
     sandbox = code_tools._Sandbox(actor_id) if code_tools.available() else None
+    # Where a delivered file goes. Mutable and set per turn, because the session is cached
+    # across turns while the chat is not: a file asked for in a group belongs in that
+    # group, or the others there wait for something that went to a DM.
+    deliver_to: dict = {"chat_id": ""}
     if sandbox is not None:
-        tools += code_tools.tools_for(actor_id, sandbox)
+        tools += code_tools.tools_for(actor_id, sandbox, deliver_to)
 
     saver = _checkpointer()
     # langchain.agents.create_agent, not langgraph.prebuilt.create_react_agent: the
@@ -539,7 +543,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         log.warning("could not check for an interrupted turn", exc_info=True)
     return {
         "graph": graph, "stack": stack, "sandbox": sandbox,
-        "config": config,
+        "config": config, "deliver_to": deliver_to,
         "actor_id": actor_id, "mem_sid": mem_sid,
         "created": time.time(),
         # auth_url is Lark's link and doubles as "identity unverified" for the web surfaces;
@@ -755,6 +759,9 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     if s.get("identity_error"):
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
+
+    # Reply and delivery go to the same place, so a file lands where it was asked for.
+    s.get("deliver_to", {})["chat_id"] = chat_id
 
     def _run_turn() -> None:
         try:

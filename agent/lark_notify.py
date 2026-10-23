@@ -115,6 +115,88 @@ def send_link(chat_id: str, text: str, link_text: str, url: str) -> bool:
     return True
 
 
+def _upload(path: str, fields: dict, file_name: str, data: bytes,
+            part: str = "file") -> dict:
+    """One multipart/form-data POST, built by hand because this module speaks urllib.
+
+    Lark's upload endpoints take the file as a form part, so neither `_call` nor a JSON
+    body can reach them — this is why uploading cannot go through the `lark_api` tool.
+    `part` is the field name, which differs per endpoint: `file` for im/v1/files, `image`
+    for im/v1/images, and getting it wrong answers `Invalid request param` (measured)."""
+    tok = _tenant_token()
+    if not tok:
+        return {}
+    boundary = "----agent" + os.urandom(8).hex()
+    parts = []
+    for key, value in fields.items():
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n"
+                     f"{value}\r\n".encode())
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{part}\"; "
+                 f"filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                 .encode())
+    parts.append(data)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        f"{_API_DOMAIN}{path}", data=b"".join(parts), method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "Authorization": f"Bearer {tok}"})
+    try:
+        # Longer than the 10 s the JSON calls use: this one carries the whole file.
+        with urllib.request.urlopen(req, timeout=120) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read().decode() or "{}")
+
+
+def upload_file(file_name: str, data: bytes, file_type: str = "stream",
+                duration_ms: int = 0) -> str:
+    """Upload a file for sending, returning its file_key. `stream` covers any type Lark
+    does not name; `mp4` is required for a video to play inline rather than download."""
+    fields = {"file_type": file_type, "file_name": file_name}
+    if duration_ms:
+        fields["duration"] = str(duration_ms)
+    body = _upload("/open-apis/im/v1/files", fields, file_name, data)
+    key = (body.get("data") or {}).get("file_key", "")
+    if not key:
+        log.error("file upload failed for %s: %s", file_name, body.get("msg", body))
+    return key
+
+
+def upload_image(data: bytes) -> str:
+    """Upload an image, returning its image_key — also how a video gets its cover, which
+    Lark requires for `media` and offers no default for."""
+    body = _upload("/open-apis/im/v1/images", {"image_type": "message"}, "cover.jpg", data,
+                   part="image")
+    key = (body.get("data") or {}).get("image_key", "")
+    if not key:
+        log.error("image upload failed: %s", body.get("msg", body))
+    return key
+
+
+def send_file(chat_id: str, file_key: str) -> bool:
+    """Post an uploaded file as an attachment."""
+    return _send_media_message(chat_id, "file", {"file_key": file_key})
+
+
+def send_media(chat_id: str, file_key: str, image_key: str) -> bool:
+    """Post an uploaded video with its cover, so it plays in the chat."""
+    return _send_media_message(chat_id, "media",
+                               {"file_key": file_key, "image_key": image_key})
+
+
+def _send_media_message(chat_id: str, msg_type: str, content: dict) -> bool:
+    tok = _tenant_token()
+    if not (tok and chat_id):
+        return False
+    body = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={_rid_type(chat_id)}",
+                 {"receive_id": chat_id, "msg_type": msg_type,
+                  "content": json.dumps(content)}, bearer=tok)
+    if body.get("code") not in (0, "0"):
+        log.error("send %s to %s failed: %s", msg_type, chat_id, body.get("msg", body))
+        return False
+    return True
+
+
 def add_reaction(message_id: str, emoji: str = "OnIt") -> str:
     """React to the user's message so they know it was received. Returns the
     reaction_id needed to remove it, or "" on failure.

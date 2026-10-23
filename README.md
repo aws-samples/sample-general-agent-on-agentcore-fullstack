@@ -60,7 +60,7 @@ Ten layers, each with a real implementation rather than a stub — that is the "
 | **Session state** | what it remembers *within* a conversation | DynamoDB checkpoints, written per superstep, so a turn cut off at the 15-minute cap resumes |
 | **Long-term memory** | what it remembers *across* conversations | **AgentCore Memory** via `remember`/`recall` — written only when the model decides a fact should outlast the chat |
 | **Persistent storage** | what survives the container, and whose it is | **S3 Files**, one Access Point per user, mounted at `/mnt/workspace`; isolated at the microVM boundary, not by agent code |
-| **Tools** | what it can do, and as whom | **MCP servers** on their own Runtimes — `lark-cli` and `google` as the calling user, approvals on the app identity; **Gateway** for web search; **Code Interpreter** for generated code |
+| **Tools** | what it can do, and as whom | **MCP servers** on their own Runtimes — `lark-cli` and `google` as the calling user, approvals on the app identity; **Gateway** for web search; **Code Interpreter** for generated code, with `deliver_file` to send a result into the chat |
 | **Observability** | what it did, and whether it worked | **AgentCore Observability** for traces and logs; a CloudWatch dashboard over platform metrics plus the agent's own — turn outcomes, tool calls by name, self-repairs |
 | **Operations** | how it deploys and tears down | CDK for what CloudFormation covers, control-plane calls for the rest, both ordered by one `./deploy.sh` |
 

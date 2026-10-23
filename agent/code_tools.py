@@ -18,12 +18,14 @@ read and written by running code; write-through to S3 is asynchronous.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import re
 
+import lark_notify
 import telemetry
 
 import boto3
@@ -125,6 +127,33 @@ class _Sandbox:
             log.warning("could not stop code session %s", self._session_id, exc_info=True)
         self._session_id = ""
 
+    def read_bytes(self, path: str) -> bytes:
+        """The contents of a workspace file, as bytes, without passing through the model.
+
+        `readFiles` is scoped to the sandbox's own directory and rejects the mount path as
+        traversal, so the file is base64'd across first — which also sidesteps having to
+        know how the API would encode raw binary. Measured: a 22,500-byte mp4 came back
+        byte-identical, and the 30,000-char payload was not truncated, because this reply
+        goes to this process rather than into a tool result."""
+        staged = hashlib.sha256(path.encode()).hexdigest()[:16] + ".b64"
+        out = self.invoke("executeCommand", {
+            "command": f"base64 -w0 -- {json.dumps(_WORKSPACE + '/' + path)} > {staged}"})
+        if out not in ("(no output)", ""):
+            raise FileNotFoundError(out)
+        r = self._client.invoke_code_interpreter(
+            codeInterpreterIdentifier=_INTERPRETER_ID, sessionId=self.session_id(),
+            name="readFiles", arguments={"paths": [staged]})
+        encoded = ""
+        for event in r["stream"]:
+            result = event.get("result") or {}
+            if result.get("isError"):
+                raise OSError(" ".join(c.get("text", "") for c in result.get("content", [])))
+            for c in result.get("content", []):
+                resource = c.get("resource") or {}
+                encoded += resource.get("text") or resource.get("blob") or ""
+        self.invoke("executeCommand", {"command": f"rm -f -- {staged}"})
+        return base64.b64decode(encoded)
+
     def invoke(self, name: str, arguments: dict) -> str:
         """One InvokeCodeInterpreter call, flattened to what the model should read."""
         try:
@@ -187,7 +216,21 @@ class _ListFilesArgs(BaseModel):
     path: str = Field(default=".", description="A path relative to the workspace root.")
 
 
-def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
+class _DeliverFileArgs(BaseModel):
+    path: str = Field(description="The file to send, relative to the workspace root.")
+
+
+# Lark's own ceiling for an uploaded file. Checked here so an oversized send fails with a
+# sentence the model can act on rather than an API error it has to interpret.
+_MAX_DELIVER_BYTES = 30 * 1000 * 1000
+# Only mp4 plays inline; everything else is an attachment. Lark names a handful of types
+# and treats the rest as `stream`.
+_NAMED_TYPES = {"mp4": "mp4", "pdf": "pdf", "doc": "doc", "docx": "doc", "xls": "xls",
+                "xlsx": "xls", "ppt": "ppt", "pptx": "ppt", "opus": "opus"}
+
+
+def tools_for(actor_id: str, sandbox: _Sandbox | None = None,
+              deliver_to: dict | None = None) -> list:
     """The three code tools bound to this user, or [] when code execution is not deployed.
 
     Absent-not-broken, like search and long-term memory: without an interpreter the agent
@@ -195,6 +238,12 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
     if not available():
         return []
     box = sandbox or _Sandbox(actor_id)
+    # Falls back to a DM only when the turn has no chat — the web page and A2A, where
+    # lark_notify._rid_type reads an `ou_` id as "send to the person".
+    open_id = actor_id.split(":", 1)[1] if ":" in actor_id else actor_id
+
+    def _target() -> str:
+        return (deliver_to or {}).get("chat_id") or open_id
 
     def _guard(fn):
         # Counted by name and outcome: "did a tool actually run" is the one question a
@@ -234,6 +283,43 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
         return box.invoke("executeCommand",
                           {"command": f"cd {_WORKSPACE} && ls -la -- {json.dumps(path)}"})
 
+    def deliver_file(path: str) -> str:
+        # The workspace is this user's own mount, so a traversal reaches no one else's
+        # files — but it does reach the sandbox's system paths, which are not ours to send.
+        if path.startswith("/") or ".." in path.split("/"):
+            return "Give a path inside the workspace, without .. or a leading /."
+        name = os.path.basename(path)
+        suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        data = box.read_bytes(path)
+        if not data:
+            return f"{name} is empty, so there is nothing to send."
+        if len(data) > _MAX_DELIVER_BYTES:
+            return (f"{name} is {len(data) / 1e6:.1f} MB and Lark accepts 30 MB. "
+                    "Compress it or split it, then send again.")
+        # A video plays inline only as `media`, which Lark will not render without a cover,
+        # so a still frame is cut for it. The upload's file_type and the message type have
+        # to agree — an mp4-typed upload refuses to be sent as `file` ("The type of file
+        # upload does not match the type of message being sent") — hence the re-upload as
+        # `stream` when there is no cover to send it with.
+        if suffix == "mp4":
+            cover = box.invoke("executeCommand", {"command": (
+                f"cd {_WORKSPACE} && FF=$(python3 -c 'import imageio_ffmpeg as f;"
+                f" print(f.get_ffmpeg_exe())') && \"$FF\" -y -i {json.dumps(name)}"
+                " -frames:v 1 -f image2 _cover.jpg >/dev/null 2>&1 && echo ok")})
+            if "ok" in cover:
+                image = lark_notify.upload_image(box.read_bytes("_cover.jpg"))
+                key = image and lark_notify.upload_file(name, data, "mp4")
+                if key and lark_notify.send_media(_target(), key, image):
+                    return f"Sent {name} to the chat; it plays there."
+            log.info("no cover for %s, sending it as an attachment", name)
+        key = lark_notify.upload_file(name, data, _NAMED_TYPES.get(suffix, "stream")
+                                      if suffix != "mp4" else "stream")
+        if not key:
+            return f"Lark would not accept {name}."
+        if lark_notify.send_file(_target(), key):
+            return f"Sent {name} to the chat as an attachment."
+        return f"{name} uploaded but the message would not send."
+
     return [
         StructuredTool.from_function(
             func=_guard(run_code), name="run_code",
@@ -261,4 +347,13 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
                 "List what is already in the workspace. Worth doing before you claim a "
                 "file does or does not exist, since it persists from earlier conversations."),
             args_schema=_ListFilesArgs),
+        StructuredTool.from_function(
+            func=_guard(deliver_file), name="deliver_file",
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
+                "Send a file from the workspace to the person you are talking to, so they "
+                "can open it. The workspace is not visible to them, so a file they asked "
+                "for is not delivered until you call this — say what you made, then send "
+                "it. An mp4 plays in the chat; anything else arrives as an attachment. "
+                "Limit 30 MB."),
+            args_schema=_DeliverFileArgs),
     ]

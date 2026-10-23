@@ -204,5 +204,73 @@ def test_a_failure_with_no_output_still_says_something():
         assert "failed" in box.invoke("executeCode", {"language": "python", "code": ""})
 
 
+# --- Delivering a file out of the workspace --------------------------------
+# The workspace is invisible to the user, so these cover the two things that are ours to
+# get wrong: where a file is sent, and the upload/message type pairing Lark enforces.
+
+
+class _DeliverBox(_FakeBox):
+    def __init__(self, cover: bool = True):
+        super().__init__()
+        self._cover = cover
+
+    def invoke(self, name, arguments):
+        super().invoke(name, arguments)
+        return "ok" if self._cover else "(no output)"
+
+    def read_bytes(self, path):
+        return b"\0" * 10
+
+
+@pytest.fixture
+def _lark():
+    with mock.patch.object(code_tools.lark_notify, "upload_file",
+                           return_value="file_k") as up, \
+         mock.patch.object(code_tools.lark_notify, "upload_image",
+                           return_value="img_k"), \
+         mock.patch.object(code_tools.lark_notify, "send_media",
+                           return_value=True) as media, \
+         mock.patch.object(code_tools.lark_notify, "send_file",
+                           return_value=True) as attach:
+        yield {"upload": up, "media": media, "file": attach}
+
+
+def test_a_path_outside_the_workspace_is_refused_before_any_upload(_lark):
+    tools = _tools(_DeliverBox())
+    for bad in ("/etc/passwd", "../../etc/passwd"):
+        assert "without .." in tools["deliver_file"].func(bad)
+    assert _lark["upload"].call_count == 0
+
+
+def test_an_mp4_is_sent_as_media_so_it_plays(_lark):
+    tools = _tools(_DeliverBox(cover=True))
+    assert "plays" in tools["deliver_file"].func("clip.mp4")
+    assert _lark["upload"].call_args.args[2] == "mp4"
+    assert _lark["media"].called and not _lark["file"].called
+
+
+def test_an_mp4_without_a_cover_is_re_uploaded_as_stream(_lark):
+    """Lark refuses to send an mp4-typed upload as `file`, so the type has to change with
+    the message. Measured: "The type of file upload does not match the type of message"."""
+    tools = _tools(_DeliverBox(cover=False))
+    assert "attachment" in tools["deliver_file"].func("clip.mp4")
+    assert _lark["upload"].call_args.args[2] == "stream"
+    assert _lark["file"].called and not _lark["media"].called
+
+
+def test_a_file_goes_to_the_chat_that_asked_for_it_not_a_dm(_lark):
+    """A file asked for in a group belongs in that group; a DM is the fallback for the
+    surfaces that have no chat at all."""
+    target: dict = {"chat_id": "oc_group"}
+    tools = {t.name: t
+             for t in code_tools.tools_for("lark:ou_x", _DeliverBox(), target)}
+    tools["deliver_file"].func("report.pdf")
+    assert _lark["file"].call_args.args[0] == "oc_group"
+
+    target["chat_id"] = ""
+    tools["deliver_file"].func("report.pdf")
+    assert _lark["file"].call_args.args[0] == "ou_x"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
