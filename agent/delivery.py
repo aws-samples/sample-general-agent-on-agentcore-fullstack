@@ -67,20 +67,31 @@ class LarkDelivery(Delivery):
         # of message being sent"), and `media` will not render without a cover. So a video
         # is only uploaded as mp4 once there is a frame to send with it.
         if suffix == "mp4":
-            frame = cover()
-            image = lark_notify.upload_image(frame) if frame else ""
-            key = lark_notify.upload_file(name, data, "mp4") if image else ""
-            if key and lark_notify.send_media(self.target, key, image):
-                return f"Sent {name} to the chat; it plays there."
-            log.info("no cover for %s, sending it as an attachment", name)
-        key = lark_notify.upload_file(name, data,
-                                      "stream" if suffix == "mp4"
-                                      else self._TYPES.get(suffix, "stream"))
-        if not key:
-            return f"Lark would not accept {name}."
-        if lark_notify.send_file(self.target, key):
-            return f"Sent {name} to the chat as an attachment."
-        return f"{name} uploaded but the message would not send."
+            try:
+                frame = cover()
+                if frame:
+                    image = lark_notify.upload_image(frame)
+                    key = lark_notify.upload_file(name, data, "mp4")
+                    if lark_notify.send_media(self.target, key, image):
+                        return f"Sent {name} to the chat; it plays there."
+            except lark_notify.LarkError:
+                # Worth one attachment attempt: a cover Lark would not take says nothing
+                # about the video itself.
+                log.info("could not send %s as a video", name, exc_info=True)
+            else:
+                log.info("no cover for %s, sending it as an attachment", name)
+        try:
+            key = lark_notify.upload_file(
+                name, data,
+                "stream" if suffix == "mp4" else self._TYPES.get(suffix, "stream"))
+            if lark_notify.send_file(self.target, key):
+                return f"Sent {name} to the chat as an attachment."
+            return f"{name} uploaded but the message would not send."
+        except lark_notify.LarkError as e:
+            # Lark's own words, because the model has to tell the user something true:
+            # "the bot is not in that chat" and "the file is too large" need different
+            # next steps, and a bare failure reads as "try again".
+            return f"{name} was not sent. {e}"
 
 
 class NoDelivery(Delivery):

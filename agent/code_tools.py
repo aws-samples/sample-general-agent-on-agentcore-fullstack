@@ -19,6 +19,7 @@ read and written by running code; write-through to S3 is asynchronous.
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import json
 import logging
@@ -156,16 +157,19 @@ class _Sandbox:
         r = self._client.invoke_code_interpreter(
             codeInterpreterIdentifier=_INTERPRETER_ID, sessionId=self.session_id(),
             name="readFiles", arguments={"paths": [staged]})
-        encoded = ""
+        # Collected in pieces and joined once: repeated `+=` on a string this size copies
+        # the whole thing each time, and the base64 is already 4/3 of a file that may run
+        # to tens of megabytes.
+        chunks: list[str] = []
         for event in r["stream"]:
             result = event.get("result") or {}
             if result.get("isError"):
                 raise OSError(" ".join(c.get("text", "") for c in result.get("content", [])))
             for c in result.get("content", []):
                 resource = c.get("resource") or {}
-                encoded += resource.get("text") or resource.get("blob") or ""
+                chunks.append(resource.get("text") or resource.get("blob") or "")
         self.invoke("executeCommand", {"command": f"rm -f -- {staged}"})
-        return base64.b64decode(encoded)
+        return base64.b64decode("".join(chunks))
 
     def invoke(self, name: str, arguments: dict) -> str:
         """One InvokeCodeInterpreter call, flattened to what the model should read."""
@@ -247,6 +251,11 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
     def _guard(fn):
         # Counted by name and outcome: "did a tool actually run" is the one question a
         # plausible-looking reply cannot answer, and it cost this project a long evening.
+        # functools.wraps, not just __name__: LangChain decides whether to inject the run's
+        # RunnableConfig by reading the callable's annotations, so a bare `*a, **kw`
+        # wrapper silently hides `config` and the tool is called without it. Measured —
+        # deliver_file then saw no delivery target and refused every send.
+        @functools.wraps(fn)
         def run(*a, **kw):
             try:
                 out = fn(*a, **kw)
@@ -256,7 +265,6 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
                 telemetry.count("tool_call", tool=fn.__name__, outcome=type(e).__name__)
                 log.exception("code tool failed for %s", actor_id)
                 return f"The sandbox could not run that ({type(e).__name__})."
-        run.__name__ = fn.__name__
         return run
 
     # Every call is prefixed with a cd: the sandbox's own working directory is elsewhere

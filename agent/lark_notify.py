@@ -115,6 +115,18 @@ def send_link(chat_id: str, text: str, link_text: str, url: str) -> bool:
     return True
 
 
+class LarkError(RuntimeError):
+    """A refusal from Lark, carrying its own words.
+
+    Raised by the file-delivery calls only. The reply path keeps returning booleans: a
+    failed reply is logged and degraded, while a failed delivery has to reach the model,
+    which otherwise tells the user a file was sent when Lark said why it was not."""
+
+
+def _reason(body: dict) -> str:
+    return str(body.get("msg") or body or "no response")
+
+
 def _upload(path: str, fields: dict, file_name: str, data: bytes,
             part: str = "file") -> dict:
     """One multipart/form-data POST, built by hand because this module speaks urllib.
@@ -158,7 +170,7 @@ def upload_file(file_name: str, data: bytes, file_type: str = "stream",
     body = _upload("/open-apis/im/v1/files", fields, file_name, data)
     key = (body.get("data") or {}).get("file_key", "")
     if not key:
-        log.error("file upload failed for %s: %s", file_name, body.get("msg", body))
+        raise LarkError(f"Lark would not accept {file_name}: {_reason(body)}")
     return key
 
 
@@ -169,7 +181,7 @@ def upload_image(data: bytes) -> str:
                    part="image")
     key = (body.get("data") or {}).get("image_key", "")
     if not key:
-        log.error("image upload failed: %s", body.get("msg", body))
+        raise LarkError(f"Lark would not accept the cover image: {_reason(body)}")
     return key
 
 
@@ -186,14 +198,17 @@ def send_media(chat_id: str, file_key: str, image_key: str) -> bool:
 
 def _send_media_message(chat_id: str, msg_type: str, content: dict) -> bool:
     tok = _tenant_token()
-    if not (tok and chat_id):
-        return False
+    if not tok:
+        raise LarkError("no tenant token, so nothing can be sent")
+    if not chat_id:
+        raise LarkError("this turn carries no chat to send to")
     body = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={_rid_type(chat_id)}",
                  {"receive_id": chat_id, "msg_type": msg_type,
                   "content": json.dumps(content)}, bearer=tok)
     if body.get("code") not in (0, "0"):
-        log.error("send %s to %s failed: %s", msg_type, chat_id, body.get("msg", body))
-        return False
+        # Lark's own sentence, e.g. the bot not being a member of the target chat — the
+        # one thing that tells the model what to say next.
+        raise LarkError(f"Lark refused the message: {_reason(body)}")
     return True
 
 

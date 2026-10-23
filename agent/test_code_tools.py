@@ -312,5 +312,38 @@ def test_a_missing_file_is_named_rather_than_sent_as_empty(_lark):
     assert not _lark["upload"].called
 
 
+def test_larks_own_reason_reaches_the_model(_lark):
+    """A bare failure reads as "try again". "The bot is not in that chat" does not — and
+    only Lark knows which it is."""
+    _lark["file"].side_effect = delivery.lark_notify.LarkError(
+        "Lark refused the message: bot is not in the chat")
+    out = _deliver(_DeliverBox(), delivery.LarkDelivery("oc_1"))
+    assert "was not sent" in out and "bot is not in the chat" in out
+
+
+def test_a_video_lark_will_not_take_a_cover_for_still_arrives(_lark):
+    """A rejected cover says nothing about the video, so it falls back to an attachment."""
+    with mock.patch.object(delivery.lark_notify, "upload_image",
+                           side_effect=delivery.lark_notify.LarkError("bad cover")):
+        out = _deliver(_DeliverBox(cover=True), delivery.LarkDelivery("oc_1"), "clip.mp4")
+    assert "attachment" in out
+    assert _lark["file"].called and not _lark["media"].called
+
+
+def test_the_guard_does_not_hide_the_runs_config_from_the_tool(_lark):
+    """The regression that made every send refuse: LangChain injects the run config by
+    reading the callable's annotations, so the telemetry wrapper has to keep them. A bare
+    `*a, **kw` wrapper leaves deliver_file with no target, and it then refuses silently —
+    the tool returns a sentence, telemetry says ok, and nothing looks broken."""
+    tools = {t.name: t for t in code_tools.tools_for("lark:ou_x", _DeliverBox())}
+    assert "config" not in tools["deliver_file"].args, "config must stay out of the schema"
+    # Invoked the way a run does, through the tool rather than the raw function.
+    out = tools["deliver_file"].invoke(
+        {"path": "report.pdf"},
+        config={"configurable": {"delivery": delivery.LarkDelivery("oc_real")}})
+    assert "attachment" in out
+    assert _lark["file"].call_args.args[0] == "oc_real"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
