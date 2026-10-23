@@ -527,6 +527,7 @@ class FakeCard:
         self.ok = False
         self.updates = []
         self.closed_with = None
+        self.tool_events = []
 
     def open(self):
         self.ok = self._open_ok
@@ -542,6 +543,12 @@ class FakeCard:
     def close(self, final_text):
         self.closed_with = final_text
         return self._close_ok
+
+    def tool_started(self):
+        self.tool_events.append("start")
+
+    def tool_finished(self):
+        self.tool_events.append("finish")
 
 
 
@@ -649,7 +656,13 @@ def _load_card(monkeypatch_calls):
     lark_notify._tenant_token = lambda: "tok"
 
     def fake_call(method, url, body, bearer=""):
-        monkeypatch_calls.append((method, body.get("content"), body.get("sequence")))
+        content = body.get("content")
+        if content is None and "elements" in body:       # the answer's first write
+            content = json.loads(body["elements"])[0]["content"]
+        # Only the answer's text is under test here; status writes are counted elsewhere.
+        if "/elements/status" in url or url.endswith("/settings"):
+            content = None
+        monkeypatch_calls.append((method, content, body.get("sequence")))
         return {"code": 0}
     lark_notify._call = fake_call
     return lark_notify
@@ -695,6 +708,93 @@ def test_card_sequence_never_repeats_or_goes_backwards():
     card.close("done")
     seqs = [s for _, _, s in calls if s is not None]
     assert seqs == sorted(set(seqs)), f"sequence not strictly increasing: {seqs}"
+
+
+def _recording_card():
+    """A StreamingCard whose writes are recorded as (method, path, body)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    import importlib
+    import lark_notify
+    importlib.reload(lark_notify)
+    lark_notify._tenant_token = lambda: "tok"
+    writes = []
+
+    def fake_call(method, url, body, bearer=""):
+        writes.append((method, url.split("/cards/c1", 1)[-1], body))
+        return {"code": 0}
+    lark_notify._call = fake_call
+    card = lark_notify.StreamingCard("oc_1")
+    card.card_id, card.ok = "c1", True
+    return lark_notify, card, writes
+
+
+def test_the_answer_appears_above_the_status_line_then_streams_in_place():
+    """CardKit rejects an empty text update, so the answer element does not exist until
+    there are words for it — and it goes above the status, which stays at the bottom."""
+    ln, card, writes = _recording_card()
+    card._write("我先")
+    card._write("我先看一下")
+    (m1, p1, b1), (m2, p2, b2) = writes
+    assert (m1, p1, b1["type"], b1["target_element_id"]) == (
+        "POST", "/elements", "insert_before", "status")
+    assert (m2, p2, b2["content"]) == ("PUT", "/elements/answer/content", "我先看一下")
+
+
+def test_the_tool_count_comes_from_results_not_from_starts():
+    """A streamed tool call names its tool on more than one chunk, so counting starts
+    would overcount; a result is one call that really ran."""
+    ln, card, _ = _recording_card()
+    card.tool_started(); card.tool_started(); card.tool_finished()
+    title, steps = card.summary()
+    assert "调用 1 次工具" in title
+    assert any(s.startswith("调用工具") for s in steps)
+
+
+def test_a_turn_without_tools_says_only_how_long_it_took():
+    ln, card, _ = _recording_card()
+    title, _ = card.summary()
+    assert title.startswith("⚙️ 执行过程 · 耗时") and "工具" not in title
+
+
+def test_closing_turns_the_status_into_a_collapsed_panel():
+    ln, card, writes = _recording_card()
+    card.update("答案")
+    assert card.close("答案") is True
+    panel = [b for m, p, b in writes if m == "PUT" and p == "/elements/status"]
+    assert panel, "the status line must be replaced by the summary panel"
+    el = json.loads(panel[-1]["element"])
+    assert el["tag"] == "collapsible_panel" and el["expanded"] is False
+    assert writes[-1][1] == "/settings"          # streaming turned off last
+
+
+def test_a_failed_panel_write_does_not_cost_the_answer():
+    """The panel is a footnote. If CardKit refuses it the answer is still delivered and
+    the card is still closed, so the caller must not fall back to posting text again."""
+    ln, card, writes = _recording_card()
+    orig = ln._call
+    ln._call = lambda m, u, b, bearer="": ({"code": 1, "msg": "no"}
+                                           if u.endswith("/elements/status") and m == "PUT"
+                                           else orig(m, u, b, bearer))
+    assert card.close("答案") is True
+
+
+def test_the_heartbeat_moves_the_seconds_only_while_waiting():
+    """A long tool call emits no event, so the status is refreshed on a timer while the
+    turn waits — and not once the answer is streaming, where it would only add writes."""
+    import threading, time as _t
+    ln, card, writes = _recording_card()
+    ln._HEARTBEAT_SECONDS = 0.05
+    card._worker = threading.Thread(target=card._pump, daemon=True)
+    card._worker.start()
+    card.tool_started()
+    _t.sleep(1.3)  # nosemgrep: arbitrary-sleep — lets a few heartbeats land
+    waiting = sum(1 for m, p, _ in writes if p == "/elements/status/content")
+    assert waiting >= 2, "the seconds must move during a tool call"
+    card.update("开始回答")
+    _t.sleep(1.3)  # nosemgrep: arbitrary-sleep — would expose a heartbeat that kept going
+    card._stop.set(); card._wake.set(); card._worker.join(timeout=2)
+    after = [b["content"] for m, p, b in writes if p == "/elements/status/content"][waiting:]
+    assert all("撰写" in c for c in after), f"heartbeat kept running while writing: {after}"
 
 
 def test_card_update_reports_failure_on_the_next_call():

@@ -282,27 +282,63 @@ def remove_reaction(message_id: str, reaction_id: str) -> bool:
 # its updates don't count against the QPS limit, unlike editing a message.
 
 _ELEMENT_ID = "answer"
-_STREAM_PLACEHOLDER = "🤔 正在思考…"
+_STATUS_ID = "status"
+# While waiting, the status line is refreshed this often so its seconds keep moving: a
+# long tool call emits no event, and a card that sits still reads as stuck.
+_HEARTBEAT_SECONDS = 3.0
+# Below this a step is noise — the model re-reading a tool result before it writes.
+_MIN_STEP_SECONDS = 0.5
+_STEP_LABEL = {"think": "思考", "tool": "调用工具", "write": "撰写回答"}
 
 
-def _card_json(text: str, streaming: bool) -> dict:
+def _grey(text: str) -> str:
+    return f"<font color='grey'>{text}</font>"
+
+
+def _status_element(text: str) -> dict:
+    return {"tag": "markdown", "element_id": _STATUS_ID, "text_size": "notation",
+            "content": _grey(text)}
+
+
+def _card_json(status: str, streaming: bool) -> dict:
+    """A card that starts as a status line only. The answer element is inserted above it
+    when the first words arrive: CardKit rejects an empty text update, and an empty
+    element would leave a gap above the status while the model is still thinking."""
     return {
         "schema": "2.0",
         "config": {"streaming_mode": streaming, "update_multi": True},
-        "body": {"elements": [
-            {"tag": "markdown", "element_id": _ELEMENT_ID, "content": text},
-        ]},
+        "body": {"elements": [_status_element(status)]},
     }
 
 
-class StreamingCard:
-    """One streaming card's lifecycle. All CardKit writes on a card share a single
-    strictly-increasing sequence, so it lives here rather than in the caller.
+def _summary_panel(title: str, steps: list[str]) -> dict:
+    """What the status line becomes when the turn ends: a collapsed, grey-filled panel,
+    so the record of what ran reads as a footnote rather than as more of the answer."""
+    icon = {"tag": "standard_icon", "token": "down-small-ccm_outlined",
+            "size": "16px 16px", "color": "grey"}
+    return {"tag": "collapsible_panel", "element_id": _STATUS_ID, "expanded": False,
+            "background_color": "grey-50", "padding": "4px 8px 4px 8px",
+            "header": {"title": {"tag": "markdown", "text_size": "notation",
+                                 "content": _grey(title)},
+                       "icon": icon, "icon_position": "right", "icon_expanded_angle": -180,
+                       "padding": "4px 0px 4px 0px"},
+            "elements": [{"tag": "markdown", "text_size": "notation",
+                          "content": _grey("\n".join(steps))}]}
 
-    Every method returns a bool and never raises: streaming is an enhancement, and
-    a failure must fall back to send_text rather than lose the answer. `ok` tracks
-    whether the card is usable; once a call fails the caller should stop and fall
-    back."""
+
+class StreamingCard:
+    """One streaming card's lifecycle: an answer above, and below it a status line that
+    tracks what the turn is doing and ends as a collapsed summary of it.
+
+    The status follows events, not a clock — a tool starting, a result arriving, the
+    first words of the answer — with a heartbeat only while nothing is happening, so the
+    seconds move during a long tool call and stop once the answer streams. Phases are
+    generic on purpose: naming each tool would be a mapping to maintain.
+
+    All CardKit writes on a card share a single strictly-increasing sequence, so it lives
+    here rather than in the caller. Every method returns a bool or nothing and never
+    raises: streaming is an enhancement, and a failure must fall back to send_text rather
+    than lose the answer. `ok` tracks whether the card is usable."""
 
     def __init__(self, chat_id: str):
         self.chat_id = chat_id
@@ -314,45 +350,132 @@ class StreamingCard:
         # flush interval it was tuned against — the loop spent over half its time
         # waiting on HTTP instead of reading the model, and the text arrived in visible
         # jerks. Now the loop only ever hands over the latest accumulated text.
-        self._lock = threading.Lock()      # guards _pending
+        self._lock = threading.Lock()      # guards _pending, the phase and the steps
         self._send_lock = threading.Lock()  # one write in flight, so _seq stays ordered
         self._pending: str | None = None
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
+        self._answer_shown = False
+        self._t0 = time.monotonic()
+        self._phase = "think"
+        self._phase_since = self._t0
+        self._tools_done = 0
+        self._steps: list[tuple[str, float]] = []
+        self._status_due = False
+        self._status_written_at = self._t0
 
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
 
+    # --- what the turn is doing ---------------------------------------------
+
+    def _elapsed(self) -> int:
+        return max(1, round(time.monotonic() - self._t0))
+
+    def _enter(self, phase: str) -> None:
+        """Close the running step and start the next. Caller holds _lock."""
+        now = time.monotonic()
+        spent = now - self._phase_since
+        if self._phase in _STEP_LABEL and (self._phase == "tool"
+                                           or spent >= _MIN_STEP_SECONDS):
+            last = self._steps[-1] if self._steps else None
+            # Consecutive thinking or writing is one step; each tool call is its own.
+            if last and last[0] == self._phase and self._phase != "tool":
+                self._steps[-1] = (self._phase, last[1] + spent)
+            else:
+                self._steps.append((self._phase, spent))
+        self._phase, self._phase_since = phase, now
+        self._status_due = True
+
+    def _status_text(self) -> str:
+        if self._phase == "tool":
+            return f"🛠️ 正在调用工具(第 {self._tools_done + 1} 次)· {self._elapsed()} 秒"
+        if self._phase == "write":
+            return "✍️ 正在撰写回答"
+        return f"🤔 思考中 · {self._elapsed()} 秒"
+
+    def tool_started(self) -> None:
+        """The model began a tool call. Counted on the result instead: a streamed call
+        names its tool on more than one chunk, so counting starts would overcount."""
+        if not self.ok:
+            return
+        with self._lock:
+            if self._phase != "tool":
+                self._enter("tool")
+        self._wake.set()
+
+    def tool_finished(self) -> None:
+        if not self.ok:
+            return
+        with self._lock:
+            self._tools_done += 1
+            self._enter("think")
+        self._wake.set()
+
+    def summary(self) -> tuple[str, list[str]]:
+        """The panel's title and its steps, as they stand."""
+        with self._lock:
+            title = (f"⚙️ 执行过程 · 调用 {self._tools_done} 次工具 · 耗时 {self._elapsed()} 秒"
+                     if self._tools_done else f"⚙️ 执行过程 · 耗时 {self._elapsed()} 秒")
+            steps = [f"{_STEP_LABEL[p]} {max(1, round(t))} 秒" for p, t in self._steps]
+        return title, steps
+
+    # --- writing ------------------------------------------------------------
+
     def _pump(self) -> None:
-        """Write the newest text, repeatedly. Superseded states are dropped rather than
-        queued: CardKit takes the full accumulated text on every write, so the newest
-        one subsumes every earlier one — queueing them would only add latency."""
+        """Write the newest text and the current status, repeatedly. Superseded text is
+        dropped rather than queued: CardKit takes the full accumulated text on every
+        write, so the newest one subsumes every earlier one."""
         while not self._stop.is_set():
             self._wake.wait(timeout=0.5)
             self._wake.clear()
             with self._lock:
                 text, self._pending = self._pending, None
+                waiting = self._phase in ("think", "tool")
+                stale = time.monotonic() - self._status_written_at >= _HEARTBEAT_SECONDS
+                status = (self._status_text()
+                          if self._status_due or (waiting and stale) else None)
+                self._status_due = False
             if text is not None:
                 self._write(text)
+            if status is not None:
+                self._write_status(status)
 
-    def _write(self, full_text: str) -> bool:
-        """The blocking CardKit write. Serialized, so `sequence` stays ordered."""
+    def _put(self, path: str, body: dict, method: str = "PUT") -> bool:
         with self._send_lock:
             tok = _tenant_token()
             if not tok:
                 return False
-            body = _call("PUT",
-                         f"{_API_DOMAIN}/open-apis/cardkit/v1/cards/{self.card_id}"
-                         f"/elements/{_ELEMENT_ID}/content",
-                         {"content": full_text or _STREAM_PLACEHOLDER,
-                          "sequence": self._next_seq()}, bearer=tok)
-            if body.get("code") not in (0, "0"):
-                log.warning("card update failed: %s", body.get("msg", body))
-                self.ok = False
-                return False
+            resp = _call(method, f"{_API_DOMAIN}/open-apis/cardkit/v1/cards/{self.card_id}{path}",
+                         {**body, "sequence": self._next_seq()}, bearer=tok)
+        if resp.get("code") not in (0, "0"):
+            log.warning("card write %s failed: %s", path, resp.get("msg", resp))
+            return False
+        return True
+
+    def _write(self, full_text: str) -> bool:
+        """The answer. Inserted above the status on its first write, updated after."""
+        if not full_text:
             return True
+        if self._answer_shown:
+            ok = self._put(f"/elements/{_ELEMENT_ID}/content", {"content": full_text})
+        else:
+            ok = self._put("/elements", {
+                "type": "insert_before", "target_element_id": _STATUS_ID,
+                "elements": json.dumps([{"tag": "markdown", "element_id": _ELEMENT_ID,
+                                         "content": full_text}])}, method="POST")
+            self._answer_shown = ok
+        if not ok:
+            self.ok = False
+        return ok
+
+    def _write_status(self, text: str) -> None:
+        # Best-effort: the status is decoration, so a failed write must not stop the
+        # answer from streaming.
+        if self._put(f"/elements/{_STATUS_ID}/content", {"content": _grey(text)}):
+            self._status_written_at = time.monotonic()
 
     def open(self) -> bool:
         """Create the card entity and post it. False if CardKit is unavailable
@@ -362,7 +485,7 @@ class StreamingCard:
             return False
         created = _post(f"{_API_DOMAIN}/open-apis/cardkit/v1/cards",
                         {"type": "card_json",
-                         "data": json.dumps(_card_json(_STREAM_PLACEHOLDER, True))},
+                         "data": json.dumps(_card_json(self._status_text(), True))},
                         bearer=tok)
         if created.get("code") not in (0, "0"):
             log.warning("card create failed (falling back to text): %s",
@@ -399,12 +522,14 @@ class StreamingCard:
             return False
         with self._lock:
             self._pending = full_text
+            if self._phase != "write":
+                self._enter("write")
         self._wake.set()
         return True
 
     def close(self, final_text: str) -> bool:
-        """Write the final text and turn streaming off, so the card stops showing the
-        typewriter indicator and becomes static."""
+        """Write the final text, turn the status line into the summary panel, and turn
+        streaming off so the card stops showing the typewriter indicator."""
         if not self.ok:
             return False
         # Stop the worker first, then write the final text synchronously: the worker
@@ -413,15 +538,17 @@ class StreamingCard:
         self._wake.set()
         if self._worker is not None:
             self._worker.join(timeout=10)
+        with self._lock:
+            self._enter("done")
         self._write(final_text)
         if not self.ok:
             return False
-        tok = _tenant_token()
-        body = _call("PATCH",
-                     f"{_API_DOMAIN}/open-apis/cardkit/v1/cards/{self.card_id}/settings",
-                     {"settings": json.dumps({"config": {"streaming_mode": False}}),
-                      "sequence": self._next_seq()}, bearer=tok)
-        if body.get("code") not in (0, "0"):
-            log.warning("card close failed: %s", body.get("msg", body))
+        title, steps = self.summary()
+        # Losing the panel loses a footnote, not the answer, so it does not fail close().
+        self._put(f"/elements/{_STATUS_ID}",
+                  {"element": json.dumps(_summary_panel(title, steps))})
+        if not self._put("/settings",
+                         {"settings": json.dumps({"config": {"streaming_mode": False}})},
+                         method="PATCH"):
             return False
         return True

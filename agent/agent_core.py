@@ -1024,12 +1024,21 @@ def _stream_to_chat(session: dict, message: str, chat_id: str,
         log.info("aborting turn: %s needs %s consent", tool_name, idp)
         return True
 
+    def _on_tool_use(tool_name: str) -> bool:
+        if _abort_on_ungranted_tool(tool_name):
+            return True
+        card.tool_started()
+        return False
+
+    def _on_tool_result(name: str, text: str) -> None:
+        session["tool_texts"].append((name, text))
+        card.tool_finished()
+
     acc = []
     for delta in _iter_deltas(session["graph"], message,
                               _run_config(session, delivery.LarkDelivery(chat_id),
                                           image_blocks, image_handles),
-                              on_tool_use=_abort_on_ungranted_tool,
-                              on_tool_result=lambda name, text: session["tool_texts"].append((name, text))):
+                              on_tool_use=_on_tool_use, on_tool_result=_on_tool_result):
         acc.append(delta)
         if streaming and not card.update("".join(acc)):
             streaming = False  # a failed write drops us to the fallback below
