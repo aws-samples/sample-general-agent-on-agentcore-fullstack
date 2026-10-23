@@ -46,7 +46,7 @@ if [ "${1:-}" != "--yes" ]; then
   warn "  + their targets, Runtimes (${RUNTIME_NAMES[*]}),"
   warn "  and CDK stacks (shim, router, storage, agentcore, observability, security)."
   warn "  With files storage deployed: every user's access point goes too (their files stay"
-  warn "  in the bucket until the bucket itself is removed), along with the VPC and NAT."
+  warn "  in the bucket until the bucket itself is removed), along with the VPC."
   warn "  Secrets include your Lark credentials ($PREFIX/channels/lark) — re-seedable"
   warn "  from .env via scripts/setup-lark.sh. Lark console app config is NOT touched."
   warn "  The OAuth provider goes too, so every user's vaulted token is purged and the"

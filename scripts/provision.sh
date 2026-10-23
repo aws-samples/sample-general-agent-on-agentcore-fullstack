@@ -20,15 +20,18 @@ cd "$ROOT"
 
 # Deployment target: command-line env vars win over .env, which wins over defaults.
 _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
-_CLI_FILES="${FILES_STORAGE:-}"
+_CLI_FILES="${FILES_STORAGE:-}" _CLI_NAT="${NAT_GATEWAY:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
-# Code execution and its per-user workspace. Off by default: it adds a VPC (no NAT — the
-# sandbox only needs S3, via a free gateway endpoint) and an S3 Files file system.
+# Code execution and its per-user workspace. Off by default: it adds a VPC (the sandbox
+# reaches S3 via a free gateway endpoint) and an S3 Files file system. NAT_GATEWAY adds a
+# NAT to that VPC so the sandbox has internet; it means nothing without FILES_STORAGE.
 # See docs/architecture.md.
 FILES_STORAGE="${_CLI_FILES:-${FILES_STORAGE:-false}}"
+NAT_GATEWAY="${_CLI_NAT:-${NAT_GATEWAY:-false}}"
+[ "$FILES_STORAGE" = "true" ] || NAT_GATEWAY=false
 PREFIX="agentcore-fullstack"
 export AWS_REGION="$REGION" UV_LINK_MODE=copy
 # Credentials already in the environment outrank .env's profile.
@@ -100,11 +103,15 @@ base_cdk_stacks() {
   # naming it unconditionally would fail the deploy rather than skip it.
   if [ "$FILES_STORAGE" = "true" ]; then
     stacks+=("$PREFIX-storage")
-    echo "  code execution: on (VPC without NAT + S3 Files will be created)"
+    if [ "$NAT_GATEWAY" = "true" ]; then
+      echo "  code execution: on (VPC with a NAT gateway + S3 Files; the sandbox has internet)"
+    else
+      echo "  code execution: on (VPC without NAT + S3 Files; the sandbox has no internet)"
+    fi
   else
     echo "  code execution: off"
   fi
-  $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" \
+  $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" \
              --require-approval never --outputs-file cdk.out/outputs.json
   # The web page needs this and CDK assigns it, so it travels through state rather than a
   # cross-stack export — importing it would freeze the router's own exports.
@@ -223,6 +230,7 @@ phase2_runtime() {
     MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
     SHIM="$shim" POOL="$pool" PWSECRET="$pwsecret" WS_URL="$ws_url" \
     APPROVAL_URL="$approval_url" FS_ARN="$fs_arn" CI_ID="$ci_id" PREFIX="$PREFIX" \
+    CODE_NET="$([ -n "$ci_id" ] && [ "$NAT_GATEWAY" = "true" ] && echo true || true)" \
     GOOGLE_URL="$google_url" \
     CKPT_TABLE="$ckpt_table" CKPT_BUCKET="$ckpt_bucket" \
     LARK_DOMAIN="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
@@ -267,6 +275,8 @@ env = {
     "CODE_INTERPRETER_ID": e["CI_ID"],
     "FILES_FS_ARN": e["FS_ARN"],
     "WORKSPACE_PATH": "/mnt/workspace" if e["CI_ID"] else "",
+    # Tells the code tools whether to promise installs; the NAT is what makes it true.
+    "CODE_INTERNET": e["CODE_NET"],
 }
 # The Runtime is never in the VPC: it must keep reaching Bedrock, Lark and a cross-region
 # Gateway, and that is what used to force a NAT. Only the sandbox goes in.
@@ -328,7 +338,7 @@ print(json.dumps(p))')" >/dev/null
   # The router's AGENTCORE_RUNTIME_ARN was synthesised before the runtime existed (a
   # PLACEHOLDER), so re-deploy it now that the real id is known.
   log "Router — re-deploy with the real runtime ARN"
-  $CDK deploy "$PREFIX-router" -c "files_storage=$FILES_STORAGE" --require-approval never
+  $CDK deploy "$PREFIX-router" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" --require-approval never
 
   # AgentCore keeps serving existing sessions from the OLD container, so stored session
   # ids would pin users to the previous image. Drop them: the next message starts a new
@@ -359,8 +369,8 @@ phase_code() {
   name="${PREFIX//-/_}_code"
 
   # VPC mode, not SANDBOX: measured — filesystemConfigurations is refused outside VPC mode
-  # ("VPC network mode is required when filesystemConfigurations are provided"). No NAT is
-  # needed, only the S3 gateway endpoint the storage stack creates.
+  # ("VPC network mode is required when filesystemConfigurations are provided"). The mount
+  # needs only the S3 gateway endpoint the storage stack creates; NAT_GATEWAY adds internet.
   #
   # No filesystemConfigurations here on purpose: the mount is named per session, so one
   # shared interpreter serves every user with their own Access Point. See docs/architecture.md.
@@ -475,7 +485,7 @@ phase_webui() {
   if [ "${WEBUI:-false}" != "true" ]; then
     echo "  webui: off (set WEBUI=true in .env)"; return 0
   fi
-  $CDK deploy "$PREFIX-webui" -c webui=true -c "files_storage=$FILES_STORAGE" \
+  $CDK deploy "$PREFIX-webui" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" \
              --require-approval never
   local url
   url="$(cfn_out "$PREFIX-webui" WebUiUrl)"
@@ -483,7 +493,7 @@ phase_webui() {
   # assigns the domain now — so it travels through .cdk-state.json and the router is
   # re-deployed, the same route the file system id takes.
   ctx_set web_origin "$url"
-  $CDK deploy "$PREFIX-router" -c webui=true -c "files_storage=$FILES_STORAGE" \
+  $CDK deploy "$PREFIX-router" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" \
              --exclusively --require-approval never
   log "Web chat: $url  (register this domain on the Lark h5 app)"
 }

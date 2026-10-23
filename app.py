@@ -81,15 +81,17 @@ shim = ShimStack(
 )
 
 # --- Storage: S3 Files, mounted per user into the code sandbox (opt-in) ---
-# Off unless files_storage=true. No NAT: only the Code Interpreter session sits in this
-# VPC and it reaches S3 through a free gateway endpoint — see docs/architecture.md. Declared
-# before the router so its ids are available to the phases that need them.
+# Off unless files_storage=true. Only the Code Interpreter session sits in this VPC and it
+# reaches S3 through a free gateway endpoint; nat_gateway=true adds a NAT for internet —
+# see docs/architecture.md. Declared before the router so its ids are available to the
+# phases that need them.
 storage = None
 if _flag("files_storage"):
     storage = StorageStack(
         app,
         f"{prefix}-storage",
         user_files_bucket=agentcore.user_files_bucket,
+        nat_gateway=_flag("nat_gateway"),
         env=env,
     )
 

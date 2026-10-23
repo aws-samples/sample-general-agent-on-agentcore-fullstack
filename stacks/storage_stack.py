@@ -1,10 +1,10 @@
 """Per-user file storage for code execution: S3 Files, mounted into the sandbox.
 
-Only deployed when the `files_storage` context flag is true. **No NAT**: what sits in this
-VPC is the Code Interpreter session, and it only has to reach S3, which a gateway endpoint
-does for free. The agent Runtime stays PUBLIC. That is the whole difference from the shape
-this replaced, where the Runtime itself had to mount NFS and therefore needed a route out
-to Bedrock, Lark and a cross-region Gateway.
+Only deployed when the `files_storage` context flag is true. What sits in this VPC is the
+Code Interpreter session; it reaches S3 through a free gateway endpoint, and the agent
+Runtime stays PUBLIC outside it. By default there is **no NAT**, so the sandbox has no
+internet; `nat_gateway=true` adds one NAT gateway so it can install packages and call
+external APIs.
 
 What isolation rests on (see docs/architecture.md):
   - one Access Point per user, `rootDirectory` fixed server-side to /users/<actor>
@@ -29,31 +29,42 @@ from constructs import Construct
 
 # NFS. The mount target listens here and nowhere else.
 _NFS_PORT = 2049
+# Subnet group the sandbox and mount targets live in. The name is part of each subnet's
+# logical id, so it stays "isolated" even when the NAT makes it private-with-egress.
+_SANDBOX_SUBNETS = "isolated"
 
 
 class StorageStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, *,
-                 user_files_bucket: s3.IBucket, **kwargs) -> None:
+                 user_files_bucket: s3.IBucket, nat_gateway: bool = False,
+                 **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         region = Stack.of(self).region
         account = Stack.of(self).account
         prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
 
-        # --- VPC: isolated subnets and no NAT. What lives in here is the Code Interpreter
-        # session, and it only has to reach S3 — which a gateway endpoint does for free.
-        # The agent Runtime stays PUBLIC and is unaffected; putting *it* in a VPC is what
-        # used to force a NAT, because it must keep reaching Bedrock, Lark and a
-        # cross-region Gateway. Two AZs because mount targets are per-AZ. See ADR 0007.
+        # --- VPC for the Code Interpreter session. S3 goes through a gateway endpoint for
+        # free; the agent Runtime stays PUBLIC outside it. Two AZs because mount targets
+        # are per-AZ. See ADR 0007.
+        #
+        # The sandbox group is listed first and keeps its name either way, so toggling the
+        # NAT retypes the same subnets (same logical ids, same CIDRs) instead of replacing
+        # them: the Code Interpreter has their ids baked in and has no update API. Public
+        # subnets only exist to hold the NAT; one NAT, not one per AZ, to keep it to one
+        # fixed hourly charge.
+        sandbox_subnets = ec2.SubnetConfiguration(
+            name=_SANDBOX_SUBNETS, cidr_mask=24,
+            subnet_type=(ec2.SubnetType.PRIVATE_WITH_EGRESS if nat_gateway
+                         else ec2.SubnetType.PRIVATE_ISOLATED))
         self.vpc = ec2.Vpc(
             self, "Vpc",
             max_azs=2,
-            nat_gateways=0,
+            nat_gateways=1 if nat_gateway else 0,
             ip_addresses=ec2.IpAddresses.cidr("10.20.0.0/16"),
-            subnet_configuration=[
-                ec2.SubnetConfiguration(name="isolated", cidr_mask=24,
-                                        subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
-            ],
+            subnet_configuration=[sandbox_subnets] + ([ec2.SubnetConfiguration(
+                name="public", cidr_mask=24, subnet_type=ec2.SubnetType.PUBLIC)]
+                if nat_gateway else []),
             gateway_endpoints={
                 "S3": ec2.GatewayVpcEndpointOptions(
                     service=ec2.GatewayVpcEndpointAwsService.S3),
@@ -150,7 +161,7 @@ class StorageStack(Stack):
         )
 
         for i, subnet in enumerate(self.vpc.select_subnets(
-                subnet_type=ec2.SubnetType.PRIVATE_ISOLATED).subnets):
+                subnet_group_name=_SANDBOX_SUBNETS).subnets):
             s3files.CfnMountTarget(
                 self, f"MountTarget{i}",
                 # .ref (the ARN) on purpose: the mount target accepts it, and switching
@@ -172,4 +183,4 @@ class StorageStack(Stack):
                   value=self.sandbox_sg.security_group_id)
         CfnOutput(self, "SandboxSubnetIds", value=",".join(
             s.subnet_id for s in self.vpc.select_subnets(
-                subnet_type=ec2.SubnetType.PRIVATE_ISOLATED).subnets))
+                subnet_group_name=_SANDBOX_SUBNETS).subnets))
