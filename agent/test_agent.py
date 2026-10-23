@@ -286,7 +286,11 @@ def test_a_message_arriving_mid_turn_is_steered_not_refused():
     agent_core.steer("t-1", "and also check the logs")
     agent_core.steer("t-1", "one more thing")
     mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
-    runtime = type("R", (), {"config": {"configurable": {"thread_id": "t-1"}}})()
+    # The runtime's real shape on LangGraph 1.2: the thread id lives on execution_info,
+    # and there is no `config` attribute at all. A fake carrying `config` kept this test
+    # green while steering was dead in production — every queued message was dropped.
+    runtime = type("R", (), {"execution_info": type("E", (), {"thread_id": "t-1"})()})()
+    assert not hasattr(runtime, "config")
     out = mw.before_model({"messages": []}, runtime)
     assert [m.content for m in out["messages"]] == ["and also check the logs", "one more thing"]
     # Drained, so the next model call in the same turn does not see them twice.

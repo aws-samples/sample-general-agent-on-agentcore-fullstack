@@ -172,16 +172,20 @@ def _take_steer(thread_id: str) -> list[str]:
         return _pending_steer.pop(thread_id, [])
 
 
+def _thread_of(runtime) -> str:  # noqa: ANN001 — the framework's own type
+    """This run's thread id. `runtime.config` does not exist on LangGraph 1.2, so reading
+    it silently disabled steering; `execution_info` is where the id actually lives."""
+    return getattr(getattr(runtime, "execution_info", None), "thread_id", "") or ""
+
+
 class _SteeringMiddleware:
     """Injects messages that arrived mid-turn, at the only boundary where it is legal."""
 
     name = "steering"
 
     def before_model(self, state, runtime):  # noqa: ANN001 — the framework's signature
-        thread_id = ""
-        try:
-            thread_id = runtime.config["configurable"]["thread_id"]
-        except Exception:  # noqa: BLE001 — no thread means nothing to inject
+        thread_id = _thread_of(runtime)
+        if not thread_id:
             return None
         queued = _take_steer(thread_id)
         if not queued:
