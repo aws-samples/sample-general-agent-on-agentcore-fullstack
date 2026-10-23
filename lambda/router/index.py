@@ -87,7 +87,8 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
                  action: str = "chat", mem_sid: str = "",
                  budget: float | None = None, chat_id: str = "",
                  message_id: str = "", reaction_id: str = "",
-                 fresh_session: bool = False) -> dict:
+                 fresh_session: bool = False,
+                 images: list | None = None) -> dict:
     """Invoke the agent once. Returns the parsed response dict
     {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON).
 
@@ -107,6 +108,8 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
         "reactionId": reaction_id,
         # Consent-resume: force a rebuilt session so the new token is used.
         "freshSession": fresh_session,
+        # [{message_id, image_key}] — the agent reads the pixels from Lark itself.
+        "images": images or [],
     }).encode()
     req = urllib.request.Request(
         _RUNTIME_URL, data=payload, method="POST",
@@ -349,10 +352,13 @@ def resume_consented_turn(actor_id: str) -> None:
     session_id = identity.get_or_create_session(user_id)
     mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
     # A fresh reaction on the resumed turn is not possible (the original message id
-    # isn't parked), so none is passed — the answer arrives without a marker.
+    # isn't parked), so none is passed — the answer arrives without a marker. The image
+    # handles are parked, though: a turn that waited for consent still had a screenshot.
+    handles = [{**a, "message_id": parked.get("attachmentMessageId", "")}
+               for a in (parked.get("attachments") or [])]
     invoke_agent(session_id, user_id, actor_id, message,
                  action="chat_async", mem_sid=mem_sid, chat_id=chat_id,
-                 fresh_session=True)
+                 fresh_session=True, images=handles)
 
 
 # ---------------------------- approval events -------------------------------
@@ -438,17 +444,21 @@ def process_approval_event(ev: dict, context=None) -> None:
 
 
 _CARRIED_NAMES = {"img": "图片", "image": "图片", "file": "文件", "media": "视频",
-                  "audio": "语音", "sticker": "表情"}
+                  "audio": "语音", "sticker": "表情", "folder": "文件夹"}
 
 
-def _words_and_attachments(msg_type: str, content: dict) -> tuple[str, list[str]]:
-    """What the user actually typed, and what else the message carried.
+def _words_and_attachments(msg_type: str, content: dict) -> tuple[str, list[str], list[dict]]:
+    """What the user typed, what the message carried that nothing can read, and handles
+    for what can be fetched.
 
     A screenshot with a caption arrives as `post`, whose content is a list of paragraphs
     of tagged elements — the caption is in there, but not under `text`, which is why
-    reading `content["text"]` for every type silently lost the whole message."""
+    reading `content["text"]` for every type silently lost the whole message. Handles,
+    never bytes: the agent reads the resource from the message itself, so nothing large
+    passes through the parked state or the async self-invoke. `kind` matters because
+    Lark's resource endpoint answers 500 when it does not match the key."""
     if msg_type == "post":
-        words, carried = [], []
+        words, carried, found = [], [], []
         for paragraph in content.get("content") or []:
             for element in paragraph or []:
                 tag = element.get("tag")
@@ -456,12 +466,33 @@ def _words_and_attachments(msg_type: str, content: dict) -> tuple[str, list[str]
                 # stripping below, so it is neither words nor an attachment.
                 if tag in ("text", "a"):
                     words.append(element.get("text", ""))
+                elif tag == "img" and element.get("image_key"):
+                    found.append({"kind": "image", "key": element["image_key"]})
+                elif tag == "media" and element.get("file_key"):
+                    found.append({"kind": "file", "key": element["file_key"],
+                                  "name": element.get("file_name", "")})
                 elif tag and tag != "at":
                     carried.append(tag)
-        return " ".join(w for w in words if w), carried
-    if msg_type in ("image", "file", "media", "audio", "sticker"):
-        return "", [msg_type]
-    return content.get("text", ""), []
+        # A file sent with text is not a paragraph element: it sits in a top-level
+        # `files` list beside `content` (measured on a real message). A folder has no
+        # bytes behind it, so it stays something to own up to.
+        for f in content.get("files") or []:
+            if f.get("is_folder"):
+                carried.append("folder")
+            elif f.get("file_key"):
+                found.append({"kind": "file", "key": f["file_key"],
+                              "name": f.get("file_name", "")})
+        return " ".join(w for w in words if w), carried, found
+    if msg_type == "image" and content.get("image_key"):
+        return "", [], [{"kind": "image", "key": content["image_key"]}]
+    # A file, and a video or audio clip, are all fetched the same way; only a sticker has
+    # nothing behind it worth reading.
+    if msg_type in ("file", "media", "audio") and content.get("file_key"):
+        return "", [], [{"kind": "file", "key": content["file_key"],
+                         "name": content.get("file_name", "")}]
+    if msg_type in ("file", "media", "audio", "sticker"):
+        return "", [msg_type], []
+    return content.get("text", ""), [], []
 
 
 # ------------------------------- chat commands ------------------------------
@@ -630,7 +661,7 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         content = json.loads(content_str)
     except Exception:
         content = {}
-    text, carried = _words_and_attachments(msg_type, content)
+    text, carried, attachments = _words_and_attachments(msg_type, content)
 
     # strip @mentions in group chats
     if message.get("chat_type") == "group":
@@ -650,14 +681,16 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         return
 
     agent_message = text.strip()
+    # Images are handed over as handles for the agent to fetch; everything else still has
+    # to be owned up to, because a model that is told nothing answers as if it had seen.
     if carried:
-        # Said out loud, because the alternative is a model that answers as though it had
-        # seen the picture. Nothing here can read one yet.
         note = "、".join(_CARRIED_NAMES.get(c, c) for c in dict.fromkeys(carried))
-        if not agent_message:
+        if not (agent_message or attachments):
             lark.send_message(chat_id, f"我收到了你的{note}，但还看不了，先用文字说说?")
             return
         agent_message += f"\n\n[附带了{note}，你看不到其内容]"
+    if not (agent_message or attachments):
+        return
 
     reply = run_command(agent_message, user_id, actor_id)
     if reply is not None:
@@ -673,12 +706,14 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
     # so the shim's /return can replay it once consent lands. Only for unauthorized
     # users: an authorized turn won't wall, and parking every message would be waste.
     # Left to expire by TTL if this turn needs no Lark tool after all.
-    identity.park_pending_auth(user_id, agent_message, chat_id)
-    _dispatch_turn(user_id, actor_id, agent_message, chat_id, message_id, context)
+    identity.park_pending_auth(user_id, agent_message, chat_id, attachments, message_id)
+    _dispatch_turn(user_id, actor_id, agent_message, chat_id, message_id, context,
+                   attachments)
 
 
 def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str,
-                   message_id: str = "", context=None) -> None:
+                   message_id: str = "", context=None,
+                   attachments: list | None = None) -> None:
     """Invoke the agent for one turn and deliver the reply. Shared by the webhook
     path and the consent-resume path (shim replays a parked message here)."""
     session_id = identity.get_or_create_session(user_id)
@@ -694,9 +729,13 @@ def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str
         # chat_async: the agent accepts the work, returns at once, and pushes the
         # answer to the chat itself. A synchronous wait cannot cover real tasks —
         # both InvokeAgentRuntime and this Lambda cap out long before they finish.
+        # Handles, so the agent reads the resource from the message that carried it. The
+        # bytes would not survive the trip: an item of parked state caps at 400 KB.
+        handles = [{**a, "message_id": message_id} for a in (attachments or [])]
         result = invoke_agent(session_id, user_id, actor_id, agent_message,
                               action="chat_async", mem_sid=mem_sid, chat_id=chat_id,
-                              message_id=message_id, reaction_id=reaction_id)
+                              message_id=message_id, reaction_id=reaction_id,
+                              images=handles)
         # First-use 3LO: post the consent link. The turn is already parked, so the
         # shim's /return replays it when consent lands — the user does not re-send.
         if result.get("needs_auth"):

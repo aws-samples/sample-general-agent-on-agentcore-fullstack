@@ -196,9 +196,12 @@ def test_a_caption_sent_with_a_screenshot_is_not_lost():
     content = {"title": "", "content": [
         [{"tag": "text", "text": "我给你添加了一个 deliver_file 工具", "style": []}],
         [{"tag": "img", "image_key": "img_v3_0216o_b46b56ab", "width": 531, "height": 641}]]}
-    text, carried = index._words_and_attachments("post", content)
+    text, carried, found = index._words_and_attachments("post", content)
     assert text == "我给你添加了一个 deliver_file 工具"
-    assert carried == ["img"]
+    # A handle, not the word "img": the agent fetches the picture from Lark itself, and
+    # bytes through here would not survive the parked state's 400 KB cap.
+    assert found == [{"kind": "image", "key": "img_v3_0216o_b46b56ab"}]
+    assert carried == []
 
 
 def test_a_link_label_counts_as_words_but_a_mention_does_not():
@@ -206,13 +209,45 @@ def test_a_link_label_counts_as_words_but_a_mention_does_not():
     content = {"content": [[{"tag": "at", "user_id": "ou_x"},
                             {"tag": "text", "text": "see"},
                             {"tag": "a", "text": "this page", "href": "https://x"}]]}
-    assert index._words_and_attachments("post", content) == ("see this page", [])
+    assert index._words_and_attachments("post", content) == ("see this page", [], [])
 
 
-def test_an_image_only_message_yields_no_words_to_invent():
+def test_a_file_sent_with_text_is_found_beside_the_paragraphs():
+    """The payload Lark really delivers for a caption plus a file: the file is in a
+    top-level `files` list, not a paragraph element, so a parser that only walked the
+    paragraphs answered "no attachment" while the user was looking at one."""
     import index
-    assert index._words_and_attachments("image", {"image_key": "img_1"}) == ("", ["image"])
-    assert index._words_and_attachments("text", {"text": "plain"}) == ("plain", [])
+    content = {"title": "",
+               "content": [[{"tag": "text", "text": "总结这个文档内容", "style": []}]],
+               "files": [{"file_key": "file_v3_0016o_715d4a6b",
+                          "file_name": "GCR MAP Mobilize Phase - Technical Review V1.docx",
+                          "is_folder": False}]}
+    text, carried, found = index._words_and_attachments("post", content)
+    assert text == "总结这个文档内容"
+    assert found == [{"kind": "file", "key": "file_v3_0016o_715d4a6b",
+                      "name": "GCR MAP Mobilize Phase - Technical Review V1.docx"}]
+    assert carried == []
+
+
+def test_a_folder_has_no_bytes_to_fetch_so_it_is_owned_up_to():
+    import index
+    content = {"content": [[{"tag": "text", "text": "看看"}]],
+               "files": [{"file_key": "f", "file_name": "docs", "is_folder": True}]}
+    assert index._words_and_attachments("post", content) == ("看看", ["folder"], [])
+
+
+def test_an_attachment_is_carried_by_its_handle_whatever_it_is():
+    """No caption is not nothing to answer, and a document is as fetchable as a picture —
+    the kind only decides whether the model looks at it or opens it with code."""
+    import index
+    assert index._words_and_attachments("image", {"image_key": "img_1"}) == (
+        "", [], [{"kind": "image", "key": "img_1"}])
+    assert index._words_and_attachments(
+        "file", {"file_key": "f_1", "file_name": "q3.pdf"}) == (
+        "", [], [{"kind": "file", "key": "f_1", "name": "q3.pdf"}])
+    assert index._words_and_attachments("text", {"text": "plain"}) == ("plain", [], [])
+    # A sticker has nothing behind it worth reading, so it stays something to own up to.
+    assert index._words_and_attachments("sticker", {}) == ("", ["sticker"], [])
 
 
 def test_microvm_line_reports_platform_version():

@@ -104,15 +104,24 @@ def drop_session(user_id: str) -> None:
 _PENDING_AUTH_TTL = int(os.environ.get("PENDING_AUTH_TTL_SECONDS", "600"))  # 10 min
 
 
-def park_pending_auth(user_id: str, message: str, chat_id: str) -> None:
+def park_pending_auth(user_id: str, message: str, chat_id: str,
+                      attachments: list | None = None,
+                      message_id: str = "") -> None:
     """Remember what the user was trying to do, to replay after they authorize.
-    One per user (overwrites) — a second attempt supersedes the first."""
-    _table.put_item(Item={
+    One per user (overwrites) — a second attempt supersedes the first.
+
+    Handles, never bytes: an item here is capped at 400 KB, and the agent can fetch the
+    resource from the message that carried it."""
+    item = {
         "PK": f"USER#{user_id}", "SK": "PENDING_AUTH",
         "message": message, "chatId": chat_id,
         "createdAt": int(time.time()),
         "ttl": int(time.time()) + _PENDING_AUTH_TTL,
-    })
+    }
+    if attachments:
+        item["attachments"] = list(attachments)
+        item["attachmentMessageId"] = message_id
+    _table.put_item(Item=item)
 
 
 def take_pending_auth(user_id: str) -> dict | None:
