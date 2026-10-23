@@ -335,17 +335,64 @@ def test_microvm_line_tolerates_an_older_image():
     assert "旧镜像" in line
 
 
-def test_model_line_reports_what_the_container_says_not_the_routers_config():
+def test_model_reports_what_the_container_says_not_the_routers_config():
     """UpdateAgentRuntime replaces the environment, so the router's own MODEL_ID can name
     a model nobody is calling. Only the serving container's answer is shown."""
     import index
-    assert index._model_line({"model": "global.anthropic.claude-sonnet-5",
-                              "cacheTtl": "1h"}) == \
-        "global.anthropic.claude-sonnet-5（prompt cache 1h）"
-    assert "关闭" in index._model_line({"model": "m", "cacheTtl": ""})
-    # An older image reports no model, and a failed probe reports nothing at all.
-    assert "探测未返回" in index._model_line({"instance": "abc"})
-    assert "探测未返回" in index._model_line(None)
+    text = index._model_text({"settings": {
+        "model": "global.anthropic.claude-sonnet-5", "region": "ap-northeast-1",
+        "cacheTtl": "1h", "summarizeAt": 120000, "summarizeKeep": 20,
+        "systemPromptCustom": False, "systemPromptChars": 180}})
+    assert "global.anthropic.claude-sonnet-5" in text
+    assert "Amazon Bedrock · ap-northeast-1" in text
+    assert "1h" in text and "120.0k" in text and "保留最近 20 条" in text
+    assert "默认（180 字符）" in text
+    assert "关闭" in index._model_text({"settings": {"model": "m", "cacheTtl": "",
+                                                    "summarizeAt": 0}})
+    # An older image reports no settings, and a failed probe reports nothing at all.
+    assert "探测未返回" in index._model_text({"model": "m"})
+    assert "探测未返回" in index._model_text(None)
+
+
+def test_the_context_line_shows_the_billed_size_next_to_the_threshold():
+    import index
+    line = index._context_line({"contextTokens": 9147, "cachedTokens": 5049},
+                               {"settings": {"summarizeAt": 120000}})
+    assert line == "最近一次请求 9.1k token，其中 5.0k 命中缓存，超过 120.0k 时自动摘要"
+    assert "发一条普通消息" in index._context_line({}, None)
+
+
+def test_tools_are_grouped_by_where_they_came_from_with_the_grant_they_need():
+    """Grouped by source, so the approval tools stand apart from Lark's even though the
+    Lark grant gates both; an ungranted system says which /auth to send."""
+    import index
+    with mock.patch.dict(index.IDPS, {"lark": {"label": "Lark"},
+                                      "google": {"label": "Google"}}, clear=True):
+        text = index._tools_text({"tools": [
+            {"name": "lark_whoami", "source": "lark", "idp": "lark"},
+            {"name": "approval_list", "source": "approval", "idp": "lark"},
+            {"name": "google_whoami", "source": "google", "idp": "google"},
+            {"name": "run_code", "source": "code", "idp": ""},
+        ], "ungranted": ["google"]})
+    lines = text.splitlines()
+    assert lines[0] == "可用工具 · 共 4 个"
+    assert "Lark：lark_whoami" in lines
+    assert "审批：approval_list" in lines
+    assert "Google（未授权，发送 /auth google）：google_whoami" in lines
+    assert "代码执行：run_code" in lines
+
+
+def test_tools_say_why_there_are_none():
+    import index
+    assert "身份校验未通过" in index._tools_text({"tools": [], "identityError": "x"})
+    assert "探测未返回" in index._tools_text(None)
+
+
+def test_status_no_longer_carries_the_model_but_points_to_it():
+    import index
+    src = open(index.__file__, encoding="utf-8").read()
+    block = src[src.index('if cmd == "/status":'):src.index('if cmd == "/model":')]
+    assert "_model_line" not in block and "模型：发送 /model 查看" in block
 
 
 def test_add_reaction_returns_id_and_never_raises():

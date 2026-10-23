@@ -975,13 +975,43 @@ def test_history_stats_counts_a_turn_only_when_an_answer_was_delivered():
             TM(content="r", tool_call_id="1"), AI(content="a")]
     with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
         assert agent_core.history_stats("lark:ou_x", "sess-1") == {
-            "turns": 1, "toolCalls": 1, "messages": 3}
+            "turns": 1, "toolCalls": 1, "messages": 3,
+            "contextTokens": 0, "cachedTokens": 0}
 
 
 def test_history_stats_reports_zero_for_an_untouched_thread():
     with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(None)):
         assert agent_core.history_stats("lark:ou_x", "sess-1") == {
-            "turns": 0, "toolCalls": 0, "messages": 0}
+            "turns": 0, "toolCalls": 0, "messages": 0,
+            "contextTokens": 0, "cachedTokens": 0}
+
+
+def test_context_size_is_the_latest_calls_billed_input_not_an_estimate():
+    """From the usage Bedrock reported, shaped as a real checkpoint stores it: input_tokens
+    already includes what came from the cache. An estimate would not do — the library's
+    counter charges a flat 85 tokens per image."""
+    from langchain_core.messages import AIMessage as AI
+    old = AI(content="a", usage_metadata={"input_tokens": 4968, "output_tokens": 49,
+             "total_tokens": 5017, "input_token_details": {"cache_read": 4832}})
+    new = AI(content="b", usage_metadata={"input_tokens": 9147, "output_tokens": 517,
+             "total_tokens": 9664, "input_token_details": {"cache_read": 5049}})
+    msgs = [HumanMessage("q"), old, HumanMessage("q2"), new]
+    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
+        out = agent_core.history_stats("lark:ou_x", "sess-1")
+    assert (out["contextTokens"], out["cachedTokens"]) == (9147, 5049)
+
+
+def test_the_tool_overview_keeps_assembly_order_and_names_the_missing_grants():
+    session = {"tool_source": {"lark_whoami": "lark", "approval_list": "approval",
+                               "run_code": "code"},
+               "tool_idp": {"lark_whoami": "lark", "approval_list": "lark"},
+               "consent": {"google": ""}}
+    out = agent_core.tools_overview(session)
+    assert [t["name"] for t in out["tools"]] == ["lark_whoami", "approval_list", "run_code"]
+    assert out["tools"][1] == {"name": "approval_list", "source": "approval", "idp": "lark"}
+    assert out["ungranted"] == ["google"]
+    assert agent_core.tools_overview({"identity_error": "x"}) == {
+        "tools": [], "identityError": "x"}
 
 
 def test_transcript_rebuilds_what_a_reloaded_page_should_show():

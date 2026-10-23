@@ -355,6 +355,37 @@ def cache_ttl() -> str:
     return _CACHE_TTL
 
 
+def model_settings() -> dict:
+    """What shapes a turn in this container, as it is actually configured. The prompt
+    itself is not returned: it can be long, and its length says whether it was changed."""
+    return {"model": _MODEL_ID, "region": _REGION, "cacheTtl": _CACHE_TTL,
+            "summarizeAt": _SUMMARIZE_AT_TOKENS, "summarizeKeep": _SUMMARIZE_KEEP,
+            "systemPromptCustom": "AGENT_SYSTEM_PROMPT" in os.environ
+                                  and bool(os.environ["AGENT_SYSTEM_PROMPT"].strip()),
+            "systemPromptChars": len(_SYSTEM)}
+
+
+def tools_overview(session: dict) -> dict:
+    """The tools this session really has, in the order they were assembled, each with
+    where it came from and which system's grant it needs ("" for none)."""
+    if session.get("identity_error"):
+        return {"tools": [], "identityError": session["identity_error"]}
+    source, idp = session.get("tool_source") or {}, session.get("tool_idp") or {}
+    return {"tools": [{"name": n, "source": s, "idp": idp.get(n, "")}
+                      for n, s in source.items()],
+            # A system named here has no grant yet; its tools are listed regardless,
+            # because servers gate calls, not discovery.
+            "ungranted": sorted((session.get("consent") or {}).keys())}
+
+
+async def atools_overview(actor_id: str, mem_sid: str, workload_token: str = "") -> dict:
+    """tools_overview for the session chat would use — the same cache key, so asking does
+    not assemble a second session and handshake every server again."""
+    session = await arun_in_thread(_get_session, actor_id, "", mem_sid or thread_for(actor_id),
+                                   False, workload_token)
+    return tools_overview(session)
+
+
 def _track(delta: int, thread_id: str = "") -> None:
     global _in_flight
     with _in_flight_lock:
@@ -551,12 +582,20 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # a call is walled only when *that* system has no grant. Untagged tools never wall.
     tool_idp: dict[str, str] = {}
     consent: dict[str, str] = {}   # idp → consent link; "" until a tool of it is reached
+    # Where each tool came from, for /tools. Tagged where a group is added rather than per
+    # tool, so a server gaining or losing a tool needs no change here. Not the same as
+    # tool_idp: the approval tools are gated by the Lark grant but are their own group.
+    tool_source: dict[str, str] = {}
 
-    async def _open(connection: dict, idp: str = "") -> list:
+    def _tag(opened: list, source: str) -> list:
+        tool_source.update((t.name, source) for t in opened)
+        return opened
+
+    async def _open(connection: dict, idp: str = "", source: str = "") -> list:
         opened = await _aopen_tools(stack, connection)
         if idp:
             tool_idp.update((t.name, idp) for t in opened)
-        return opened
+        return _tag(opened, source or idp)
     try:
         kind, value = await asyncio.to_thread(
             lark_3lo.get_user_lark_token, actor_id, False, workload_token)
@@ -593,7 +632,8 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         if _APPROVAL_MCP_URL:
             try:
                 tools += await _open(
-                    lark_3lo.mcp_connection_for(token, url=_APPROVAL_MCP_URL), "lark")
+                    lark_3lo.mcp_connection_for(token, url=_APPROVAL_MCP_URL), "lark",
+                    source="approval")
             except Exception:  # noqa: BLE001 — optional, like search
                 log.exception("approval tools unavailable for %s", actor_id)
 
@@ -616,11 +656,11 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     if websearch.available():
         try:
             conn = await asyncio.to_thread(websearch.connection_for, actor_id)
-            tools += await _aopen_tools(stack, conn)
+            tools += _tag(await _aopen_tools(stack, conn), "web_search")
         except Exception:  # noqa: BLE001 — search is optional, Lark tools are not
             log.exception("web search unavailable for %s", actor_id)
 
-    tools += _long_term_tools(actor_id)
+    tools += _tag(_long_term_tools(actor_id), "memory")
 
     # Code execution, when an interpreter is deployed. The sandbox is created here rather
     # than per call so one conversation keeps one workspace session — and it is kept on the
@@ -628,7 +668,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # begins when the model first runs something.
     sandbox = code_tools._Sandbox(actor_id) if code_tools.available() else None
     if sandbox is not None:
-        tools += code_tools.tools_for(actor_id, sandbox)
+        tools += _tag(code_tools.tools_for(actor_id, sandbox), "code")
 
     saver = _checkpointer()
     # langchain.agents.create_agent, not langgraph.prebuilt.create_react_agent: the
@@ -660,7 +700,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         # auth_url is Lark's link and doubles as "identity unverified" for the web surfaces;
         # consent/tool_idp drive the per-system wall.
         "auth_url": auth_url, "identity_error": identity_error,
-        "consent": consent, "tool_idp": tool_idp,
+        "consent": consent, "tool_idp": tool_idp, "tool_source": tool_source,
         # Tool results seen during the current turn, for the auth-wall scan.
         "tool_texts": [],
     }
@@ -1168,11 +1208,18 @@ def history_stats(actor_id: str, mem_sid: str = "") -> dict:
     values = (tup.checkpoint.get("channel_values") if tup else None) or {}
     messages = values.get("messages") or []
     ai = [m for m in messages if isinstance(m, AIMessage)]
+    # The context size is what Bedrock billed for the latest model call, read from that
+    # call's own usage — not an estimate, which matters because the library's estimator
+    # charges a flat 85 tokens per image. input_tokens already includes the cached part.
+    usage = next((m.usage_metadata for m in reversed(ai)
+                  if getattr(m, "usage_metadata", None)), None) or {}
     return {
         "turns": sum(1 for m in ai if not (getattr(m, "tool_calls", None) or [])),
         "toolCalls": sum(len(getattr(m, "tool_calls", None) or []) for m in ai),
         "messages": sum(1 for m in messages
                         if isinstance(m, (HumanMessage, AIMessage))),
+        "contextTokens": usage.get("input_tokens", 0),
+        "cachedTokens": (usage.get("input_token_details") or {}).get("cache_read", 0),
     }
 
 

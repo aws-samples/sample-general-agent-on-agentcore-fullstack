@@ -154,6 +154,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             # config can disagree with what was baked into this Runtime.
             "model": agent_core.model_id(),
             "cacheTtl": agent_core.cache_ttl(),
+            "settings": agent_core.model_settings(),
         })
 
     if action == "warmup":
@@ -195,6 +196,17 @@ async def handle_invocations(request: web.Request) -> web.Response:
         except Exception as e:
             log.exception("transcript failed")
             return web.json_response({"messages": [], "error": str(e)})
+
+    # The tool list is per session — it depends on which servers answered and which systems
+    # the user has granted — so only the container serving this user can say what it is.
+    if action == "tools":
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        try:
+            return web.json_response(await agent_core.atools_overview(
+                actor_id, payload.get("memorySessionId", ""), workload_token))
+        except Exception as e:
+            log.exception("tools failed")
+            return web.json_response({"tools": [], "error": str(e)})
 
     if action == "auth_status":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"

@@ -162,6 +162,7 @@ def _app_identity() -> str:
 # id shown may have been created by the command itself. Budget is kept short so a
 # slow cold start degrades to "unknown" instead of stalling the command.
 _PROBE_SECONDS = int(os.environ.get("STATUS_PROBE_SECONDS", "8"))
+_TOOLS_SECONDS = int(os.environ.get("TOOLS_PROBE_SECONDS", "45"))
 
 
 def probe_agent(session_id: str, user_id: str, actor_id: str) -> dict | None:
@@ -189,14 +190,72 @@ def probe_agent(session_id: str, user_id: str, actor_id: str) -> dict | None:
     return None
 
 
-def _model_line(data: dict | None) -> str:
-    """The model the serving container reports, not what the router is configured with —
-    UpdateAgentRuntime replaces the environment, so the two can disagree."""
-    model = (data or {}).get("model")
-    if not model:
-        return "—（探测未返回）"
-    ttl = (data or {}).get("cacheTtl")
-    return f"{model}（prompt cache {ttl}）" if ttl else f"{model}（prompt cache 关闭）"
+def _k(tokens: int) -> str:
+    return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+
+
+def _context_line(stats: dict, probe: dict | None) -> str:
+    """The thread's real size, from the latest model call's billed input — the number the
+    summarisation threshold is about, so it is shown next to that threshold."""
+    tokens = (stats or {}).get("contextTokens") or 0
+    if not tokens:
+        return "—（发一条普通消息后可见）"
+    cached = (stats or {}).get("cachedTokens") or 0
+    at = (((probe or {}).get("settings") or {}).get("summarizeAt")) or 0
+    parts = [f"最近一次请求 {_k(tokens)} token"]
+    if cached:
+        parts.append(f"其中 {_k(cached)} 命中缓存")
+    if at:
+        parts.append(f"超过 {_k(at)} 时自动摘要")
+    return "，".join(parts)
+
+
+def _model_text(data: dict | None) -> str:
+    """The settings the serving container reports, not what the router is configured
+    with — UpdateAgentRuntime replaces the environment, so the two can disagree."""
+    s = (data or {}).get("settings") or {}
+    if not s:
+        return "模型设置：—（探测未返回；下条消息仍会正常处理）"
+    ttl = s.get("cacheTtl")
+    at, keep = s.get("summarizeAt") or 0, s.get("summarizeKeep") or 0
+    return "\n".join([
+        f"模型：{s.get('model', '—')}",
+        f"平台：Amazon Bedrock · {s.get('region', '—')}",
+        f"Prompt cache：{ttl if ttl else '关闭'}",
+        (f"上下文压缩：超过 {_k(at)} token 时摘要，保留最近 {keep} 条消息" if at
+         else "上下文压缩：关闭"),
+        ("系统提示词：自定义（" if s.get("systemPromptCustom") else "系统提示词：默认（")
+        + f"{s.get('systemPromptChars', 0)} 字符）",
+        "当前对话的上下文大小：发送 /status 查看",
+    ])
+
+
+# Where a tool group came from → how it is named in chat. Sources, not tools: a server
+# gaining or losing a tool needs no change here. A downstream system uses its IdP label.
+_TOOL_SOURCES = {"approval": "审批", "web_search": "网络搜索", "memory": "长期记忆",
+                 "code": "代码执行"}
+
+
+def _tools_text(data: dict | None) -> str:
+    if not data:
+        return "工具列表：—（探测未返回；下条消息仍会正常处理）"
+    if data.get("identityError"):
+        return f"工具列表：身份校验未通过，没有可用工具（{data['identityError']}）"
+    tools = data.get("tools") or []
+    if not tools:
+        return "工具列表：当前没有可用工具"
+    ungranted = set(data.get("ungranted") or [])
+    groups: dict[str, list[dict]] = {}
+    for t in tools:                      # in assembly order, which is the agent's own
+        groups.setdefault(t.get("source") or "other", []).append(t)
+    lines = [f"可用工具 · 共 {len(tools)} 个"]
+    for source, members in groups.items():
+        label = (_TOOL_SOURCES.get(source)
+                 or (IDPS.get(source) or {}).get("label") or source)
+        need = sorted({t["idp"] for t in members if t.get("idp") in ungranted})
+        note = ("（未授权，发送 " + "、".join(f"/auth {i}" for i in need) + "）") if need else ""
+        lines.append(f"{label}{note}：" + "、".join(t["name"] for t in members))
+    return "\n".join(lines)
 
 
 def _microvm_line(session_id: str, data: dict | None) -> str:
@@ -502,6 +561,8 @@ _HELP = "\n".join([
     "  /auth        查看各 IdP 的授权状态",
     "  /auth <idp>  对该 IdP 授权或重新授权",
     "  /status      当前身份、会话与对话记录",
+    "  /model       当前模型与上下文设置",
+    "  /tools       当前可用的工具，按来源分组",
     "  /new         开启新的对话（切换运行实例）",
     "  /reset       重置对话记录（运行实例不变）",
     "  /clear       清除对话记录（运行实例不变）",
@@ -598,14 +659,33 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
             f"用户身份：{actor_id}",
             f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
             f"当前 microVM：{_microvm_line(rt_sid, probe)}",
-            f"模型：{_model_line(probe)}",
             f"记忆线程：{mem_sid}",
             (f"该线程对话：{stats['turns']} 轮"
              f"（含 {stats['toolCalls']} 次工具调用）" if stats
              else "该线程对话：—（发一条普通消息后可见）"),
+            f"上下文：{_context_line(stats, probe)}",
             f"最近活跃：{last_str}",
             "授权状态：发送 /auth 查看",
+            "模型：发送 /model 查看",
         ])}
+
+    if cmd == "/model":
+        info = identity.session_info(user_id)
+        rt_sid = info.get("sessionId", "") or identity.get_or_create_session(user_id)
+        return {"text": _model_text(probe_agent(rt_sid, user_id, actor_id))}
+
+    if cmd == "/tools":
+        rt_sid = identity.get_or_create_session(user_id)
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        try:
+            # Assembling a session from cold handshakes every MCP server, so this gets
+            # more time than a status probe.
+            data = invoke_agent(rt_sid, user_id, actor_id, "", action="tools",
+                                mem_sid=mem_sid, budget=_TOOLS_SECONDS)
+        except Exception:  # noqa: BLE001 — a diagnostic must answer, not raise
+            logger.warning("tools listing failed for %s", actor_id, exc_info=True)
+            data = None
+        return {"text": _tools_text(data)}
 
     return None
 
