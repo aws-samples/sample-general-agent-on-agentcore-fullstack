@@ -97,7 +97,7 @@ _UNAUTH_TTL = int(os.environ.get("UNAUTH_SESSION_TTL_SECONDS", "60"))
 # Bedrock caches nothing without a cachePoint block, and `cache_control` is only read from
 # per-call kwargs — hence the subclass below rather than a constructor argument.
 # Placement, TTL choice and the measured break-even: docs/architecture.md.
-_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "1h")   # "5m" | "1h" | "" disables
+_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "5m")   # "5m" | "1h" | "" disables
 
 
 class _CachingChatBedrockConverse(ChatBedrockConverse):
@@ -114,7 +114,7 @@ class _CachingChatBedrockConverse(ChatBedrockConverse):
     nothing until the conversation itself grows past the minimum.
     """
 
-    cache_ttl: str = "1h"
+    cache_ttl: str
 
     def _with_cache(self, kwargs: dict) -> dict:
         # An explicit per-call value wins: a caller asking for something specific should
