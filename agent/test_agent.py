@@ -1212,6 +1212,42 @@ def test_empty_ttl_disables_caching_entirely():
     assert (got["system"], got["tools"], got["messages"]) == (0, 0, 0)
 
 
+@pytest.mark.parametrize("model,explicit", [
+    ("global.anthropic.claude-sonnet-5", True),
+    ("us.anthropic.claude-haiku-4-5-20251001-v1:0", True),
+    ("amazon.nova-pro-v1:0", True),
+    ("global.moonshotai.kimi-k3", False),
+    ("zai.glm-5", False),
+    ("deepseek.v3.2", False),
+])
+def test_only_claude_and_nova_get_a_cache_point(model, explicit):
+    """Bedrock's explicit-caching table for Converse lists only those two families; Kimi K3
+    rejects any request with a cachePoint (measured), and caches implicitly instead."""
+    assert agent_core._caches_explicitly(model) is explicit
+
+
+@pytest.mark.parametrize("model,setting,ttl,mode", [
+    ("global.anthropic.claude-sonnet-5", "1h", "1h", "explicit 1h"),
+    ("global.anthropic.claude-sonnet-5", "", "5m", "explicit 5m"),
+    ("global.anthropic.claude-sonnet-5", "off", "", "off"),
+    ("global.moonshotai.kimi-k3", "1h", "", "implicit"),
+    ("global.moonshotai.kimi-k3", "off", "", "implicit"),
+])
+def test_the_model_decides_whether_a_ttl_is_sent(model, setting, ttl, mode):
+    import importlib
+    with mock.patch.dict(os.environ, {"BEDROCK_MODEL_ID": model, "PROMPT_CACHE_TTL": setting}):
+        m = importlib.reload(agent_core)
+        assert (m._CACHE_TTL, m.cache_mode(), m._model.cache_ttl) == (ttl, mode, ttl)
+    importlib.reload(agent_core)
+
+
+def test_a_mistyped_cache_setting_stops_the_container():
+    import importlib
+    with mock.patch.dict(os.environ, {"PROMPT_CACHE_TTL": "1hr"}), pytest.raises(SystemExit):
+        importlib.reload(agent_core)
+    importlib.reload(agent_core)
+
+
 def test_an_explicit_per_call_cache_control_is_not_overridden():
     from langchain_core.messages import SystemMessage
     client = _CaptureClient()

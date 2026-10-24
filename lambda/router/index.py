@@ -211,7 +211,7 @@ def _cache_line(stats: dict, probe: dict | None) -> str:
     """How much of the input came from the cache: for the latest call, and summed over the
     thread's calls, which says whether caching is paying off across the conversation."""
     settings = (probe or {}).get("settings") or {}
-    if settings and not settings.get("cacheTtl"):
+    if settings and settings.get("cache") == "off":
         return "关闭"
     stats = stats or {}
     if not stats.get("contextTokens"):
@@ -228,12 +228,15 @@ def _model_text(data: dict | None) -> str:
     s = (data or {}).get("settings") or {}
     if not s:
         return "模型设置：—（探测未返回；下条消息仍会正常处理）"
-    ttl = s.get("cacheTtl")
+    cache = s.get("cache") or ""
+    cache_text = ("隐式（模型自动缓存相同前缀）" if cache == "implicit"
+                  else f"显式（cachePoint，TTL {cache.split()[-1]}）" if cache.startswith("explicit")
+                  else "关闭" if cache == "off" else "—")
     at, keep = s.get("summarizeAt") or 0, s.get("summarizeKeep") or 0
     return "\n".join([
         f"模型：{s.get('model', '—')}",
         f"平台：Amazon Bedrock · {s.get('region', '—')}",
-        f"Prompt cache：{ttl if ttl else '关闭'}",
+        f"Prompt cache：{cache_text}",
         (f"上下文压缩：超过 {_k(at)} token 时摘要，保留最近 {keep} 条消息" if at
          else "上下文压缩：关闭"),
         ("系统提示词：自定义（" if s.get("systemPromptCustom") else "系统提示词：默认（")

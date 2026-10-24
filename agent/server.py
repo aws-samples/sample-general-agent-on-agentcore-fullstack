@@ -153,7 +153,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             # Reported by the container that actually calls Bedrock: the router's own
             # config can disagree with what was baked into this Runtime.
             "model": agent_core.model_id(),
-            "cacheTtl": agent_core.cache_ttl(),
+            "cache": agent_core.cache_mode(),
             "settings": agent_core.model_settings(),
         })
 

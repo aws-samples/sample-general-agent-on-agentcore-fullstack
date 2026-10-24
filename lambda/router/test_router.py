@@ -342,13 +342,15 @@ def test_model_reports_what_the_container_says_not_the_routers_config():
     import index
     text = index._model_text({"settings": {
         "model": "global.anthropic.claude-sonnet-5", "region": "ap-northeast-1",
-        "cacheTtl": "1h", "summarizeAt": 120000, "summarizeKeep": 20,
+        "cache": "explicit 1h", "summarizeAt": 120000, "summarizeKeep": 20,
         "systemPromptCustom": False, "systemPromptChars": 180}})
     assert "global.anthropic.claude-sonnet-5" in text
     assert "Amazon Bedrock · ap-northeast-1" in text
-    assert "1h" in text and "120.0k" in text and "保留最近 20 条" in text
+    assert "显式（cachePoint，TTL 1h）" in text and "120.0k" in text and "保留最近 20 条" in text
     assert "默认（180 字符）" in text
-    assert "关闭" in index._model_text({"settings": {"model": "m", "cacheTtl": "",
+    assert "关闭" in index._model_text({"settings": {"model": "m", "cache": "off",
+                                                    "summarizeAt": 0}})
+    assert "隐式" in index._model_text({"settings": {"model": "m", "cache": "implicit",
                                                     "summarizeAt": 0}})
     # An older image reports no settings, and a failed probe reports nothing at all.
     assert "探测未返回" in index._model_text({"model": "m"})
@@ -369,9 +371,11 @@ def test_the_cache_line_gives_the_latest_and_the_whole_threads_hit_rate():
     import index
     stats = {"contextTokens": 9147, "cachedTokens": 5049,
              "inputTotal": 19166, "cachedTotal": 14845, "modelCalls": 3}
-    line = index._cache_line(stats, {"settings": {"cacheTtl": "1h"}})
+    line = index._cache_line(stats, {"settings": {"cache": "explicit 1h"}})
     assert line == "最近一次命中 55%，本线程累计 77%（3 次模型调用）"
-    assert index._cache_line(stats, {"settings": {"cacheTtl": ""}}) == "关闭"
+    assert index._cache_line(stats, {"settings": {"cache": "off"}}) == "关闭"
+    # An implicit-caching model still reports hits, so the rate is shown, not "off".
+    assert "最近一次命中" in index._cache_line(stats, {"settings": {"cache": "implicit"}})
     assert "发一条普通消息" in index._cache_line({}, None)
 
 

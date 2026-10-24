@@ -97,10 +97,27 @@ _SESSION_TTL = int(os.environ.get("SESSION_TTL_SECONDS", "3000"))  # 50 min
 # consents we want the next turn to pick up the token.
 _UNAUTH_TTL = int(os.environ.get("UNAUTH_SESSION_TTL_SECONDS", "60"))
 
-# Bedrock caches nothing without a cachePoint block, and `cache_control` is only read from
-# per-call kwargs — hence the subclass below rather than a constructor argument.
+# Prompt caching on Bedrock is explicit or implicit by model, not by choice. On Converse only
+# Claude and Nova take a cachePoint, and they cache nothing without one; every other model
+# caches matching prefixes on its own or not at all, and may reject a request that carries a
+# cachePoint (Kimi K3 does, measured). So the model decides whether to send one, and
+# PROMPT_CACHE_TTL only sets how long: "5m" (Bedrock's default) | "1h" | "off".
+# Source: https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
 # Placement, TTL choice and the measured break-even: docs/architecture.md.
-_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "5m")   # "5m" | "1h" | "" disables
+_EXPLICIT_CACHE_FAMILIES = ("anthropic.claude", "amazon.nova")
+
+
+def _caches_explicitly(model_id: str) -> bool:
+    """Whether this model caches only behind a cachePoint (and accepts one)."""
+    return any(f in model_id.lower() for f in _EXPLICIT_CACHE_FAMILIES)
+
+
+_CACHE_SETTING = os.environ.get("PROMPT_CACHE_TTL", "").strip() or "5m"
+if _CACHE_SETTING not in ("5m", "1h", "off"):
+    raise SystemExit(f"PROMPT_CACHE_TTL must be 5m, 1h or off, not {_CACHE_SETTING!r}")
+# The TTL actually put on requests: empty sends no cachePoint at all.
+_CACHE_TTL = (_CACHE_SETTING if _caches_explicitly(_MODEL_ID) and _CACHE_SETTING != "off"
+              else "")
 
 
 class _CachingChatBedrockConverse(ChatBedrockConverse):
@@ -423,15 +440,18 @@ def model_id() -> str:
     return _MODEL_ID
 
 
-def cache_ttl() -> str:
-    """The prompt-cache TTL in force, "" when caching is off."""
-    return _CACHE_TTL
+def cache_mode() -> str:
+    """How this model's prompt cache works here: "explicit 5m" / "explicit 1h" (a cachePoint
+    on every request), "implicit" (the model caches by itself) or "off"."""
+    if _CACHE_TTL:
+        return f"explicit {_CACHE_TTL}"
+    return "off" if _caches_explicitly(_MODEL_ID) else "implicit"
 
 
 def model_settings() -> dict:
     """What shapes a turn in this container, as it is actually configured. The prompt
     itself is not returned: it can be long, and its length says whether it was changed."""
-    return {"model": _MODEL_ID, "region": _REGION, "cacheTtl": _CACHE_TTL,
+    return {"model": _MODEL_ID, "region": _REGION, "cache": cache_mode(),
             "summarizeAt": _SUMMARIZE_AT_TOKENS, "summarizeKeep": _SUMMARIZE_KEEP,
             "systemPromptCustom": "AGENT_SYSTEM_PROMPT" in os.environ
                                   and bool(os.environ["AGENT_SYSTEM_PROMPT"].strip()),

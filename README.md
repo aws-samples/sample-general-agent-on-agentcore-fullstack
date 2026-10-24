@@ -54,7 +54,7 @@ Ten layers, each with a real implementation rather than a stub — that is the "
 | Layer | What it decides | How it's built |
 |---|---|---|
 | **Channel** | how a turn starts, how the answer returns | Lark webhook → router Lambda → answer typed into a streaming CardKit card. Two more surfaces reach the same agent: a page inside Lark (AG-UI over SSE) and A2A for peers |
-| **Model** | which model answers | **Bedrock** — Claude Sonnet over Converse, with an explicit `cachePoint` on every request |
+| **Model** | which model answers | **Bedrock** over Converse — an open-weight model by default (Kimi K3), any streaming tool-use model via `MODEL_ID`; prompt caching (`cachePoint`) where the model supports it |
 | **Agent loop** | the prompt, and how tool calls iterate | LangGraph `create_agent`, plus threshold-triggered summarisation to bound a permanent thread |
 | **Identity** | who this turn is, and whose credentials its tools may use | Cognito mints the signed identity; **AgentCore Identity** vaults each person's grant per downstream system; tools act as them |
 | **Session state** | what it remembers *within* a conversation | DynamoDB checkpoints, written per superstep, so a turn cut off at the 15-minute cap resumes |

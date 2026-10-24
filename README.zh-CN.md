@@ -54,7 +54,7 @@
 | 层次 | 它决定什么 | 如何实现 |
 |---|---|---|
 | **渠道(Channel)** | 一轮对话如何开始、答案如何返回 | Lark webhook → router Lambda → 答案以流式方式写入 CardKit 卡片。另外两个渠道接到同一个 Agent:Lark 内嵌页面(AG-UI over SSE)、面向对等 Agent 的 A2A |
-| **模型(Model)** | 由哪个模型回答 | **Bedrock** —— Claude Sonnet,走 Converse API,每次请求都显式带 `cachePoint` |
+| **模型(Model)** | 由哪个模型回答 | **Bedrock** —— 走 Converse API;默认是开放权重模型 Kimi K3,`MODEL_ID` 可换成任意支持流式工具调用的模型;模型支持时启用提示缓存(`cachePoint`) |
 | **Agent 循环** | 提示词,以及工具调用如何迭代 | LangGraph `create_agent`,配合按阈值触发的摘要压缩,为长期对话线程设置上限 |
 | **身份(Identity)** | 这一轮是谁、它的工具可以用谁的凭证 | Cognito 签发身份;**AgentCore Identity** 按下游系统分别托管每个人的授权;工具以用户本人身份行事 |
 | **会话状态** | 一次对话*内部*记住什么 | DynamoDB checkpoint,每个 superstep 都写入,因此在 15 分钟上限处被截断的一轮对话可以续接 |
