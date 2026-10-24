@@ -524,7 +524,7 @@ def _session_for(deltas, tool_calls=None, follow_up="", **extra):
 def _patch_notify(card, notify_sent):
     return mock.patch.object(
         agent_core, "lark_notify",
-        mock.Mock(StreamingCard=lambda chat_id: card,
+        mock.Mock(StreamingCard=lambda chat_id, **kw: card,
                   send_text=lambda cid, t: notify_sent.append(t) or True))
 
 
@@ -547,8 +547,9 @@ class FakeCard:
         self.ok = self._update_ok
         return self._update_ok
 
-    def close(self, final_text):
+    def close(self, final_text, handed_over=False):
         self.closed_with = final_text
+        self.handed_over = handed_over
         return self._close_ok
 
     def tool_started(self):
@@ -822,6 +823,25 @@ def test_the_summary_is_a_full_width_band_at_the_end():
     assert "⏱️ 耗时" in tail[0]["columns"][0]["elements"][0]["content"]
 
 
+def test_a_handed_over_card_says_so_and_the_next_one_replies_and_keeps_the_clock():
+    ln, card, writes = _recording_card()
+    card.tool_started(); card.tool_finished()
+    card.update("先看一下。")
+    assert card.close("先看一下。", handed_over=True) is True
+    tail = [json.loads(b["elements"])[0] for m, p, b in writes
+            if m == "POST" and '"tail"' in b["elements"]][0]
+    assert "被用户新消息打断" in tail["columns"][0]["elements"][0]["content"]
+    nxt = ln.StreamingCard("oc_1", reply_to="om_steered", carry=card)
+    assert nxt._t0 == card._t0 and nxt._tools_done == 1 and nxt._steps == card._steps
+    posted = []
+    ln._post = lambda url, body, bearer="": posted.append(url) or {
+        "code": 0, "data": {"card_id": "c2"}}
+    ln._animation_keys = lambda: {}
+    assert nxt.open() is True
+    nxt._stop.set(); nxt._wake.set()
+    assert posted[-1].endswith("/open-apis/im/v1/messages/om_steered/reply")
+
+
 def test_a_failed_status_line_does_not_cost_the_answer():
     """A status line is decoration. If CardKit refuses one the answer is still delivered
     and the card closed, so the caller must not fall back to posting text again."""
@@ -1045,6 +1065,108 @@ def test_the_card_hears_of_a_tool_only_after_the_words_before_it():
     assert card.seen[0] == ("start", "我先看一下。")
     assert ("finish", "我先看一下。") in card.seen
     assert card.updates[-1] == "我先看一下。查到了。"
+
+
+def test_a_message_steered_in_mid_turn_is_answered_on_a_new_card_below_it():
+    """Answering it on the card above the message read as the agent ignoring it. The card
+    in progress is closed where the message joined, and the rest goes on a new card —
+    quoting the message in a group, and carrying the turn's clock so the last card sums
+    up the whole turn."""
+    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.tools import StructuredTool
+    thread = f"t{next(_thread_seq)}"
+
+    def lookup() -> str:
+        """Steers a message in while the turn is between model calls, as a user would."""
+        agent_core.steer(thread, "不用看代码了")
+        agent_core._steer_reply_to[thread] = "om_steered"
+        return "found"
+    steering = type("SteeringMiddleware", (AgentMiddleware,),
+                    dict(agent_core._SteeringMiddleware.__dict__))()
+    graph = agent_core.create_agent(
+        model=_ScriptedModel(turns=[{"text": ["我先查一下。"], "tool_calls": ["lookup"]},
+                                    {"text": ["好的，不看了。"]}]),
+        tools=[_dummy_tool, StructuredTool.from_function(func=lookup, name="lookup")],
+        middleware=[steering])
+    session = {"graph": graph, "tool_texts": [],
+               "config": {"configurable": {"thread_id": thread}}}
+    made = []
+
+    def factory(chat_id, reply_to="", carry=None):
+        card = FakeCard()
+        card.reply_to, card.carry = reply_to, carry
+        made.append(card)
+        return card
+    notify = mock.Mock(StreamingCard=factory, send_text=lambda cid, t: True,
+                       is_group=lambda cid: True)
+    try:
+        with mock.patch.object(agent_core, "lark_notify", notify):
+            text = agent_core._stream_to_chat(session, "看一下仓库", "oc_group")
+    finally:
+        agent_core._pending_steer.pop(thread, None)
+    first, second = made
+    assert (first.closed_with, first.handed_over) == ("我先查一下。", True)
+    assert second.reply_to == "om_steered" and second.carry is first
+    assert (second.closed_with, second.handed_over) == ("好的，不看了。", False)
+    assert second.updates == ["好的，不看了。"], "the new card holds only what came after"
+    assert text == "我先查一下。好的，不看了。"
+
+
+def test_a_card_that_showed_nothing_yet_is_not_handed_over():
+    """Steered in before any text — B sent while A's session was still being built — the
+    card already sits where the answer belongs, and closing it would leave it empty."""
+    from langchain.agents.middleware import AgentMiddleware
+    thread = f"t{next(_thread_seq)}"
+    agent_core.steer(thread, "B")
+    agent_core._steer_reply_to[thread] = "om_b"
+    steering = type("SteeringMiddleware", (AgentMiddleware,),
+                    dict(agent_core._SteeringMiddleware.__dict__))()
+    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["A 和 B 的答案"]}]),
+                                    tools=[_dummy_tool], middleware=[steering])
+    session = {"graph": graph, "tool_texts": [],
+               "config": {"configurable": {"thread_id": thread}}}
+    made = []
+    notify = mock.Mock(StreamingCard=lambda chat_id, **kw: made.append(FakeCard()) or made[-1],
+                       send_text=lambda cid, t: True)
+    with mock.patch.object(agent_core, "lark_notify", notify):
+        agent_core._stream_to_chat(session, "A", "oc_1")
+    assert len(made) == 1 and made[0].closed_with == "A 和 B 的答案"
+
+
+def test_a_failed_hand_over_still_delivers_the_rest():
+    """The hand-over runs inside the stream: if it raises, the turn must go on as text
+    rather than end in an apology with the graph still running."""
+    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.tools import StructuredTool
+    thread = f"t{next(_thread_seq)}"
+
+    def lookup() -> str:
+        """Steers a message in mid-turn."""
+        agent_core.steer(thread, "还有这个")
+        return "found"
+    steering = type("SteeringMiddleware", (AgentMiddleware,),
+                    dict(agent_core._SteeringMiddleware.__dict__))()
+    graph = agent_core.create_agent(
+        model=_ScriptedModel(turns=[{"text": ["先查。"], "tool_calls": ["lookup"]},
+                                    {"text": ["好了。"]}]),
+        tools=[_dummy_tool, StructuredTool.from_function(func=lookup, name="lookup")],
+        middleware=[steering])
+    session = {"graph": graph, "tool_texts": [],
+               "config": {"configurable": {"thread_id": thread}}}
+    first, sent = FakeCard(), []
+
+    def factory(chat_id, **kw):
+        if kw.get("carry") is not None:
+            raise RuntimeError("tenant token refresh failed")
+        return first
+    notify = mock.Mock(StreamingCard=factory, send_text=lambda cid, t: sent.append(t) or True,
+                       is_group=lambda cid: False)
+    try:
+        with mock.patch.object(agent_core, "lark_notify", notify):
+            agent_core._stream_to_chat(session, "看一下", "oc_1")
+    finally:
+        agent_core._pending_steer.pop(thread, None)
+    assert first.closed_with == "先查。" and sent == ["好了。"]
 
 
 def test_stream_does_not_abort_when_authorized():

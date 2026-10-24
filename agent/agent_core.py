@@ -198,6 +198,8 @@ def _summary_is_usable(update) -> bool:
 # this fixes. `before_model` is the one safe boundary: any tool results from the previous
 # step are written, and the next model call has not happened yet.
 _pending_steer: dict[str, list[tuple[str, str, bool]]] = {}
+# The Lark message last steered into each thread, for the card that answers it to reply to.
+_steer_reply_to: dict[str, str] = {}
 
 
 def steer(thread_id: str, message: str, message_id: str = "", fresh: bool = False) -> None:
@@ -213,6 +215,7 @@ def steer(thread_id: str, message: str, message_id: str = "", fresh: bool = Fals
 
 def _take_steer(thread_id: str) -> list[tuple[str, str, bool]]:
     with _in_flight_lock:
+        _steer_reply_to.pop(thread_id, None)    # answered as a continuation, on its own card
         return _pending_steer.pop(thread_id, [])
 
 
@@ -286,8 +289,16 @@ class _SteeringMiddleware:
                 _pending_steer[thread_id] = later
             else:
                 _pending_steer.pop(thread_id, None)
+            reply_to = _steer_reply_to.pop(thread_id, "")
         log.info("steering %d message(s) into the running turn on %s", len(now), thread_id)
         telemetry.count("steer_injected")
+        # What follows answers the new message, so it goes below it, on a card of its own.
+        try:
+            card = _turn_cards.get(thread_id)
+            if card is not None:
+                card.steered(reply_to)
+        except Exception:  # noqa: BLE001 — the card is decoration, the message is not
+            log.warning("could not hand the card over", exc_info=True)
         return {"messages": [HumanMessage(text, id=mid or None) for text, mid, _ in now]}
 
 
@@ -564,6 +575,7 @@ def release(thread_id: str) -> list[tuple[str, str, bool]]:
         if thread_id not in _in_flight_threads:
             return []
         leftover = _pending_steer.pop(thread_id, [])
+        _steer_reply_to.pop(thread_id, None)
         images.end_turn(thread_id)
         _track(-1, thread_id)
         return leftover
@@ -1129,6 +1141,8 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
                 message = "\n".join([message, marks]).strip() if message else marks
             if owner == "lark":
                 steer(thread_id, message, turn_message_id, fresh=fresh_session)
+                if message_id and not fresh_session:
+                    _steer_reply_to[thread_id] = message_id
     if owner == "lark":
         telemetry.count("steered", surface="lark")
         _quietly(lark_notify.remove_reaction, message_id, reaction_id)
@@ -1278,13 +1292,17 @@ def _turn_input(message, message_id: str | None = None) -> list:
 class _InStreamOrder:
     """A card's status calls, queued behind the text the stream produced before them. The
     graph runs on the agent loop and the card is fed from the consumer thread, so a call
-    made straight from the loop could reach the card ahead of the last words before it."""
+    made straight from the loop could reach the card ahead of the last words before it.
+    `current` is called when the event is handled: the card may have been replaced by then."""
 
-    def __init__(self, events: queue.Queue, card):
-        self._events, self._card = events, card
+    def __init__(self, events: queue.Queue, current, on_steered):
+        self._events, self._current, self._on_steered = events, current, on_steered
 
     def compacting(self, started: bool) -> None:
-        self._events.put((_EVENT, self._card.compacting, started))
+        self._events.put((_EVENT, lambda: self._current().compacting(started)))
+
+    def steered(self, reply_to: str) -> None:
+        self._events.put((_EVENT, self._on_steered, reply_to))
 
 
 def _iter_deltas(graph, message, config: dict, on_tool_use=None,
@@ -1418,12 +1436,53 @@ def _stream_to_chat(session: dict, message, chat_id: str,
     cardkit:card:write scope isn't granted), fall back to posting the final text — the
     answer must survive regardless. Consent replies are handled by the caller."""
     session["tool_texts"] = []
-    card = lark_notify.StreamingCard(chat_id)
-    streaming = card.open()
+    # One card per stretch of the turn: a message steered in mid-turn closes the current
+    # card and the rest is answered on a new one, below that message.
+    cards = [lark_notify.StreamingCard(chat_id)]
+    streaming = cards[0].open()
+    acc: list[str] = []         # the current card's text
+    earlier: list[str] = []     # what the closed cards said, for the return value
+    group = None                # asked once, and only if a message is steered in
+
+    def _deliver(text: str, last: bool) -> None:
+        """Finish the current card with `text`, or post it as text if the card failed."""
+        nonlocal streaming
+        card = cards[-1]
+        if streaming:
+            if not card.close(text, handed_over=not last):
+                streaming = False
+        elif getattr(card, "sent", False):
+            card.close(text)    # failed mid-stream: stops its worker, clears its live line
+        if not streaming and text:
+            # Either CardKit was never available or it failed mid-stream. Post the text so
+            # the user still gets it.
+            if not lark_notify.send_text(chat_id, text):
+                log.error("could not deliver reply to %s: %s", chat_id, text[:200])
+
+    def _on_steered(reply_to: str) -> None:
+        nonlocal streaming, acc, group
+        # A card that has shown nothing yet is not handed over: it already sits where the
+        # answer belongs, and closing it would leave an empty card behind.
+        if not "".join(acc).strip() and not getattr(cards[-1], "_tools_done", 0):
+            return
+        try:
+            _deliver("".join(acc), last=False)
+            earlier.append("".join(acc))
+            acc = []
+            if group is None:
+                group = lark_notify.is_group(chat_id)
+            # Quoted in a group, so others can see which message is being answered.
+            cards.append(lark_notify.StreamingCard(
+                chat_id, reply_to=reply_to if group else "", carry=cards[-1]))
+            streaming = cards[-1].open()
+        except Exception:  # noqa: BLE001 — the rest of the answer must still arrive
+            log.warning("could not hand the turn over to a new card", exc_info=True)
+            streaming = False
+
     thread_id = (session.get("config") or {}).get("configurable", {}).get("thread_id", "")
     events: queue.Queue = queue.Queue()
-    in_order = _InStreamOrder(events, card)
-    if streaming and thread_id:
+    in_order = _InStreamOrder(events, lambda: cards[-1], _on_steered)
+    if thread_id:
         _turn_cards[thread_id] = in_order
     try:
 
@@ -1441,15 +1500,15 @@ def _stream_to_chat(session: dict, message, chat_id: str,
         def _on_tool_result(name: str, text: str) -> None:
             session["tool_texts"].append((name, text))
 
-        acc = []
         for delta in _iter_deltas(session["graph"], message,
                                   _run_config(session, delivery.LarkDelivery(chat_id)),
                                   on_tool_use=_abort_on_ungranted_tool,
                                   on_tool_result=_on_tool_result, message_id=message_id,
-                                  on_tool_started=card.tool_started,
-                                  on_tool_finished=card.tool_finished, events=events):
+                                  on_tool_started=lambda: cards[-1].tool_started(),
+                                  on_tool_finished=lambda: cards[-1].tool_finished(),
+                                  events=events):
             acc.append(delta)
-            if streaming and not card.update("".join(acc)):
+            if streaming and not cards[-1].update("".join(acc)):
                 streaming = False  # a failed write drops us to the fallback below
         text = "".join(acc)
 
@@ -1460,17 +1519,13 @@ def _stream_to_chat(session: dict, message, chat_id: str,
             idp = _walled_idp(session, session["walled_tool"]) or "lark"
             text = f"🔐 这一步需要访问你的 {idp.capitalize()} 账号"
 
+        _deliver(text, last=True)
+        return "".join(earlier) + text
+    except BaseException:
+        # The stream failed: stop the card claiming it is still working.
         if streaming:
-            if not card.close(text):
-                streaming = False
-        elif getattr(card, "sent", False):
-            card.close(text)    # failed mid-stream: stops its worker, clears its live line
-        if not streaming:
-            # Either CardKit was never available or it failed mid-stream. Post the whole
-            # answer as plain text so the user still gets it.
-            if not lark_notify.send_text(chat_id, text):
-                log.error("could not deliver reply to %s: %s", chat_id, text[:200])
-        return text
+            _quietly(cards[-1].close, "".join(acc))
+        raise
     finally:
         # Only this turn's card: a later turn may already have registered its own.
         if _turn_cards.get(thread_id) is in_order:

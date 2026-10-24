@@ -256,6 +256,25 @@ def chat_of(message_id: str) -> str:
     return (items[0].get("chat_id") or "") if items else ""
 
 
+_chat_modes: dict[str, str] = {}
+
+
+def is_group(chat_id: str) -> bool:
+    """Whether a chat is a group rather than a one-to-one chat. An `ou_` id is a person."""
+    if not chat_id or chat_id.startswith("ou_"):
+        return False
+    if chat_id not in _chat_modes:
+        try:
+            mode = ((_get(f"/open-apis/im/v1/chats/{_seg(chat_id)}").get("data") or {})
+                    .get("chat_mode") or "")
+        except ValueError:
+            mode = ""
+        if not mode:
+            return False                    # unknown is not cached: ask again next time
+        _chat_modes[chat_id] = mode
+    return _chat_modes[chat_id] in ("group", "topic")
+
+
 def fetch_message_resource(message_id: str, key: str, kind: str = "image") -> bytes:
     """The bytes of something somebody sent, read back from the message that carried it.
 
@@ -490,8 +509,13 @@ class StreamingCard:
     must fall back to send_text rather than lose the answer. `ok` tracks whether the card
     is usable."""
 
-    def __init__(self, chat_id: str):
+    def __init__(self, chat_id: str, reply_to: str = "",
+                 carry: "StreamingCard | None" = None):
+        """`reply_to` posts the card as a reply to that message. `carry` is the card this
+        one takes over from mid-turn: its clock and its steps go on, so the last card's
+        summary covers the whole turn."""
         self.chat_id = chat_id
+        self.reply_to = reply_to
         self.card_id = ""
         self._seq = 0
         self.ok = False
@@ -505,11 +529,11 @@ class StreamingCard:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
-        self._t0 = time.monotonic()
+        self._t0 = carry._t0 if carry is not None else time.monotonic()
         self._phase = "think"
-        self._phase_since = self._t0
-        self._tools_done = 0
-        self._steps: list[tuple[str, float]] = []
+        self._phase_since = time.monotonic()
+        self._tools_done = carry._tools_done if carry is not None else 0
+        self._steps: list[tuple[str, float]] = list(carry._steps) if carry is not None else []
         self._full = ""            # the whole answer so far, as the caller hands it over
         self._text_from = 0        # where in it the open (or next) text block starts
         self._gaps = 0
@@ -769,11 +793,23 @@ class StreamingCard:
         self.card_id = created.get("data", {}).get("card_id", "")
         if not self.card_id:
             return False
-        sent = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={_rid_type(self.chat_id)}",
-                     {"receive_id": self.chat_id, "msg_type": "interactive",
-                      "content": json.dumps({"type": "card",
-                                             "data": {"card_id": self.card_id}})},
-                     bearer=tok)
+        content = json.dumps({"type": "card", "data": {"card_id": self.card_id}})
+        try:
+            reply_path = f"/open-apis/im/v1/messages/{_seg(self.reply_to)}/reply" \
+                if self.reply_to else ""
+        except ValueError:
+            reply_path = ""
+        sent = {}
+        if reply_path:
+            sent = _post(f"{_API_DOMAIN}{reply_path}",
+                         {"msg_type": "interactive", "content": content}, bearer=tok)
+            if sent.get("code") not in (0, "0"):
+                # The quoted message may be gone (recalled): the card still goes out.
+                log.warning("card reply failed, sending instead: %s", sent.get("msg", sent))
+        if sent.get("code") not in (0, "0"):
+            sent = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={_rid_type(self.chat_id)}",
+                         {"receive_id": self.chat_id, "msg_type": "interactive",
+                          "content": content}, bearer=tok)
         if sent.get("code") not in (0, "0"):
             log.warning("card send failed (falling back to text): %s",
                         sent.get("msg", sent))
@@ -804,9 +840,12 @@ class StreamingCard:
         self._wake.set()
         return True
 
-    def close(self, final_text: str) -> bool:
+    def close(self, final_text: str, handed_over: bool = False) -> bool:
         """Write the final text, freeze the last status line, add the summary, and turn
-        streaming off so the card stops showing the typewriter indicator."""
+        streaming off so the card stops showing the typewriter indicator.
+
+        `handed_over` closes a card whose turn goes on in a new one, below a message the
+        user sent meanwhile: its footer says so instead of summing up."""
         # Stop the worker first, then write the final state synchronously: the worker
         # drops superseded states, and the last one must not be dropped. Stopped on the
         # failure path too, or it would retry a dead card for the life of the process.
@@ -825,15 +864,17 @@ class StreamingCard:
             self._set_text(final_text[len(head):] if final_text.startswith(head)
                            else final_text)
             self._end_wait()
-        tail = _Item("tail", "band", self.summary())
+        tail = _Item("tail", "band", (f"⏱️ 已用 {self._elapsed()} 秒 · 被用户新消息打断"
+                                      if handed_over else self.summary()))
         with self._lock:
             self._items.append(tail)
         self._flush()
         if not self.ok:
             self._abandon()
             return False
-        if not self._put("/settings",
-                         {"settings": json.dumps({"config": {"streaming_mode": False}})},
-                         method="PATCH"):
-            return False
+        # The answer is on the card by now, so a failure here costs the typewriter
+        # indicator, not the answer — and must not have the caller post it again.
+        self._put("/settings",
+                  {"settings": json.dumps({"config": {"streaming_mode": False}})},
+                  method="PATCH")
         return True

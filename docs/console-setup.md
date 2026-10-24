@@ -19,6 +19,7 @@ What to configure in the vendors' consoles; the deploy itself is in the [README]
    | `im:resource` | download images the user sends |
    | `contact:user.base:readonly` | resolve the sender's basic profile |
    | `cardkit:card:write` | create and update the streaming reply card ("Create and update cards") |
+   | `im:chat:readonly` | check that a turn is answered only into a chat its sender is in, and tell a group from a one-to-one chat |
 
    **User token scopes** (the *user's* identity, via 3LO — this is what the Lark MCP server uses, so tools reach only what that user can). Needs admin approval:
 
