@@ -1,3 +1,6 @@
+# shellcheck shell=bash
+# Sets variables for the scripts that source it, which shellcheck cannot see from here.
+# shellcheck disable=SC2034
 # The deployment target, set up the same way for every script. Source it first; it cds to
 # the repo root.
 #
@@ -11,7 +14,7 @@
 #     state file and CDK output dir, so two deployments never read each other's ids.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 [ -f .env ] || { echo "missing .env — copy .env.example to .env and fill it in" >&2; exit 1; }
 

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Build a container image natively on ARM64 in CodeBuild and push it to ECR.
 # Sourced by build-mcp.sh and provision.sh, which set ACCOUNT, REGION and PREFIX first.
 #
@@ -103,5 +104,6 @@ print("\n".join([
     echo "  build $status — logs: https://$REGION.console.aws.amazon.com/codesuite/codebuild/projects/$CB_PROJECT/build/${bid//:/%3A}/log"
     return 1
   fi
+  # shellcheck disable=SC2034  # read by the caller
   CB_IMAGE_URI="$ecr:$tag"
 }

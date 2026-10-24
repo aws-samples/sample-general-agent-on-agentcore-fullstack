@@ -58,6 +58,7 @@ RUNTIME_SUFFIX=""; DEPLOY_IF=""; REQUIRE_VARS=""; RUNTIME_ENV_MAP=""; IMAGE_TAG=
 # that doesn't wrap lark-cli isn't labelled with a CLI version it never installs.
 # SRC_SHA lets such a server tag by content, which also makes "did this deploy
 # actually change anything?" visible at a glance in ECR.
+# shellcheck disable=SC2034  # read by the eval of IMAGE_TAG below
 SRC_SHA="$(find "$DIR" -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-12)"
 TAG="$(eval echo "${IMAGE_TAG:-cli-\$LARK_CLI_VERSION}")"
 
