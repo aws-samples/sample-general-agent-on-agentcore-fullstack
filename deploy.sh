@@ -19,6 +19,10 @@
 # are collected and printed at the end. Implementations live in scripts/ — this
 # file owns the order, and every step is idempotent, so re-running is safe.
 set -euo pipefail
+# Parsed whole before any of it runs: bash otherwise reads a script as it goes, so an edit
+# made while this runs (an editor, another session) shifts what it reads next — measured as
+# a syntax error halfway through a deploy.
+{
 cd "$(cd "$(dirname "$0")" && pwd)"
 
 PREFIX="agentcore-fullstack"
@@ -100,3 +104,5 @@ case "${1:-all}" in
   -h|--help) usage ;;
   *) echo "unknown step: $1"; echo; usage; exit 1 ;;
 esac
+exit
+}

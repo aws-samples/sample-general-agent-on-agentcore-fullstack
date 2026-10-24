@@ -14,6 +14,10 @@
 # which owns the ordering. Callable directly when iterating on one phase:
 # Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--code|--runtime|--gateway|--a2a|--webui]
 set -euo pipefail
+# Parsed whole before any of it runs: bash otherwise reads a script as it goes, so an edit
+# made while this runs (an editor, another session) shifts what it reads next — measured as
+# a syntax error halfway through a deploy.
+{
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -659,3 +663,5 @@ case "${1:-all}" in
               log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
   *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--code|--runtime|--gateway|--a2a|--webui]"; exit 1 ;;
 esac
+exit
+}

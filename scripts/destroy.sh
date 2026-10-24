@@ -17,6 +17,10 @@
 # Usage: [PROFILE=p REGION=r] scripts/destroy.sh [--yes]
 #   --yes   skip the interactive confirmation
 set -euo pipefail
+# Parsed whole before any of it runs: bash otherwise reads a script as it goes, so an edit
+# made while this runs (an editor, another session) shifts what it reads next — measured as
+# a syntax error halfway through a deploy.
+{
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -291,3 +295,5 @@ else
 fi
 warn "The webhook, web chat and OAuth callback URLs all change on redeploy; ./deploy.sh"
 warn "prints the ones to register in the Lark console (and the Google console, if used)."
+exit
+}

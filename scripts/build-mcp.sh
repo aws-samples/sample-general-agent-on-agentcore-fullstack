@@ -13,6 +13,10 @@
 #
 # Images are built natively on ARM64 in CodeBuild (scripts/lib/codebuild.sh).
 set -euo pipefail
+# Parsed whole before any of it runs: bash otherwise reads a script as it goes, so an edit
+# made while this runs (an editor, another session) shifts what it reads next — measured as
+# a syntax error halfway through a deploy.
+{
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 
@@ -133,4 +137,5 @@ echo "IMAGE_URI=$ECR:$TAG"
 echo "  runtime: $RUNTIME_NAME ($RID)"
 
 done
-
+exit
+}
