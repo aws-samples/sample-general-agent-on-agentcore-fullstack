@@ -41,6 +41,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from contextlib import AsyncExitStack
 
 from langchain.agents import create_agent
@@ -179,16 +180,21 @@ def _summary_is_usable(update) -> bool:
 # immediately, so appending a HumanMessage between them would recreate exactly the failure
 # this fixes. `before_model` is the one safe boundary: any tool results from the previous
 # step are written, and the next model call has not happened yet.
-_pending_steer: dict[str, list[str]] = {}
+_pending_steer: dict[str, list[tuple[str, str, bool]]] = {}
 
 
-def steer(thread_id: str, message: str) -> None:
-    """Hand a message to the turn already running on this thread."""
+def steer(thread_id: str, message: str, message_id: str = "", fresh: bool = False) -> None:
+    """Hand a message to the turn already running on this thread. `message_id` is the id
+    its attachments were registered under (images.register), so its pixels find it.
+
+    `fresh` marks the replay that follows a consent. It is never injected into the running
+    turn — that turn's session predates the grant and would wall again — only answered as a
+    continuation, on a rebuilt session."""
     with _in_flight_lock:
-        _pending_steer.setdefault(thread_id, []).append(message)
+        _pending_steer.setdefault(thread_id, []).append((message, message_id, fresh))
 
 
-def _take_steer(thread_id: str) -> list[str]:
+def _take_steer(thread_id: str) -> list[tuple[str, str, bool]]:
     with _in_flight_lock:
         return _pending_steer.pop(thread_id, [])
 
@@ -197,6 +203,11 @@ def _thread_of(runtime) -> str:  # noqa: ANN001 — the framework's own type
     """This run's thread id. `runtime.config` does not exist on LangGraph 1.2, so reading
     it silently disabled steering; `execution_info` is where the id actually lives."""
     return getattr(getattr(runtime, "execution_info", None), "thread_id", "") or ""
+
+
+# Bedrock's per-request image limit is about 20; a turn that has had pictures steered into
+# it can gather more than that.
+_MAX_IMAGES_PER_REQUEST = 20
 
 
 class _ImageMiddleware:
@@ -211,22 +222,24 @@ class _ImageMiddleware:
     name = "images"
 
     def _attach(self, request):  # noqa: ANN001 — the framework's own type
-        from langgraph.config import get_config
-        try:
-            blocks = ((get_config() or {}).get("configurable") or {}).get("image_blocks")
-        except Exception:  # noqa: BLE001 — no run config means no images to attach
+        pixels = images.pixels_for(_thread_of(request.runtime))
+        if not pixels or not request.messages:
             return request
-        if not blocks or not request.messages:
-            return request
-        last = request.messages[-1]
-        if not isinstance(last, HumanMessage):
-            return request
-        text = last.content if isinstance(last.content, str) else ""
-        # Same id, so this replaces the message in the request rather than appending to
-        # the thread. The stored copy keeps its placeholders.
-        request.messages = request.messages[:-1] + [HumanMessage(
-            id=last.id,
-            content=([{"type": "text", "text": text}] if text else []) + list(blocks))]
+        out, room = [], _MAX_IMAGES_PER_REQUEST
+        # Newest first, so if a turn has gathered more pictures than one request may carry,
+        # the ones dropped are the oldest.
+        for m in reversed(request.messages):
+            blocks = pixels.get(getattr(m, "id", None)) if isinstance(m, HumanMessage) else None
+            blocks = (blocks or [])[:max(room, 0)]
+            room -= len(blocks)
+            if blocks:
+                text = m.content if isinstance(m.content, str) else ""
+                # Same id, so this replaces the message in the request rather than adding
+                # to the thread. The stored copy keeps its placeholders.
+                m = HumanMessage(id=m.id, content=(
+                    [{"type": "text", "text": text}] if text else []) + list(blocks))
+            out.append(m)
+        request.messages = out[::-1]
         return request
 
     def wrap_model_call(self, request, handler):  # noqa: ANN001 — the framework's signature
@@ -245,12 +258,20 @@ class _SteeringMiddleware:
         thread_id = _thread_of(runtime)
         if not thread_id:
             return None
-        queued = _take_steer(thread_id)
-        if not queued:
-            return None
-        log.info("steering %d message(s) into the running turn on %s", len(queued), thread_id)
+        # A consent replay stays queued for the continuation; everything else joins now.
+        with _in_flight_lock:
+            queued = _pending_steer.get(thread_id) or []
+            now = [q for q in queued if not q[2]]
+            if not now:
+                return None
+            later = [q for q in queued if q[2]]
+            if later:
+                _pending_steer[thread_id] = later
+            else:
+                _pending_steer.pop(thread_id, None)
+        log.info("steering %d message(s) into the running turn on %s", len(now), thread_id)
         telemetry.count("steer_injected")
-        return {"messages": [HumanMessage(m) for m in queued]}
+        return {"messages": [HumanMessage(text, id=mid or None) for text, mid, _ in now]}
 
 
 def _middleware() -> list:
@@ -340,8 +361,13 @@ _lock = threading.Lock()
 # whose toolUse has no toolResult yet, and Bedrock rejects it — the state is *in flight*,
 # not orphaned, so it must be waited out rather than repaired.
 _in_flight = 0
-_in_flight_threads: set[str] = set()
-_in_flight_lock = threading.Lock()
+# thread → the surface running a turn on it. The surface decides what a second message
+# does: on the same surface it is steered into the running turn, whose answer appears where
+# the user is looking; across surfaces it would appear in the other window, so it is told.
+_in_flight_threads: dict[str, str] = {}
+# Re-entrant: claiming a thread, registering a message's attachments and queueing a steer
+# happen as one step under it, and steer() takes it too.
+_in_flight_lock = threading.RLock()
 
 
 def busy() -> bool:
@@ -430,19 +456,70 @@ async def atools_overview(actor_id: str, mem_sid: str, workload_token: str = "")
     return tools_overview(session)
 
 
-def _track(delta: int, thread_id: str = "") -> None:
+def _track(delta: int, thread_id: str = "", surface: str = "lark") -> None:
     global _in_flight
     with _in_flight_lock:
         _in_flight += delta
         if thread_id:
-            _in_flight_threads.add(thread_id) if delta > 0 else \
-                _in_flight_threads.discard(thread_id)
+            if delta > 0:
+                _in_flight_threads[thread_id] = surface
+            else:
+                _in_flight_threads.pop(thread_id, None)
 
 
 def thread_busy(thread_id: str) -> bool:
     """Whether a turn is already running on this thread, in this container."""
     with _in_flight_lock:
         return thread_id in _in_flight_threads
+
+
+def thread_owner(thread_id: str) -> str | None:
+    """The surface running a turn on this thread, or None."""
+    with _in_flight_lock:
+        return _in_flight_threads.get(thread_id)
+
+
+def try_claim(thread_id: str, surface: str) -> str | None:
+    """Claim the thread for a turn on `surface`. Returns None on success, or the surface
+    already holding it. One step under the lock: a separate check and mark left seconds
+    between them (a cold session build), and two turns could start on one thread."""
+    with _in_flight_lock:
+        owner = _in_flight_threads.get(thread_id)
+        if owner is None:
+            _track(+1, thread_id, surface)
+        return owner
+
+
+def release(thread_id: str) -> list[tuple[str, str, bool]]:
+    """End a claim: forget the turn's attachments, then free the thread — in that order,
+    so a message arriving right after cannot register into a turn that has finished.
+
+    Returns whatever was still queued to be steered in. Dropped here rather than left for
+    the next turn, which would inject it after its own message with its pixels gone and
+    its attachment numbers pointing at that turn's files. A no-op if the thread is not
+    claimed, so a second release cannot drive the in-flight count below zero."""
+    with _in_flight_lock:
+        if thread_id not in _in_flight_threads:
+            return []
+        leftover = _pending_steer.pop(thread_id, [])
+        images.end_turn(thread_id)
+        _track(-1, thread_id)
+        return leftover
+
+
+def _release_unanswered(thread_id: str, chat_id: str) -> None:
+    """Release after a turn that never ran, telling the chat about anything steered into it
+    meanwhile — those messages were acknowledged, so dropping them silently would lose them."""
+    leftover = release(thread_id)
+    if leftover:
+        telemetry.count("steer_unanswered", n=str(len(leftover)))
+        _quietly(lark_notify.send_text, chat_id,
+                 f"还有 {len(leftover)} 条消息没来得及处理，请重新发送。")
+
+
+_BUSY_ELSEWHERE = {"web": "这段对话正在网页上回答，等它结束后再发送。",
+                   "lark": "这段对话正在 Lark 里回答，等它结束后再发送。",
+                   "sync": "这段对话正在另一处回答，等它结束后再发送。"}
 
 
 # --------------------------- the process's one event loop --------------------
@@ -539,7 +616,7 @@ def _long_term_tools(actor_id: str) -> list:
 _INTERRUPTED_TOOL = "The previous attempt was interrupted before this tool returned."
 
 
-async def _arepair_interrupted_turn(graph, config: dict) -> int:
+async def _arepair_interrupted_turn(graph, config: dict, own_claim: bool = False) -> int:
     """Answer any tool call the previous turn was killed before completing.
 
     Checkpoints are written per superstep, so a turn cut off between "the model emitted
@@ -572,7 +649,10 @@ async def _arepair_interrupted_turn(graph, config: dict) -> int:
         # A turn still running on this thread has exactly this shape — its toolUse is
         # written, its toolResult is not yet — so removing the message would corrupt a live
         # turn instead of repairing a dead one. Wait it out; the results are coming.
-        if thread_busy(config["configurable"]["thread_id"]):
+        # `own_claim`: the caller holds this thread's claim and no graph of its own is
+        # running, so "busy" is itself — a claim is taken before the session is built,
+        # and skipping here would leave the thread failing every turn, unrepaired.
+        if thread_busy(config["configurable"]["thread_id"]) and not own_claim:
             log.info("dangling call belongs to a turn still in flight; leaving it alone")
             return 0
         # Buried and nothing is running: drop it rather than paper over it in the wrong
@@ -607,7 +687,7 @@ async def _aopen_tools(stack: AsyncExitStack, connection: dict) -> list:
 
 
 async def _abuild_session(actor_id: str, email: str, mem_sid: str,
-                          workload_token: str = "") -> dict:
+                          workload_token: str = "", own_claim: bool = False) -> dict:
     """Build a session for this user. Agent-side 3LO: fetch the user's vaulted Lark
     token if there is one and open MCP sessions to the tool servers (SigV4 + the token
     in the custom header), kept open for the session.
@@ -731,7 +811,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # Building a session is exactly the moment a replaced microVM picks up a thread whose
     # last turn may have been killed mid tool call, so repair before the first invoke.
     try:
-        repaired = await _arepair_interrupted_turn(graph, config)
+        repaired = await _arepair_interrupted_turn(graph, config, own_claim)
         if repaired:
             log.info("answered %d tool call(s) left by an interrupted turn", repaired)
     except Exception:  # noqa: BLE001 — a failed repair must not cost the user a session
@@ -751,8 +831,8 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
 
 
 def _build_session(actor_id: str, email: str, mem_sid: str,
-                   workload_token: str = "") -> dict:
-    return _run(_abuild_session(actor_id, email, mem_sid, workload_token))
+                   workload_token: str = "", own_claim: bool = False) -> dict:
+    return _run(_abuild_session(actor_id, email, mem_sid, workload_token, own_claim))
 
 
 def _close_session(s: dict) -> None:
@@ -833,7 +913,7 @@ _IDENTITY_ERROR = (
 
 
 def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
-                 workload_token: str = "") -> dict:
+                 workload_token: str = "", own_claim: bool = False) -> dict:
     """Return the cached session for this user, rebuilding it if absent or near token
     expiry. A pending-authorization session (no token yet) is NOT cached — so the next
     turn re-checks the vault and picks up a freshly consented token."""
@@ -859,13 +939,13 @@ def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
             if (time.time() - s["created"]) < ttl:
                 return s
             _close_session(s)
-        s = _build_session(actor_id, email, mem_sid, workload_token)
+        s = _build_session(actor_id, email, mem_sid, workload_token, own_claim)
         # One retry when the vault says "not consented". GetResourceOauth2Token is
         # nondeterministic for a grant that exists: measured in one container, seconds apart,
         # identical arguments — one build got the token, the next only an authorizationUrl.
         # Without this a consented user is told to authorise again at random.
         if s.get("auth_url") and workload_token:
-            retry = _build_session(actor_id, email, mem_sid, workload_token)
+            retry = _build_session(actor_id, email, mem_sid, workload_token, own_claim)
             # Keep the retry either way. Each attempt mints a pending consent session and
             # invalidates the one before it, so handing back the first attempt's URL gave the
             # user a link that this retry had already killed — every completion then failed
@@ -885,30 +965,35 @@ def chat_result(actor_id: str, message: str, email: str = "",
     of asking the user to re-send."""
     remember_thread(actor_id, mem_sid)
     thread_id = mem_sid or thread_for(actor_id)
-    # A turn is already running on this thread. This surface has to answer synchronously, so
-    # it cannot wait for that turn — but the message is not lost: it is steered into the
-    # running turn, whose answer covers it.
-    if thread_busy(thread_id):
-        steer(thread_id, message)
-        telemetry.count("steered", surface="sync")
-        return {"reply": "收到，我把它并入正在处理的那一轮，稍后一起回答。",
-                "needs_auth": False, "steered": True}
-    s = _get_session(actor_id, email, thread_id, workload_token=workload_token)
-    if s.get("identity_error"):
-        # Answer without tools, but say so — silently degrading is what made a missing
-        # IAM permission look like the model choosing not to help.
-        return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
-                "needs_auth": False, "identity_error": s["identity_error"]}
-    s["tool_texts"] = []
-    _track(+1, thread_id)
+    # A turn is already running on this thread. This surface answers synchronously and the
+    # running turn's answer appears on another surface, so steering the message there would
+    # promise an answer this caller never receives. It is told to send again instead.
+    owner = try_claim(thread_id, "sync")
+    if owner is not None:
+        telemetry.count("busy_elsewhere", surface="sync")
+        return {"reply": _BUSY_ELSEWHERE.get(owner, _BUSY_ELSEWHERE["sync"]),
+                "needs_auth": False, "busy": owner}
     try:
+        s = _get_session(actor_id, email, thread_id, workload_token=workload_token,
+                         own_claim=True)
+        if s.get("identity_error"):
+            # Answer without tools, but say so — silently degrading is what made a missing
+            # IAM permission look like the model choosing not to help.
+            return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
+                    "needs_auth": False, "identity_error": s["identity_error"]}
+        s["tool_texts"] = []
+        turn_id = "msg-" + uuid.uuid4().hex
         with telemetry.timed("turn", surface="sync"):
             state = _run(s["graph"].ainvoke(
-                {"messages": [HumanMessage(message)]},
+                {"messages": [HumanMessage(message, id=turn_id)]},
                 config=_run_config(s, delivery.NoDelivery("this channel"))))
     finally:
-        _track(-1, thread_id)
-    for m in state.get("messages", []):
+        release(thread_id)
+    # This turn's tool results only. The state is the whole thread, so scanning all of it
+    # let one old "no user token" result raise a consent prompt on every later sync turn.
+    messages = state.get("messages", [])
+    start = next((i for i, m in enumerate(messages) if getattr(m, "id", None) == turn_id), 0)
+    for m in messages[start:]:
         if isinstance(m, ToolMessage):
             s["tool_texts"].append((m.name, _message_text(m)))
     reply = _message_text(state["messages"][-1]) if state.get("messages") else ""
@@ -924,6 +1009,14 @@ def run_chat(actor_id: str, message: str, email: str = "",
              mem_sid: str = "") -> str:
     """Back-compat: assistant's final text (or the consent prompt)."""
     return chat_result(actor_id, message, email, mem_sid)["reply"]
+
+
+def _quietly(fn, *args) -> None:
+    """Run a best-effort side effect whose failure must not change what happens next."""
+    try:
+        fn(*args)
+    except Exception:  # noqa: BLE001 — best-effort by definition
+        log.warning("%s failed", getattr(fn, "__name__", fn), exc_info=True)
 
 
 def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
@@ -943,75 +1036,122 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     other answer and the user re-sends after approving."""
     remember_thread(actor_id, mem_sid)
     thread_id = mem_sid or thread_for(actor_id)
-    # A turn is already running on this thread: hand the message to it rather than starting
-    # a second one. Two turns would each read the other's half-written checkpoint, and the
-    # user would be told to re-send something the agent had in fact received.
-    if thread_busy(thread_id):
-        steer(thread_id, message)
+    handles = list(image_handles or [])
+    blocks = images.prepare(handles)        # network, so before the lock
+
+    # One step under the lock: see who holds the thread, then claim it, steer into it, or
+    # step aside. A separate check and claim left a cold session build between them, so two
+    # turns could start on one thread. On the same surface the message is steered into the
+    # running turn, whose answer appears where the user is looking; on another surface it
+    # would be answered in that window, so it is told instead — and registers nothing, so
+    # it cannot join that turn's attachments.
+    with _in_flight_lock:
+        owner = _in_flight_threads.get(thread_id)
+        if owner in (None, "lark"):
+            if owner is None:
+                _track(+1, thread_id, "lark")
+            marks, turn_message_id = images.register(thread_id, handles, blocks)
+            if marks:
+                message = "\n".join([message, marks]).strip() if message else marks
+            if owner == "lark":
+                steer(thread_id, message, turn_message_id, fresh=fresh_session)
+    if owner == "lark":
         telemetry.count("steered", surface="lark")
-        lark_notify.remove_reaction(message_id, reaction_id)
+        _quietly(lark_notify.remove_reaction, message_id, reaction_id)
         return {"accepted": True, "needs_auth": False, "steered": True}
-    s = _get_session(actor_id, email, thread_id,
-                     fresh=fresh_session, workload_token=workload_token)
-    if s.get("identity_error"):
-        return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
-                "needs_auth": False, "identity_error": s["identity_error"]}
+    if owner is not None:
+        telemetry.count("busy_elsewhere", surface="lark")
+        _quietly(lark_notify.remove_reaction, message_id, reaction_id)
+        lark_notify.send_text(chat_id, _BUSY_ELSEWHERE.get(owner, _BUSY_ELSEWHERE["sync"]))
+        return {"accepted": True, "needs_auth": False, "busy": owner}
 
-    # Handles become text the thread keeps; the bytes are fetched once for this run and
-    # attached to the model call by _ImageMiddleware, so the thread never carries them.
-    # Pictures are shown to the model; anything else is named, and save_attachment is how
-    # the model opens it. Either way the bytes stay out of the thread.
-    image_blocks: list = []
-    attachments = list(image_handles or [])
-    if attachments:
-        pictures = [(h.get("message_id", ""), h.get("key", ""))
-                    for h in attachments if h.get("kind") == images.IMAGE]
-        image_blocks = images.blocks_for(pictures[:images.MAX_PER_MESSAGE])
-        marks = []
-        for i, h in enumerate(attachments, start=1):
-            if h.get("kind") == images.IMAGE:
-                mark = images.placeholder(i, h.get("message_id", ""), h.get("key", ""))
-                marks.append(mark if image_blocks else mark + " (no longer available)")
-            else:
-                marks.append(f"[attachment {i}: {h.get('name') or 'file'} — "
-                             f"call save_attachment({i}) to open it]")
-        message = "\n".join([message, *marks]).strip() if message else " ".join(marks)
+    # The thread is claimed from here on. Every way out has to release it, or the thread
+    # reads as busy for good and every later message is steered into a turn that is gone.
+    try:
+        s = _get_session(actor_id, email, thread_id, fresh=fresh_session,
+                         workload_token=workload_token, own_claim=True)
+        if s.get("identity_error"):
+            _release_unanswered(thread_id, chat_id)
+            return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
+                    "needs_auth": False, "identity_error": s["identity_error"]}
 
-    def _run_turn() -> None:
-        try:
-            with telemetry.timed("turn", surface="lark"):
-                answer = _stream_to_chat(s, message, chat_id, image_blocks, attachments)
-            idp = _hit_auth_wall(s)
-            if idp:
-                telemetry.count("auth_wall", surface="lark", idp=idp)
-                link = _consent_link(s, idp, workload_token)
-                if link:
-                    # The message was parked before this turn, so the shim's /return
-                    # replays it once consent lands — no re-send.
-                    lark_notify.send_link(
-                        chat_id, f"需要访问你的 {idp.capitalize()} 账号，授权后我会自动继续：",
-                        "点击授权", link)
-                else:
-                    _drop_sessions(actor_id)
-                    lark_notify.send_text(chat_id, f"{idp.capitalize()} 已授权，请再发一次。")
-        except Exception as e:  # noqa: BLE001 — the caller is already gone
-            log.exception("async turn failed for %s", actor_id)
-            # This session stays cached, so a turn that died mid tool call would make every
-            # later turn fail too. Repair here as well as at build time.
+        def _answer(s: dict, inputs: list) -> None:
             try:
-                _run(_arepair_interrupted_turn(s["graph"], s["config"]), timeout=30)
-            except Exception:  # noqa: BLE001
-                log.warning("could not repair the interrupted turn", exc_info=True)
-            lark_notify.send_text(chat_id, f"Sorry, that didn't work out ({type(e).__name__}).")
-        finally:
-            # Clear the router's marker whatever happened — leaving it on a failed turn
-            # would read as "still working". If the container dies outright nobody
-            # clears it, which is cosmetic only.
-            lark_notify.remove_reaction(message_id, reaction_id)
-            _track(-1, thread_id)
+                with telemetry.timed("turn", surface="lark"):
+                    _stream_to_chat(s, inputs, chat_id)
+                idp = _hit_auth_wall(s)
+                if idp:
+                    telemetry.count("auth_wall", surface="lark", idp=idp)
+                    link = _consent_link(s, idp, workload_token)
+                    if link:
+                        # The message was parked before this turn, so the shim's /return
+                        # replays it once consent lands — no re-send.
+                        lark_notify.send_link(
+                            chat_id, f"需要访问你的 {idp.capitalize()} 账号，授权后我会自动继续：",
+                            "点击授权", link)
+                    else:
+                        _drop_sessions(actor_id)
+                        lark_notify.send_text(chat_id, f"{idp.capitalize()} 已授权，请再发一次。")
+            except Exception as e:  # noqa: BLE001 — the caller is already gone
+                log.exception("async turn failed for %s", actor_id)
+                # This session stays cached, so a turn that died mid tool call would make
+                # every later turn fail too. Repair here as well as at build time.
+                try:
+                    _run(_arepair_interrupted_turn(s["graph"], s["config"], own_claim=True),
+                         timeout=30)
+                except Exception:  # noqa: BLE001
+                    log.warning("could not repair the interrupted turn", exc_info=True)
+                _quietly(lark_notify.send_text, chat_id,
+                         f"Sorry, that didn't work out ({type(e).__name__}).")
 
-    _track(+1, thread_id)
-    threading.Thread(target=_run_turn, name=f"turn-{actor_id[:16]}", daemon=True).start()
+        def _run_turn() -> None:
+            session, inputs = s, [(message, turn_message_id, False)]
+            released = False
+            try:
+                while inputs:
+                    _answer(session, inputs)
+                    # A message steered in after the turn's last model call is never read
+                    # by it — that window is the whole streamed answer, which is when people
+                    # add "also this". So the claim is kept and the leftovers are answered as
+                    # a continuation, with their attachments still registered; only an empty
+                    # queue ends the turn, in the same step as releasing the thread.
+                    with _in_flight_lock:
+                        inputs = _take_steer(thread_id)
+                        if not inputs:
+                            release(thread_id)
+                            released = True
+                    if inputs:
+                        telemetry.count("steer_continued")
+                        # Fetched again rather than reused: the consent branch above may
+                        # have dropped this session, and a consent replay among the inputs
+                        # needs one built after the grant, not the unauthorised one.
+                        fresh = any(item[2] for item in inputs)
+                        if fresh:
+                            _drop_sessions(actor_id)
+                        # These inputs are already off the queue, so a failure here has to
+                        # count them itself — the release at the end only sees what is left.
+                        try:
+                            session = _get_session(actor_id, email, thread_id, fresh=fresh,
+                                                   workload_token=workload_token, own_claim=True)
+                            problem = session.get("identity_error")
+                        except Exception as e:  # noqa: BLE001 — told below, not raised
+                            log.exception("continuation session failed for %s", actor_id)
+                            problem = type(e).__name__
+                        if problem:
+                            _quietly(lark_notify.send_text, chat_id,
+                                     f"还有 {len(inputs)} 条消息没来得及处理（{problem}），请重新发送。")
+                            break
+            finally:
+                if not released:
+                    _release_unanswered(thread_id, chat_id)
+                # Last, and on its own: it is a network call that can raise, and the claim
+                # must be released whatever it does. A marker left behind is cosmetic.
+                _quietly(lark_notify.remove_reaction, message_id, reaction_id)
+
+        threading.Thread(target=_run_turn, name=f"turn-{actor_id[:16]}", daemon=True).start()
+    except BaseException:
+        _release_unanswered(thread_id, chat_id)
+        raise
     return {"accepted": True, "needs_auth": False}
 
 
@@ -1038,27 +1178,29 @@ def _message_text(msg) -> str:
 _STREAM_END = object()
 
 
-def _run_config(session: dict, channel: delivery.Delivery,
-                image_blocks: list | None = None,
-                image_handles: list | None = None) -> dict:
-    """The session's config plus what belongs to this run alone: where a file may be
-    delivered, and the pixels of any image that arrived with the message.
+def _run_config(session: dict, channel: delivery.Delivery) -> dict:
+    """The session's config plus where this run may deliver a file.
 
     A fresh dict every run: the session is cached per actor and thread and is served to
-    every surface, so a target stored on it would send one surface's file to another's,
-    and an image left behind would be re-sent with somebody else's question.
+    every surface, so a target stored on it would send one surface's file to another's.
+    A turn's attachments are not here: a message steered in mid-turn joins a run whose
+    config is already fixed, so they live in images' per-thread turn registry instead.
     """
     configurable = session["config"]["configurable"]
     return {**session["config"],
-            "configurable": {**configurable, "delivery": channel,
-                             # Pixels for the model, handles for use_image — both only
-                             # for this run, and the handles never come from the model.
-                             "image_blocks": image_blocks or [],
-                             "attachments": image_handles or []}}
+            "configurable": {**configurable, "delivery": channel}}
 
 
-def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
-                 on_tool_result=None):
+def _turn_input(message, message_id: str | None = None) -> list:
+    """The HumanMessages a turn starts from: one string, or (text, id) pairs — several when
+    a continuation answers what was steered in after the last model call."""
+    if isinstance(message, str):
+        return [HumanMessage(message, id=message_id)]
+    return [HumanMessage(item[0], id=item[1] or None) for item in message]
+
+
+def _iter_deltas(graph, message, config: dict, on_tool_use=None,
+                 on_tool_result=None, message_id: str | None = None):
     """Yield text chunks from the graph's async stream, as a synchronous generator.
 
     The stream runs on the agent loop (where the MCP sessions live) and hands chunks
@@ -1073,7 +1215,7 @@ def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
 
     async def _pump() -> None:
         try:
-            stream = graph.astream({"messages": [HumanMessage(message)]},
+            stream = graph.astream({"messages": _turn_input(message, message_id)},
                                    config=config, stream_mode="messages")
             async for chunk, _meta in stream:
                 if isinstance(chunk, ToolMessage):
@@ -1127,19 +1269,16 @@ async def aget_session(actor_id: str, workload_token: str = "") -> dict:
                                thread_for(actor_id), False, workload_token)
 
 
-def track_in_flight(delta: int) -> None:
-    """Mark a turn in flight so /ping reports HealthyBusy and the container is not
-    reclaimed mid-answer."""
-    _track(delta)
-
-
-async def aiter_on_agent_loop(agen_factory):
-    """Yield from an async generator that must run on _LOOP, into another loop.
+def stream_on_agent_loop(agen_factory, on_done=None):
+    """Start an async generator on _LOOP now, and return an async iterator over its items
+    for another loop to consume.
 
     The graph's MCP sessions are bound to the loop that opened them, so anything awaiting
-    them has to run on _LOOP — but an aiohttp handler runs on the server's own loop. The
-    hand-off is a thread-safe queue, the same bridge _iter_deltas uses for its synchronous
-    consumer."""
+    them has to run on _LOOP — but an aiohttp handler runs on the server's own loop; the
+    hand-off is a thread-safe queue. Started eagerly, and `on_done` runs on _LOOP when the
+    producer finishes, not when the consumer stops: a web page that is closed mid-answer
+    stops reading, but the graph runs on and keeps writing the checkpoint, so anything
+    marking the turn as running has to last until the producer is done."""
     q: queue.Queue = queue.Queue()
 
     async def _pump() -> None:
@@ -1150,21 +1289,29 @@ async def aiter_on_agent_loop(agen_factory):
             q.put(e)
         finally:
             q.put(_STREAM_END)
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:  # noqa: BLE001 — never lose the release to a logging bug
+                    log.exception("on_done failed")
 
     asyncio.run_coroutine_threadsafe(_pump(), _LOOP)
-    loop = asyncio.get_running_loop()
-    while True:
-        item = await loop.run_in_executor(None, q.get)
-        if item is _STREAM_END:
-            return
-        if isinstance(item, Exception):
-            raise item
-        yield item
+
+    async def _drain():
+        loop = asyncio.get_running_loop()
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is _STREAM_END:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    return _drain()
 
 
-def _stream_to_chat(session: dict, message: str, chat_id: str,
-                    image_blocks: list | None = None,
-                    image_handles: list | None = None) -> str:
+def _stream_to_chat(session: dict, message, chat_id: str,
+                    message_id: str | None = None) -> str:
     """Run the turn, typing the answer into a streaming card as it is produced, and
     return the full text. If the card can't be created or an update fails (e.g. the
     cardkit:card:write scope isn't granted), fall back to posting the final text — the
@@ -1196,9 +1343,9 @@ def _stream_to_chat(session: dict, message: str, chat_id: str,
 
     acc = []
     for delta in _iter_deltas(session["graph"], message,
-                              _run_config(session, delivery.LarkDelivery(chat_id),
-                                          image_blocks, image_handles),
-                              on_tool_use=_on_tool_use, on_tool_result=_on_tool_result):
+                              _run_config(session, delivery.LarkDelivery(chat_id)),
+                              on_tool_use=_on_tool_use, on_tool_result=_on_tool_result,
+                              message_id=message_id):
         acc.append(delta)
         if streaming and not card.update("".join(acc)):
             streaming = False  # a failed write drops us to the fallback below

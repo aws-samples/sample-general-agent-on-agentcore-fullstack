@@ -356,19 +356,20 @@ def test_save_attachment_takes_its_handle_from_the_run_not_from_the_model(_lark)
     assert list(tools["save_attachment"].args) == ["which"], \
         "no handle may come from the model"
 
+    code_tools.images.add_to_turn("t-att", [{"kind": "file", "key": "file_real",
+                                             "name": "report.pdf", "message_id": "om_real"}])
     with mock.patch.object(code_tools.images.lark_notify, "fetch_message_resource",
                            return_value=b"PK\x03\x04") as fetched:
         out = tools["save_attachment"].invoke(
-            {"which": 1},
-            config={"configurable": {"attachments": [
-                {"kind": "file", "key": "file_real", "name": "report.pdf",
-                 "message_id": "om_real"}]}})
+            {"which": 1}, config={"configurable": {"thread_id": "t-att"}})
+    code_tools.images.end_turn("t-att")
     assert "report.pdf" in out and written["name"] == "report.pdf"
     # The kind has to travel with the handle: Lark answers 500 if it does not match.
     assert fetched.call_args.args == ("om_real", "file_real", "file")
 
-    # Nothing in the config means nothing to fetch, whatever the model asks for.
-    out = tools["save_attachment"].invoke({"which": 1}, config={"configurable": {}})
+    # Nothing registered for this thread means nothing to fetch, whatever the model asks.
+    out = tools["save_attachment"].invoke({"which": 1},
+                                          config={"configurable": {"thread_id": "t-other"}})
     assert "Nothing came with this message" in out
 
 
@@ -377,12 +378,14 @@ def test_a_picture_keeps_a_usable_name_when_the_sender_gave_none(_lark):
     written = {}
     box.write_bytes = lambda name, data: written.update({"name": name})
     tools = {t.name: t for t in code_tools.tools_for("lark:ou_x", box)}
+    with mock.patch.object(code_tools.images, "blocks_for", return_value=[]):
+        code_tools.images.add_to_turn("t-pic", [{"kind": "image", "key": "img_1",
+                                                 "message_id": "om_1"}])
     with mock.patch.object(code_tools.images.lark_notify, "fetch_message_resource",
                            return_value=b"\xff\xd8ab"):
-        tools["save_attachment"].invoke(
-            {"which": 1},
-            config={"configurable": {"attachments": [
-                {"kind": "image", "key": "img_1", "message_id": "om_1"}]}})
+        tools["save_attachment"].invoke({"which": 1},
+                                        config={"configurable": {"thread_id": "t-pic"}})
+    code_tools.images.end_turn("t-pic")
     assert written["name"] == "image-1.jpg"
 
 

@@ -86,25 +86,43 @@ async def handle(request: web.Request, payload: dict,
     if session.get("identity_error"):
         return await _error_stream(request, "暂时无法访问你的 Lark 账号，请稍后再试。")
 
-    # thread_id comes from the session, never from the request: it decides whose
-    # conversation this is.
-    run_input = RunAgentInput(**{**payload,
-                                "threadId": session["mem_sid"],
-                                "runId": payload.get("runId") or session["mem_sid"]})
-    # The page has no way to carry a file yet, and this session is also served to Lark, so
-    # the run says so explicitly rather than inheriting whatever chat was served last.
-    agui = LangGraphAgent(name="agentcore-fullstack", graph=session["graph"],
-                          config=agent_core._run_config(
-                              session, agent_core.delivery.NoDelivery("the web page")))
-    # The graph's MCP sessions live on agent_core's own loop, so the run has to happen
-    # there and the events come back over a queue.
-    events = agent_core.aiter_on_agent_loop(lambda: agui.run(run_input))
+    # One turn per thread: two would each read the other's half-written checkpoint. A turn
+    # already running elsewhere would answer this in that window, so the page is told rather
+    # than have its message steered there. Claimed in one step, so two tabs cannot both pass.
+    thread_id = session["mem_sid"]
+    owner = agent_core.try_claim(thread_id, "web")
+    if owner:
+        return await _error_stream(request, agent_core._BUSY_ELSEWHERE.get(
+            owner, agent_core._BUSY_ELSEWHERE["sync"]))
+
+    # From the claim until the run has started, a failure — a malformed payload included —
+    # has to release the thread itself: no run exists yet to release it.
+    try:
+        # thread_id comes from the session, never from the request: it decides whose
+        # conversation this is.
+        run_input = RunAgentInput(**{**payload,
+                                    "threadId": thread_id,
+                                    "runId": payload.get("runId") or thread_id})
+        # The page has no way to carry a file yet, and this session is also served to
+        # Lark, so the run says so explicitly rather than inheriting whatever chat was
+        # served last.
+        agui = LangGraphAgent(name="agentcore-fullstack", graph=session["graph"],
+                              config=agent_core._run_config(
+                                  session, agent_core.delivery.NoDelivery("the web page")))
+        # The graph's MCP sessions live on agent_core's own loop, so the run happens there
+        # and the events come back over a queue. Released when the run finishes, not when
+        # this handler stops reading: a page closed mid-answer leaves the graph running,
+        # and a Lark message must see the thread busy until it ends.
+        events = agent_core.stream_on_agent_loop(
+            lambda: agui.run(run_input), on_done=lambda: agent_core.release(thread_id))
+    except BaseException:
+        agent_core.release(thread_id)
+        raise
 
     resp = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                        "Cache-Control": "no-cache",
                                        "X-Accel-Buffering": "no"})
     await resp.prepare(request)
-    agent_core.track_in_flight(+1)   # /ping reports HealthyBusy while this runs
     try:
         async for event in events:
             await resp.write(_sse(event))
@@ -113,6 +131,5 @@ async def handle(request: web.Request, payload: dict,
         await resp.write(f'data: {json.dumps({"type": "RUN_ERROR", "message": type(e).__name__})}\n\n'
                          .encode())
     finally:
-        agent_core.track_in_flight(-1)
         await resp.write_eof()
     return resp

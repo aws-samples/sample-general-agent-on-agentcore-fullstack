@@ -313,9 +313,8 @@ def test_steering_is_per_thread():
     agent_core._pending_steer.clear()
     agent_core.steer("t-a", "for A")
     mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
-    other = type("R", (), {"config": {"configurable": {"thread_id": "t-b"}}})()
-    assert mw.before_model({"messages": []}, other) is None
-    assert agent_core._pending_steer == {"t-a": ["for A"]}
+    assert mw.before_model({"messages": []}, _runtime("t-b")) is None
+    assert agent_core._pending_steer == {"t-a": [("for A", "", False)]}
 
 
 def _load_busy_helpers():
@@ -605,7 +604,7 @@ def test_the_session_retry_hands_back_the_live_consent_link():
     CompleteResourceTokenAuth then answered "Invalid or expired session" every time."""
     calls = []
 
-    def build(actor, email, mem_sid, wat=""):
+    def build(actor, email, mem_sid, wat="", own_claim=False):
         calls.append(1)
         return {"auth_url": f"https://consent/{len(calls)}", "mem_sid": mem_sid,
                 "created": 0, "stack": None}
@@ -922,7 +921,7 @@ def test_fresh_session_evicts_a_cached_unauthorized_session():
     for expiry is not a fix."""
     closed, built = [], []
 
-    def fake_build(actor_id, email, mem_sid, workload_token=""):
+    def fake_build(actor_id, email, mem_sid, workload_token="", own_claim=False):
         built.append(mem_sid)
         return {"created": 1e9}                      # authorized: no auth_url
 
@@ -1313,32 +1312,389 @@ def test_summarisation_can_be_disabled_outright():
             "ImageMiddleware", "SteeringMiddleware"]
 
 
+def _runtime(thread_id):
+    """The runtime's real shape on LangGraph 1.2: the thread id is on execution_info."""
+    return type("R", (), {"execution_info": type("E", (), {"thread_id": thread_id})()})()
+
+
+def _image_mw():
+    return [m for m in agent_core._middleware() if getattr(m, "name", "") == "images"][0]
+
+
+_BLOCK = {"type": "image", "base64": "Zm9v", "mime_type": "image/jpeg"}
+
+
+def _register(thread_id, handles):
+    """Register attachments with a turn, with the Lark fetch replaced."""
+    with mock.patch.object(agent_core.images, "blocks_for", return_value=[_BLOCK]):
+        return agent_core.images.add_to_turn(thread_id, handles)
+
+
 def test_the_pixels_reach_the_request_but_never_the_thread():
     """The whole point: the model sees the image on this turn, and the stored thread keeps
     only a handle, so the image is not re-billed on every later turn."""
     from langchain_core.messages import HumanMessage as _HM
-    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "images"][0]
-    stored = _HM(id="m1", content="what is in this? [image 1 msg=om_x key=img_y]")
-    request = type("R", (), {"messages": [stored]})()
-    block = {"type": "image", "base64": "Zm9v", "mime_type": "image/jpeg"}
-    with mock.patch("langgraph.config.get_config",
-                    return_value={"configurable": {"image_blocks": [block]}}):
-        out = mw._attach(request)
-    sent = out.messages[-1]
-    kinds = [b["type"] for b in sent.content]
-    assert kinds == ["text", "image"]
+    marks, mid = _register("t-px", [{"kind": "image", "key": "img_y", "message_id": "om_x"}])
+    stored = _HM(id=mid, content="what is in this?\n" + marks)
+    request = type("R", (), {"messages": [stored], "runtime": _runtime("t-px")})()
+    sent = _image_mw()._attach(request).messages[-1]
+    assert [b["type"] for b in sent.content] == ["text", "image"]
     # Same id, so this replaces the message in the request rather than growing the thread.
-    assert sent.id == "m1"
+    assert sent.id == mid
     # The stored message is untouched: still text, still carrying the handle.
-    assert stored.content == "what is in this? [image 1 msg=om_x key=img_y]"
+    assert stored.content == "what is in this?\n[image 1 msg=om_x key=img_y]"
+    agent_core.images.end_turn("t-px")
 
 
 def test_a_run_with_no_images_is_left_alone():
-    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "images"][0]
     from langchain_core.messages import HumanMessage as _HM
-    request = type("R", (), {"messages": [_HM(id="m1", content="just text")]})()
-    with mock.patch("langgraph.config.get_config", return_value={"configurable": {}}):
-        assert mw._attach(request).messages[-1].content == "just text"
+    request = type("R", (), {"messages": [_HM(id="m1", content="just text")],
+                             "runtime": _runtime("t-none")})()
+    assert _image_mw()._attach(request).messages[-1].content == "just text"
+
+
+def test_a_picture_sent_mid_turn_reaches_the_running_turn_on_its_own_message():
+    """A message steered into a running turn joins a run whose config is already fixed, so
+    its pixels come from the turn registry — bound to its own id. Attaching to "the last
+    human message" would have handed the first picture to the steered one instead."""
+    from langchain_core.messages import HumanMessage as _HM, AIMessage as _AI
+    first_marks, first = _register("t-mid", [{"kind": "image", "key": "img_a", "message_id": "om_1"}])
+    later_marks, later = _register("t-mid", [{"kind": "image", "key": "img_b", "message_id": "om_2"}])
+    # Numbered across the turn, so the second picture is "image 2", not another "image 1".
+    assert "[image 1 " in first_marks and "[image 2 " in later_marks
+    request = type("R", (), {"runtime": _runtime("t-mid"), "messages": [
+        _HM(id=first, content="look"), _AI(content="ok"), _HM(id=later, content="and this")]})()
+    sent = _image_mw()._attach(request).messages
+    assert [b["type"] for b in sent[0].content] == ["text", "image"]
+    assert [b["type"] for b in sent[2].content] == ["text", "image"]
+    agent_core.images.end_turn("t-mid")
+    assert agent_core.images.pixels_for("t-mid") == {}
+
+
+def test_an_attachment_steered_into_a_running_turn_is_not_dropped():
+    """It used to be: the busy check came before the attachments were read, and steering
+    carried text only, so a file sent while the bot was answering vanished silently."""
+    agent_core._pending_steer.clear()
+    agent_core._in_flight_threads.clear()
+    agent_core._track(+1, "t-busy", "lark")
+    try:
+        with mock.patch.object(agent_core.images, "blocks_for", return_value=[]), \
+             mock.patch.object(agent_core, "lark_notify"):
+            out = agent_core.chat_async("lark:ou_x", "also this", "oc_1", mem_sid="t-busy",
+                                        image_handles=[{"kind": "file", "key": "f_1",
+                                                        "name": "q3.pdf", "message_id": "om_9"}])
+        assert out["steered"] is True
+        (text, mid, _fresh), = agent_core._pending_steer["t-busy"]
+        assert "also this" in text and "save_attachment(1)" in text and "q3.pdf" in text
+        assert agent_core.images.handles_for("t-busy")[0]["key"] == "f_1"
+    finally:
+        agent_core._track(-1, "t-busy")
+        agent_core.images.end_turn("t-busy")
+        agent_core._pending_steer.clear()
+
+
+def test_a_lark_message_during_a_web_turn_is_told_not_steered():
+    """Steered into a web turn, its answer would appear on the page while the user waits in
+    Lark. Nothing is registered either, so the web turn's attachment numbering is untouched."""
+    agent_core._pending_steer.clear()
+    agent_core._in_flight_threads.clear()
+    agent_core._track(+1, "t-web", "web")
+    try:
+        with mock.patch.object(agent_core, "lark_notify") as notify:
+            out = agent_core.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-web",
+                                        image_handles=[{"kind": "file", "key": "f_1",
+                                                        "message_id": "om_9"}])
+        assert out["busy"] == "web"
+        assert "网页" in notify.send_text.call_args.args[1]
+        assert agent_core._pending_steer == {} and agent_core.images.handles_for("t-web") == []
+    finally:
+        agent_core._track(-1, "t-web")
+
+
+def _fresh_claims():
+    """Tests share the module's claim state; start each from nothing."""
+    agent_core._in_flight = 0
+    agent_core._in_flight_threads.clear()
+    agent_core._pending_steer.clear()
+
+
+class _InlineThread:
+    """threading.Thread that runs its target on start(), so a turn finishes in the test."""
+    def __init__(self, target=None, name=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+def test_a_claim_is_one_step_and_a_second_claimant_learns_who_holds_it():
+    _fresh_claims()
+    assert agent_core.try_claim("t-c", "web") is None
+    assert agent_core.try_claim("t-c", "lark") == "web"
+    agent_core.release("t-c")
+    assert agent_core.thread_owner("t-c") is None and agent_core._in_flight == 0
+
+
+def test_a_turn_releases_its_thread_and_attachments_on_every_way_out():
+    """Left claimed, the thread reads as busy for good and every later message is steered
+    into a turn that no longer exists."""
+    handles = [{"kind": "file", "key": "f_1", "name": "a.pdf", "message_id": "om_1"}]
+    for case in ("identity", "raises", "ok"):
+        _fresh_claims()
+        if case == "identity":
+            got = mock.patch.object(agent_core, "_get_session",
+                                    return_value={"identity_error": "nope"})
+        elif case == "raises":
+            got = mock.patch.object(agent_core, "_get_session", side_effect=RuntimeError("cold"))
+        else:
+            got = mock.patch.object(agent_core, "_get_session", return_value=_session_for([]))
+        with got, mock.patch.object(agent_core, "lark_notify"), \
+             mock.patch.object(agent_core, "_stream_to_chat", return_value="ok"), \
+             mock.patch.object(agent_core.threading, "Thread", _InlineThread):
+            try:
+                agent_core.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-out",
+                                      image_handles=handles)
+            except RuntimeError:
+                assert case == "raises"
+        assert agent_core.thread_owner("t-out") is None, case
+        assert agent_core.images.handles_for("t-out") == [], case
+
+
+def test_a_message_steered_after_the_last_model_call_is_answered_not_dropped():
+    """That window is the whole streamed answer, which is when people add "also this". The
+    turn keeps its claim and answers the leftover as a continuation, attachments intact."""
+    _fresh_claims()
+    seen = []
+
+    def stream(session, inputs, chat_id, message_id=None):
+        seen.append(inputs)
+        if len(seen) == 1:       # arrives while the first answer is streaming
+            with mock.patch.object(agent_core.images, "blocks_for", return_value=[]):
+                agent_core.chat_async("lark:ou_x", "also this", "oc_1", mem_sid="t-late",
+                                      image_handles=[{"kind": "file", "key": "f_9",
+                                                      "name": "late.pdf", "message_id": "om_9"}])
+            assert agent_core.images.handles_for("t-late"), "still registered for the continuation"
+        return "ok"
+
+    with mock.patch.object(agent_core, "_get_session", return_value=_session_for([])), \
+         mock.patch.object(agent_core, "lark_notify"), \
+         mock.patch.object(agent_core, "_stream_to_chat", side_effect=stream), \
+         mock.patch.object(agent_core.threading, "Thread", _InlineThread):
+        agent_core.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-late")
+    assert len(seen) == 2
+    (text, _mid, _fresh), = seen[1]
+    assert "also this" in text and "save_attachment(1)" in text
+    assert agent_core.thread_owner("t-late") is None
+    assert agent_core.images.handles_for("t-late") == []
+
+
+def test_across_surfaces_a_message_is_told_not_steered():
+    """Steered across surfaces, the answer appears in the other window — and a sync caller
+    would be promised an answer it never receives."""
+    for owner, arrives in (("sync", "lark"), ("web", "lark"), ("lark", "sync"), ("web", "sync")):
+        _fresh_claims()
+        agent_core.try_claim("t-x", owner)
+        with mock.patch.object(agent_core, "lark_notify") as notify:
+            if arrives == "lark":
+                out = agent_core.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-x")
+                assert out["busy"] == owner and notify.send_text.called
+            else:
+                out = agent_core.chat_result("lark:ou_x", "hi", mem_sid="t-x")
+                assert out["busy"] == owner and "steered" not in out
+        assert agent_core._pending_steer == {}, (owner, arrives)
+        agent_core.release("t-x")
+
+
+def test_a_web_runs_claim_lasts_until_the_run_ends_not_until_the_page_stops_reading():
+    """A page closed mid-answer stops reading, but the graph runs on and writes the
+    checkpoint; releasing at that point let a Lark turn start beside it."""
+    import asyncio, threading as _th
+    done = _th.Event()
+
+    async def produce():
+        for i in range(3):
+            await asyncio.sleep(0.05)
+            yield i
+
+    async def read_one_and_leave():
+        events = agent_core.stream_on_agent_loop(produce, on_done=done.set)
+        async for _ in events:
+            break            # the page went away after the first event
+        assert not done.is_set(), "released while the run was still going"
+
+    asyncio.run(read_one_and_leave())
+    assert done.wait(5), "the run finished but never released"
+
+
+def test_a_picture_steered_into_a_real_turn_reaches_the_model_on_its_own_message():
+    """Through a compiled graph, not a faked request: the steering middleware injects the
+    message with its id, and the image middleware finds its pixels by that id."""
+    _fresh_claims()
+    seen_by_model = []
+
+    class _Recording(_ScriptedModel):
+        async def _astream(self, messages, stop=None, run_manager=None, **kw):
+            seen_by_model.append(messages)
+            async for chunk in super()._astream(messages, stop, run_manager, **kw):
+                yield chunk
+
+    from langgraph.checkpoint.memory import InMemorySaver
+    graph = agent_core.create_agent(model=_Recording(turns=[{"text": ["ok"]}]), tools=[],
+                                    checkpointer=InMemorySaver(),
+                                    middleware=agent_core._middleware()[:2])
+    with mock.patch.object(agent_core.images, "blocks_for", return_value=[_BLOCK]):
+        _, first = agent_core.images.add_to_turn(
+            "t-real", [{"kind": "image", "key": "img_a", "message_id": "om_1"}])
+        marks, later = agent_core.images.add_to_turn(
+            "t-real", [{"kind": "image", "key": "img_b", "message_id": "om_2"}])
+    agent_core.steer("t-real", "and this one\n" + marks, later)
+    # Streamed, as a real turn is (_iter_deltas): that is the path that calls _astream.
+    async def run():
+        async for _ in graph.astream({"messages": [HumanMessage("look", id=first)]},
+                                     config={"configurable": {"thread_id": "t-real"}},
+                                     stream_mode="messages"):
+            pass
+    agent_core._run(run())
+    humans = [m for m in seen_by_model[0] if isinstance(m, HumanMessage)]
+    assert [m.id for m in humans] == [first, later]
+    for m in humans:
+        assert any(isinstance(b, dict) and b.get("type") == "image" for b in m.content), m.id
+    agent_core.images.end_turn("t-real")
+
+
+def test_a_malformed_page_request_does_not_leave_the_thread_claimed():
+    """Claimed before the run input is built, so a payload that fails validation must
+    release it — left claimed, Lark answers "正在网页上回答" for good."""
+    import asyncio, agui
+    _fresh_claims()
+    session = {"mem_sid": "t-bad", "graph": object(), "config": {"configurable": {}}}
+
+    async def go():
+        with mock.patch.object(agent_core, "aget_session",
+                               mock.AsyncMock(return_value=session)):
+            await agui.handle(mock.Mock(), {"actorId": "lark:ou_x", "messages": "not a list"}, "")
+
+    try:
+        asyncio.run(go())
+    except Exception:  # noqa: BLE001 — the validation error itself is not under test
+        pass
+    assert agent_core.thread_owner("t-bad") is None and agent_core._in_flight == 0
+
+
+def test_release_is_idempotent():
+    _fresh_claims()
+    agent_core.try_claim("t-i", "lark")
+    agent_core.release("t-i")
+    agent_core.release("t-i")
+    assert agent_core._in_flight == 0
+
+
+def test_a_steer_queued_while_a_turn_failed_to_start_is_reported_not_carried_over():
+    """Acknowledged as steered, so dropping it silently loses it; carried over, it would be
+    injected into the next turn with its pixels gone and its numbers pointing elsewhere."""
+    _fresh_claims()
+
+    def cold_build(*a, **k):
+        agent_core.steer("t-fail", "meanwhile", "msg-x")     # arrives during the build
+        raise RuntimeError("build failed")
+
+    with mock.patch.object(agent_core, "_get_session", side_effect=cold_build), \
+         mock.patch.object(agent_core, "lark_notify") as notify:
+        try:
+            agent_core.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-fail")
+        except RuntimeError:
+            pass
+    assert agent_core._pending_steer == {}
+    assert any("1 条消息没来得及处理" in c.args[1] for c in notify.send_text.call_args_list)
+    assert agent_core.thread_owner("t-fail") is None
+
+
+def test_a_continuation_that_cannot_get_a_session_says_how_many_it_dropped():
+    """Its inputs are already off the queue, so the release at the end cannot count them;
+    for a consent replay the parked copy is spent too, so silence would lose it outright."""
+    _fresh_claims()
+    calls = {"n": 0}
+
+    def get_session(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _session_for([])
+        raise RuntimeError("mcp connect timeout")      # the continuation's rebuild
+
+    def stream(session, inputs, chat_id, message_id=None):
+        if calls["n"] == 1:
+            agent_core.steer("t-cont", "after consent", "m-r", fresh=True)
+        return "ok"
+
+    with mock.patch.object(agent_core, "_get_session", side_effect=get_session), \
+         mock.patch.object(agent_core, "_drop_sessions"), \
+         mock.patch.object(agent_core, "lark_notify") as notify, \
+         mock.patch.object(agent_core, "_stream_to_chat", side_effect=stream), \
+         mock.patch.object(agent_core.threading, "Thread", _InlineThread):
+        agent_core.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-cont")
+    sent = [c.args[1] for c in notify.send_text.call_args_list]
+    assert any("1 条消息没来得及处理" in m and "RuntimeError" in m for m in sent), sent
+    assert agent_core.thread_owner("t-cont") is None
+
+
+def test_a_consent_replay_waits_for_the_continuation_on_a_rebuilt_session():
+    """Injected into the running turn it would run on the session built before the grant
+    and wall again, with the parked message already spent."""
+    _fresh_claims()
+    agent_core.steer("t-r", "aside", "m1")
+    agent_core.steer("t-r", "replayed after consent", "m2", fresh=True)
+    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    out = mw.before_model({"messages": []}, _runtime("t-r"))
+    assert [m.content for m in out["messages"]] == ["aside"]
+    assert agent_core._pending_steer["t-r"] == [("replayed after consent", "m2", True)]
+    _fresh_claims()
+
+
+def test_the_claim_holder_repairs_its_own_thread():
+    """A claim is taken before the session is built, so the build-time repair sees the
+    thread as busy — and skipping then left a buried dangling call failing every turn."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langchain_core.messages import AIMessage as _AI
+    _fresh_claims()
+    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]), tools=[],
+                                    checkpointer=InMemorySaver(),
+                                    middleware=agent_core._middleware()[:2])
+    cfg = {"configurable": {"thread_id": "t-rep"}}
+    agent_core._run(graph.aupdate_state(cfg, {"messages": [
+        HumanMessage("q"),
+        _AI(content="", tool_calls=[{"name": "t", "args": {}, "id": "lost", "type": "tool_call"}]),
+        HumanMessage("asked again")]}, as_node="model"))
+    agent_core.try_claim("t-rep", "lark")
+    try:
+        assert agent_core._run(agent_core._arepair_interrupted_turn(graph, cfg)) == 0
+        assert agent_core._run(agent_core._arepair_interrupted_turn(graph, cfg, own_claim=True)) == 1
+    finally:
+        agent_core.release("t-rep")
+
+
+def test_the_sync_path_judges_consent_on_this_turns_tool_results_only():
+    """The returned state is the whole thread. Scanning all of it let one old "no user
+    token" result raise a consent prompt on every later sync turn."""
+    from langchain_core.messages import AIMessage as _AI, ToolMessage as _TM
+    seen = {}
+
+    class _Graph:
+        async def ainvoke(self, inp, config=None):
+            turn = inp["messages"][0]
+            seen["id"] = turn.id
+            return {"messages": [
+                HumanMessage("long ago", id="old"),
+                _AI(content="", tool_calls=[{"name": "lark_api", "args": {}, "id": "c0"}]),
+                _TM(content="no user token for this call", tool_call_id="c0", name="lark_api"),
+                _AI(content="old answer"),
+                turn, _AI(content="fresh answer")]}
+
+    session = {"graph": _Graph(), "config": {"configurable": {"thread_id": "t-sync"}},
+               "tool_texts": [], "consent": {}, "tool_idp": {}}
+    with mock.patch.object(agent_core, "_get_session", return_value=session):
+        out = agent_core.chat_result("lark:ou_x", "today's question", mem_sid="t-sync")
+    assert session["tool_texts"] == [], "an old tool result leaked into this turn"
+    assert out == {"reply": "fresh answer", "needs_auth": False}
 
 
 def test_images_are_attached_before_anything_downstream_can_see_them():
@@ -1510,7 +1866,7 @@ def test_agui_verifies_a_claimed_actor_rather_than_trusting_or_deriving_it():
     # Session building is what fetches the token and runs the ownership check; an unverified
     # claim surfaces as auth_url rather than as somebody else's conversation.
     assert "aget_session" in src and 'session.get("auth_url")' in src
-    assert '"threadId": session["mem_sid"]' in src
+    assert 'thread_id = session["mem_sid"]' in src and '"threadId": thread_id' in src
     assert 'payload.get("threadId")' not in src
 
 

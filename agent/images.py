@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
+import uuid
 
 import lark_notify
 
@@ -109,3 +111,69 @@ def blocks_for(handles: list[tuple[str, str]]) -> list[dict]:
                     "base64": base64.b64encode(data).decode(),
                     "mime_type": mime})
     return out
+
+
+# --- the attachments of the turn running on a thread --------------------------------
+# A turn's own attachments and any steered into it while it runs share one registry, keyed
+# by thread: a steered message joins a run whose config was fixed when it started, so the
+# config cannot carry what that message brought. Sound because a thread runs one turn at a
+# time. Pixels are bound to the message id they arrived with — attaching to "the last human
+# message" would hand the original picture to whatever was steered in after it — and the
+# handles are numbered across the turn, so save_attachment(3) can reach a file sent mid-turn.
+_lock = threading.Lock()
+_turns: dict[str, dict] = {}
+
+
+def prepare(handles: list[dict]) -> list[dict]:
+    """Fetch and downscale a message's pictures. Network, so done before any lock."""
+    return blocks_for([(h.get("message_id", ""), h.get("key", ""))
+                       for h in handles if h.get("kind") == IMAGE])
+
+
+def register(thread_id: str, handles: list[dict], blocks: list[dict]) -> tuple[str, str]:
+    """Join a message's attachments to the turn on this thread.
+
+    Returns the placeholder text to append to the message, and the message id its pixels
+    are bound to — the caller gives that id to the HumanMessage it sends. No network, so it
+    can run under the caller's lock, which is what keeps registering and claiming the
+    thread one step."""
+    message_id = "msg-" + uuid.uuid4().hex
+    if not handles:
+        return "", message_id
+    with _lock:
+        turn = _turns.setdefault(thread_id, {"pixels": {}, "handles": []})
+        start = len(turn["handles"]) + 1
+        turn["handles"].extend(handles)
+        if blocks:
+            turn["pixels"][message_id] = blocks
+    marks = []
+    for i, h in enumerate(handles, start=start):
+        if h.get("kind") == IMAGE:
+            mark = placeholder(i, h.get("message_id", ""), h.get("key", ""))
+            marks.append(mark if blocks else mark + " (no longer available)")
+        else:
+            marks.append(f"[attachment {i}: {h.get('name') or 'file'} — "
+                         f"call save_attachment({i}) to open it]")
+    return "\n".join(marks), message_id
+
+
+def add_to_turn(thread_id: str, handles: list[dict]) -> tuple[str, str]:
+    """prepare then register, for a caller that holds no lock."""
+    return register(thread_id, handles, prepare(handles))
+
+
+def pixels_for(thread_id: str) -> dict[str, list]:
+    with _lock:
+        return dict((_turns.get(thread_id) or {}).get("pixels") or {})
+
+
+def handles_for(thread_id: str) -> list[dict]:
+    with _lock:
+        return list((_turns.get(thread_id) or {}).get("handles") or [])
+
+
+def end_turn(thread_id: str) -> None:
+    """Forget the turn's attachments. Called when the turn ends, however it ends."""
+    with _lock:
+        _turns.pop(thread_id, None)
+

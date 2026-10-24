@@ -344,10 +344,12 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
 
     def save_attachment(which: int = 1, config: RunnableConfig = None) -> str:
         """Write something the user sent into the workspace, so code can open it."""
-        # Straight from the run config, never parsed out of the conversation: history
-        # also holds the model's own words, so a handle read from text could be one it
-        # invented — and a tenant token can read any chat this bot belongs to.
-        handles = ((config or {}).get("configurable") or {}).get("attachments") or []
+        # From the turn registry, keyed by the run's thread — never parsed out of the
+        # conversation: history also holds the model's own words, so a handle read from
+        # text could be one it invented, and a tenant token can read any chat this bot
+        # belongs to. The registry includes files steered in while the turn ran.
+        thread_id = ((config or {}).get("configurable") or {}).get("thread_id", "")
+        handles = images.handles_for(thread_id)
         if not handles:
             return ("Nothing came with this message. Ask the user to send the file again "
                     "in the message where they want it used.")
