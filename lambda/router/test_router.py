@@ -358,8 +358,20 @@ def test_the_context_line_shows_the_billed_size_next_to_the_threshold():
     import index
     line = index._context_line({"contextTokens": 9147, "cachedTokens": 5049},
                                {"settings": {"summarizeAt": 120000}})
-    assert line == "最近一次请求 9.1k token，其中 5.0k 命中缓存，超过 120.0k 时自动摘要"
+    assert line == "最近一次请求 9.1k token，超过 120.0k 时自动摘要"
     assert "发一条普通消息" in index._context_line({}, None)
+
+
+def test_the_cache_line_gives_the_latest_and_the_whole_threads_hit_rate():
+    """Figures from a real thread: the latest call almost all cached, the thread as a whole
+    less so — which is what says whether caching pays off across the conversation."""
+    import index
+    stats = {"contextTokens": 9147, "cachedTokens": 5049,
+             "inputTotal": 19166, "cachedTotal": 14845, "modelCalls": 3}
+    line = index._cache_line(stats, {"settings": {"cacheTtl": "1h"}})
+    assert line == "最近一次命中 55%，本线程累计 77%（3 次模型调用）"
+    assert index._cache_line(stats, {"settings": {"cacheTtl": ""}}) == "关闭"
+    assert "发一条普通消息" in index._cache_line({}, None)
 
 
 def test_tools_are_grouped_by_where_they_came_from_with_the_grant_they_need():
@@ -396,11 +408,6 @@ def test_tools_say_why_there_are_none():
     assert "探测未返回" in index._tools_text(None)
 
 
-def test_status_no_longer_carries_the_model_but_points_to_it():
-    import index
-    src = open(index.__file__, encoding="utf-8").read()
-    block = src[src.index('if cmd == "/status":'):src.index('if cmd == "/model":')]
-    assert "_model_line" not in block and "模型：发送 /model 查看" in block
 
 
 def test_add_reaction_returns_id_and_never_raises():
@@ -891,12 +898,25 @@ def test_a_failed_count_does_not_take_down_the_command():
         assert index.user_authorized("ses_x", "u1", "lark:ou_a", "lark") is False
 
 
-def test_status_does_not_manufacture_the_session_it_reports_as_absent():
+def test_context_does_not_manufacture_the_session_it_reports_as_absent():
     """Counting needs a runtime session, so counting eagerly created one — while the line
     above still said "not established". A diagnostic must not cause what it reports."""
     import index, inspect
     src = inspect.getsource(index.run_command)
-    i = src.index('cmd == "/status"')
-    block = src[i:i + 1400]
+    block = src[src.index('cmd == "/context"'):src.index('cmd == "/model"')]
     assert "get_or_create_session" not in block
     assert "（发一条普通消息后可见）" in block
+
+
+def test_status_shows_who_serves_you_and_points_at_the_rest():
+    """The runtime state stays in /status — the routing key, the microVM, the thread — and
+    what the thread holds moves to /context. Neither may create a session to report on."""
+    import index, inspect
+    src = inspect.getsource(index.run_command)
+    block = src[src.index('cmd == "/status"'):src.index('cmd == "/context"')]
+    assert "get_or_create_session" not in block
+    for line in ("会话路由键", "当前 microVM", "记忆线程", "最近活跃"):
+        assert line in block, line
+    for pointer in ("/context", "/model", "/tools", "/auth"):
+        assert pointer in block, pointer
+    assert "thread_stats" not in block, "turns and context size belong to /context"

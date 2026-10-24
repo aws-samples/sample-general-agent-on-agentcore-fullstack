@@ -1257,6 +1257,9 @@ def history_stats(actor_id: str, mem_sid: str = "") -> dict:
     # charges a flat 85 tokens per image. input_tokens already includes the cached part.
     usage = next((m.usage_metadata for m in reversed(ai)
                   if getattr(m, "usage_metadata", None)), None) or {}
+    # Every model call in the thread, for the cache hit rate over the conversation. Only
+    # what the checkpoint still holds: a compaction drops the older calls with their turns.
+    calls = [m.usage_metadata for m in ai if getattr(m, "usage_metadata", None)]
     return {
         "turns": sum(1 for m in ai if not (getattr(m, "tool_calls", None) or [])),
         "toolCalls": sum(len(getattr(m, "tool_calls", None) or []) for m in ai),
@@ -1264,6 +1267,10 @@ def history_stats(actor_id: str, mem_sid: str = "") -> dict:
                         if isinstance(m, (HumanMessage, AIMessage))),
         "contextTokens": usage.get("input_tokens", 0),
         "cachedTokens": (usage.get("input_token_details") or {}).get("cache_read", 0),
+        "modelCalls": len(calls),
+        "inputTotal": sum(u.get("input_tokens", 0) for u in calls),
+        "cachedTotal": sum((u.get("input_token_details") or {}).get("cache_read", 0)
+                           for u in calls),
     }
 
 

@@ -200,14 +200,26 @@ def _context_line(stats: dict, probe: dict | None) -> str:
     tokens = (stats or {}).get("contextTokens") or 0
     if not tokens:
         return "—（发一条普通消息后可见）"
-    cached = (stats or {}).get("cachedTokens") or 0
     at = (((probe or {}).get("settings") or {}).get("summarizeAt")) or 0
     parts = [f"最近一次请求 {_k(tokens)} token"]
-    if cached:
-        parts.append(f"其中 {_k(cached)} 命中缓存")
     if at:
         parts.append(f"超过 {_k(at)} 时自动摘要")
     return "，".join(parts)
+
+
+def _cache_line(stats: dict, probe: dict | None) -> str:
+    """How much of the input came from the cache: for the latest call, and summed over the
+    thread's calls, which says whether caching is paying off across the conversation."""
+    settings = (probe or {}).get("settings") or {}
+    if settings and not settings.get("cacheTtl"):
+        return "关闭"
+    stats = stats or {}
+    if not stats.get("contextTokens"):
+        return "—（发一条普通消息后可见）"
+    rate = lambda hit, total: f"{hit / total:.0%}" if total else "—"
+    return (f"最近一次命中 {rate(stats.get('cachedTokens', 0), stats['contextTokens'])}，"
+            f"本线程累计 {rate(stats.get('cachedTotal', 0), stats.get('inputTotal', 0))}"
+            f"（{stats.get('modelCalls', 0)} 次模型调用）")
 
 
 def _model_text(data: dict | None) -> str:
@@ -226,7 +238,7 @@ def _model_text(data: dict | None) -> str:
          else "上下文压缩：关闭"),
         ("系统提示词：自定义（" if s.get("systemPromptCustom") else "系统提示词：默认（")
         + f"{s.get('systemPromptChars', 0)} 字符）",
-        "当前对话的上下文大小：发送 /status 查看",
+        "当前对话的上下文大小：发送 /context 查看",
     ])
 
 
@@ -263,7 +275,7 @@ def _compact_text(data: dict | None) -> str:
     if data.get("compacted"):
         return (f"已压缩：较早的 {data['compacted']} 条消息合并为一段摘要，"
                 f"保留最近 {data.get('kept', 0)} 条。下一次请求起上下文会变小，"
-                "发送 /status 可查看。")
+                "发送 /context 可查看。")
     return {
         "busy": "这一轮还在回答中，等它结束后再压缩。",
         "short": "对话还很短，没有需要压缩的内容。",
@@ -581,7 +593,8 @@ _HELP = "\n".join([
     "可用命令：",
     "  /auth        查看各 IdP 的授权状态",
     "  /auth <idp>  对该 IdP 授权或重新授权",
-    "  /status      当前身份、会话与对话记录",
+    "  /status      当前身份、会话与服务你的 microVM",
+    "  /context     对话轮数、上下文大小与 prompt cache 命中率",
     "  /model       当前模型与上下文设置",
     "  /tools       当前可用的工具，按来源分组",
     "  /new         开启新的对话（切换运行实例）",
@@ -664,31 +677,48 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
 
     # Read-only diagnostics over three independent dimensions: the session id that routes
     # you, the container currently serving it, and the thread holding your history.
+    # Who is serving you and where: identity, the session id that routes you, the
+    # container currently serving it, and the thread holding your history. What that
+    # thread holds is /context's; the rest each have a command, pointed at below.
     if cmd == "/status":
         info = identity.session_info(user_id)
         rt_sid = info.get("sessionId", "")
         mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        # Counting needs a runtime session, so with no routing key yet report it as
-        # unavailable rather than create one: a diagnostic must not cause what it reports.
-        stats = thread_stats(rt_sid, user_id, actor_id, mem_sid) if rt_sid else {}
         probe = probe_agent(rt_sid, user_id, actor_id)
         last = info.get("lastActivity", 0)
         last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
                     .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
-        logger.info("status for %s: %s", actor_id, stats or "unknown")
         return {"text": "\n".join([
             f"应用身份：{_app_identity()}",
             f"用户身份：{actor_id}",
             f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
             f"当前 microVM：{_microvm_line(rt_sid, probe)}",
             f"记忆线程：{mem_sid}",
+            f"最近活跃：{last_str}",
+            "上下文：发送 /context 查看",
+            "模型：发送 /model 查看",
+            "工具：发送 /tools 查看",
+            "授权状态：发送 /auth 查看",
+        ])}
+
+    # What the thread holds and what it costs: turns, the context size the last request
+    # was billed for, and how much of the input the prompt cache served.
+    if cmd == "/context":
+        info = identity.session_info(user_id)
+        rt_sid = info.get("sessionId", "")
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        # Counting needs a runtime session, so with no routing key yet report it as
+        # unavailable rather than create one: a diagnostic must not cause what it reports.
+        stats = thread_stats(rt_sid, user_id, actor_id, mem_sid) if rt_sid else {}
+        probe = probe_agent(rt_sid, user_id, actor_id) if rt_sid else None
+        logger.info("context for %s: %s", actor_id, stats or "unknown")
+        return {"text": "\n".join([
             (f"该线程对话：{stats['turns']} 轮"
              f"（含 {stats['toolCalls']} 次工具调用）" if stats
              else "该线程对话：—（发一条普通消息后可见）"),
-            f"上下文：{_context_line(stats, probe)}",
-            f"最近活跃：{last_str}",
-            "授权状态：发送 /auth 查看",
-            "模型：发送 /model 查看",
+            f"上下文大小：{_context_line(stats, probe)}",
+            f"Prompt cache：{_cache_line(stats, probe)}",
+            "压缩较早的对话：发送 /compact",
         ])}
 
     if cmd == "/model":

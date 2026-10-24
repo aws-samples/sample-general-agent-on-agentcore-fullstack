@@ -976,14 +976,16 @@ def test_history_stats_counts_a_turn_only_when_an_answer_was_delivered():
     with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
         assert agent_core.history_stats("lark:ou_x", "sess-1") == {
             "turns": 1, "toolCalls": 1, "messages": 3,
-            "contextTokens": 0, "cachedTokens": 0}
+            "contextTokens": 0, "cachedTokens": 0,
+            "modelCalls": 0, "inputTotal": 0, "cachedTotal": 0}
 
 
 def test_history_stats_reports_zero_for_an_untouched_thread():
     with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(None)):
         assert agent_core.history_stats("lark:ou_x", "sess-1") == {
             "turns": 0, "toolCalls": 0, "messages": 0,
-            "contextTokens": 0, "cachedTokens": 0}
+            "contextTokens": 0, "cachedTokens": 0,
+            "modelCalls": 0, "inputTotal": 0, "cachedTotal": 0}
 
 
 def test_context_size_is_the_latest_calls_billed_input_not_an_estimate():
@@ -999,6 +1001,8 @@ def test_context_size_is_the_latest_calls_billed_input_not_an_estimate():
     with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
         out = agent_core.history_stats("lark:ou_x", "sess-1")
     assert (out["contextTokens"], out["cachedTokens"]) == (9147, 5049)
+    # Summed over every call still in the checkpoint, for the thread's hit rate.
+    assert (out["modelCalls"], out["inputTotal"], out["cachedTotal"]) == (2, 14115, 9881)
 
 
 def _compactable(turns: int, summary: str):
