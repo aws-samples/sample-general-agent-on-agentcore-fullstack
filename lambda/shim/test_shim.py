@@ -176,6 +176,20 @@ def test_return_url_reports_a_failed_completion():
     assert r["statusCode"] == 502 and "AccessDeniedException" in r["body"]
 
 
+def test_the_return_page_escapes_what_it_reports_and_runs_no_script():
+    import base64
+    st = base64.urlsafe_b64encode(b"lark:ou_x").decode().rstrip("=")
+    payload = mock.Mock()
+    payload.read.return_value = b'{"ok": false, "error": "bad session <script>alert(1)</script>"}'
+    with mock.patch.object(index, "_ROUTER_FUNCTION", "router-fn"), \
+         mock.patch.object(index, "_lambda") as lam:
+        lam.invoke.return_value = {"Payload": payload}
+        r = index.handler(_evt("GET", "/return",
+                               qs={"session_id": "sess-uri", "state": st}), None)
+    assert "<script>" not in r["body"] and "&lt;script&gt;" in r["body"]
+    assert "default-src 'none'" in r["headers"]["Content-Security-Policy"]
+
+
 def test_return_url_missing_userid():
     r = index.handler(_evt("GET", "/return", qs={"session_id": "sess-uri"}), None)
     assert r["statusCode"] == 400 and "userId" in r["body"]

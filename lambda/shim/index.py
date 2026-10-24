@@ -19,6 +19,7 @@ with accounts. in place of open., which holds for Lark and Feishu alike.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import logging
 import os
@@ -215,8 +216,7 @@ def handle_return(qs: dict) -> dict:
     # Keeping the minting there also keeps the password salt out of this façade.
     err = _complete_via_router(user_id, session_id)
     if err:
-        return {"statusCode": 502, "headers": {"Content-Type": "text/html"},
-                "body": f"<h3>Authorization failed</h3><p>{err}</p>"}
+        return _page(502, "Authorization failed", err)
     # Tell the user in chat — the browser only sees this static page, and the
     # router can't reliably detect completion by polling (a re-auth keeps the old
     # token until the new one lands). This is the precise signal.
@@ -226,8 +226,19 @@ def handle_return(qs: dict) -> dict:
     # notify so a resumed answer, not a "you can ask now", is what they see.
     _resume_router(user_id)
     _notify_chat(user_id, "✅ 授权成功，正在继续处理…")
-    return {"statusCode": 200, "headers": {"Content-Type": "text/html"},
-            "body": "<h3>Authorized</h3><p>You can close this tab and return to the chat.</p>"}
+    return _page(200, "Authorized", "You can close this tab and return to the chat.")
+
+
+# The error text can carry what the query string brought in, so it is escaped, and the page
+# runs no script at all.
+_PAGE_HEADERS = {"Content-Type": "text/html; charset=utf-8",
+                 "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+                 "X-Content-Type-Options": "nosniff"}
+
+
+def _page(status: int, title: str, text: str) -> dict:
+    return {"statusCode": status, "headers": _PAGE_HEADERS,
+            "body": f"<h3>{html.escape(title)}</h3><p>{html.escape(str(text))}</p>"}
 
 
 def _post_json(url: str, body: dict, bearer: str = "") -> dict:
