@@ -1,4 +1,6 @@
-// Measurement MCP server: answers "is one runtime session served by one instance?"
+// Measurement MCP server for AgentCore's own behaviour — which instance serves a session,
+// whether sessions are isolated, how V1 and V2 differ, and what a Gateway forwards. An MCP
+// server because one can be invoked as a Runtime directly and also put behind a Gateway.
 //
 // Built for the Runtime V2 question, where the usual discriminators stop working: a
 // snapshot is copied to every restored instance, so hostname is always `localhost`,
@@ -13,6 +15,11 @@
 //   marker     — whether a file this process wrote on its first request is still there.
 //                A second opinion on `calls`, immune to a counter being reset.
 //   kernelAge  — /proc/uptime, maintained by the kernel rather than by this process.
+// And two for the Gateway path:
+//   mcpSessionId — the Mcp-Session-Id the request was routed with.
+//   authorization — scheme, sha256 prefix and length of the inbound Authorization header:
+//                   enough to tell whether a Gateway injected a credential and whether it
+//                   changed between calls, never the value itself.
 'use strict';
 
 const http = require('http');
@@ -29,7 +36,15 @@ function kernelAge() {
   catch { return null; }
 }
 
-function observe(sessionId) {
+function digest(value) {
+  if (!value) return null;
+  const [scheme, ...rest] = value.split(' ');
+  const secret = rest.join(' ');
+  return `${scheme} …${crypto.createHash('sha256').update(secret).digest('hex').slice(0, 8)} (len=${secret.length})`;
+}
+
+function observe(headers) {
+  const sessionId = headers['x-amzn-bedrock-agentcore-runtime-session-id'] || '';
   calls += 1;
   const markerExisted = fs.existsSync(MARKER);
   if (!markerExisted) fs.writeFileSync(MARKER, String(Date.now()));
@@ -42,6 +57,8 @@ function observe(sessionId) {
     pid: process.pid,
     hostname: require('os').hostname(),
     sessionId: sessionId ? sessionId.slice(0, 16) : null,
+    mcpSessionId: headers['mcp-session-id'] || null,
+    authorization: digest(headers.authorization),
   };
 }
 
@@ -61,7 +78,6 @@ http.createServer((req, res) => {  // nosemgrep: using-http-server — TLS termi
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
-    const sid = req.headers['x-amzn-bedrock-agentcore-runtime-session-id'] || '';
     let mcp; try { mcp = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
     if (mcp.method === 'initialize') {
       return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
@@ -76,14 +92,14 @@ http.createServer((req, res) => {  // nosemgrep: using-http-server — TLS termi
     // runtime itself is invoked. Session affinity is a property of that shape, not of a
     // per-call MCP connection, so the comparison has to be made here.
     if (!mcp.method) {
-      const obs = observe(sid);
+      const obs = observe(req.headers);
       console.log('probe ' + JSON.stringify(obs));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(obs));
       return;
     }
     if (mcp.method === 'tools/call') {
-      const obs = observe(sid);
+      const obs = observe(req.headers);
       console.log('probe ' + JSON.stringify(obs));
       return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
         content: [{ type: 'text', text: JSON.stringify(obs) }] } });

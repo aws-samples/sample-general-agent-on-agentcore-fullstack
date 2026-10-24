@@ -83,7 +83,7 @@
 | `deploy.sh` | 部署入口——按顺序编排 `scripts/` 里的各个步骤 |
 | `scripts/` | 各步骤的具体实现:preflight / provision(base/memory/code/runtime/gateway/a2a/webui)/ build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
 | `tests/` | `run.sh`(全部单元测试套件)+ 需要已部署环境的端到端 smoke test |
-| `probe/` | 一个仅用于测量的 MCP server,不是产品部署的一部分——`docs/agentcore-behavior.md` 里的结论就是靠它建立的 |
+| `mcp-servers/probe/` | 一个仅用于测量的 MCP server,不是产品部署的一部分——`docs/agentcore-behavior.md` 里的结论就是靠它建立的 |
 
 ## 快速开始
 

@@ -83,7 +83,7 @@ Four layers ship switched off, because each adds cost or console work: `WEB_SEAR
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
 | `scripts/` | step implementations: preflight / provision (base/memory/code/runtime/gateway/a2a/webui) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
 | `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
-| `probe/` | a measurement MCP server, not part of the deployed agent — how the findings in `docs/agentcore-behavior.md` were established |
+| `mcp-servers/probe/` | a measurement MCP server, not part of the deployed agent — how the findings in `docs/agentcore-behavior.md` were established |
 
 ## Quick start
 
