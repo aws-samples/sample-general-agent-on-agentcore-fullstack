@@ -74,8 +74,11 @@ def _ap_path(actor_id: str) -> str:
 def _access_point_for(actor_id: str) -> str:
     """Get or create this user's Access Point, returning its ARN.
 
-    Idempotent by `clientToken`: a stable hash of the actor, so a second call returns the
-    same Access Point instead of creating a rival one. `rootDirectory` is fixed here and
+    Idempotent by `clientToken`: a stable hash of the file system and the actor, so a second
+    call returns the same Access Point instead of creating a rival one. The file system is in
+    it because S3 Files scopes the token to the account and region, not to the file system:
+    keyed on the actor alone, a second deployment's create for the same user was refused as
+    that user's Access Point in the first (measured, ConflictException). `rootDirectory` is fixed here and
     enforced server-side, which is what keeps a mount from seeing another user's prefix
     however the sandbox behaves."""
     s3files = boto3.client("s3files", region_name=_REGION)
@@ -85,7 +88,7 @@ def _access_point_for(actor_id: str) -> str:
             return ap["accessPointArn"]
     r = s3files.create_access_point(
         fileSystemId=_fs_id(),
-        clientToken=hashlib.sha256(actor_id.encode()).hexdigest()[:64],
+        clientToken=hashlib.sha256(f"{_fs_id()}:{actor_id}".encode()).hexdigest()[:64],
         tags=[{"key": "actor", "value": actor_id}],
         # 1000/1000 rather than root: files land owned by an unprivileged uid, and the
         # sandbox sees only this subtree anyway.

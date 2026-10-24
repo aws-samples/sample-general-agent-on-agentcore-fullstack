@@ -398,3 +398,21 @@ def test_an_edited_image_is_sent_so_it_shows_rather_than_downloads(_lark):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_the_access_point_token_is_per_file_system_not_per_actor():
+    """S3 Files dedupes clientToken across the account and region; one keyed on the actor
+    alone made a second deployment's create collide with the first's Access Point."""
+    tokens = []
+    fake = mock.Mock()
+    fake.list_access_points.return_value = {"accessPoints": []}
+    fake.create_access_point.side_effect = lambda **kw: tokens.append(kw["clientToken"]) or {
+        "accessPointArn": "arn:ap"}
+    with mock.patch.object(code_tools.boto3, "client", return_value=fake):
+        for fs in ("arn:aws:s3files:r:1:file-system/fs-a", "arn:aws:s3files:r:1:file-system/fs-b"):
+            with mock.patch.object(code_tools, "_FS_ARN", fs):
+                code_tools._access_point_for("lark:ou_same")
+        with mock.patch.object(code_tools, "_FS_ARN", "arn:aws:s3files:r:1:file-system/fs-a"):
+            code_tools._access_point_for("lark:ou_same")
+    assert tokens[0] != tokens[1], "same user, two file systems: tokens must differ"
+    assert tokens[0] == tokens[2], "same user, same file system: the retry must be idempotent"
