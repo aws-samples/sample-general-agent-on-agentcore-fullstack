@@ -22,19 +22,7 @@ set -euo pipefail
 # a syntax error halfway through a deploy.
 {
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
-
-# Deployment target: command-line env vars win over .env, which wins over defaults.
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
-[ -f .env ] && { set -a; . ./.env; set +a; }
-PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
-REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-PREFIX="agentcore-fullstack"
-# boto3 reads AWS_DEFAULT_REGION or the profile's region, never AWS_REGION.
-export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION"
-# Credentials already in the environment outrank .env's profile.
-[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"

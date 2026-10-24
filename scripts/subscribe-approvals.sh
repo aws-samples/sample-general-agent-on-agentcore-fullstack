@@ -11,10 +11,7 @@
 # Usage: scripts/subscribe-approvals.sh [--unsubscribe]
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
-
-[ -f .env ] && { set -a; . ./.env; set +a; }
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 
 ACTION="subscribe"
 [ "${1:-}" = "--unsubscribe" ] && ACTION="unsubscribe"

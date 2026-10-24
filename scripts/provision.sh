@@ -19,31 +19,20 @@ set -euo pipefail
 # a syntax error halfway through a deploy.
 {
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
-
-# Deployment target: command-line env vars win over .env, which wins over defaults.
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
-_CLI_FILES="${FILES_STORAGE:-}" _CLI_NAT="${NAT_GATEWAY:-}" _CLI_BUILD="${AGENT_BUILD:-}"
-[ -f .env ] && { set -a; . ./.env; set +a; }
-PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
-REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
+WEB_SEARCH="${WEB_SEARCH:-false}"
 # Code execution and its per-user workspace. Off by default: it adds a VPC (the sandbox
 # reaches S3 via a free gateway endpoint) and an S3 Files file system. NAT_GATEWAY adds a
 # NAT to that VPC so the sandbox has internet; it means nothing without FILES_STORAGE.
 # See docs/architecture.md.
-FILES_STORAGE="${_CLI_FILES:-${FILES_STORAGE:-false}}"
-NAT_GATEWAY="${_CLI_NAT:-${NAT_GATEWAY:-false}}"
+FILES_STORAGE="${FILES_STORAGE:-false}"
+NAT_GATEWAY="${NAT_GATEWAY:-false}"
 [ "$FILES_STORAGE" = "true" ] || NAT_GATEWAY=false
 # Where the agent image is built: CodeBuild (ARM64 native, no local Docker) unless .env
 # asks for the host's Docker.
-AGENT_BUILD="${_CLI_BUILD:-${AGENT_BUILD:-codebuild}}"
+AGENT_BUILD="${AGENT_BUILD:-codebuild}"
 case "$AGENT_BUILD" in codebuild|local) ;; *) echo "AGENT_BUILD must be codebuild or local, not '$AGENT_BUILD'"; exit 1 ;; esac
-PREFIX="agentcore-fullstack"
-export AWS_REGION="$REGION" UV_LINK_MODE=copy
-# Credentials already in the environment outrank .env's profile.
-[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
+export UV_LINK_MODE=copy
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"

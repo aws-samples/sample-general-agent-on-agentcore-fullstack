@@ -13,14 +13,7 @@
 # Usage: [PROFILE=p REGION=r] scripts/a2a-demo.sh [question]
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
-
-[ -f .env ] && { set -a; . ./.env; set +a; }
-REGION="${REGION:-us-west-2}"
-PREFIX="agentcore-fullstack"
-export AWS_REGION="$REGION"
-[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "${PROFILE:-}" ] && export AWS_PROFILE="$PROFILE"; } || true
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 
 QUESTION="${1:-列出我最近的文档}"
 ACTOR="lark:${LARK_ADMIN_OPEN_ID:?LARK_ADMIN_OPEN_ID must be set in .env}"

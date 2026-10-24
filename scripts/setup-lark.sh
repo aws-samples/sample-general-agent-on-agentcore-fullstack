@@ -16,19 +16,7 @@
 # Fill .env (see .env.example) BEFORE running this.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
-
-[ -f .env ] || { echo "missing .env — copy .env.example to .env and fill it in"; exit 1; }
-# Deployment target: command-line env vars win over .env, which wins over defaults.
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
-set -a; . ./.env; set +a
-PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
-REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-PREFIX="agentcore-fullstack"
-export AWS_REGION="$REGION"
-# Credentials already in the environment outrank .env's profile.
-[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 TABLE="$PREFIX-identity"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }

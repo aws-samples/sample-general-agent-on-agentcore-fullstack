@@ -18,17 +18,7 @@ set -euo pipefail
 # a syntax error halfway through a deploy.
 {
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-
-# Deployment target: command-line env vars win over .env, which wins over defaults.
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
-[ -f .env ] && { set -a; . ./.env; set +a; }
-PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds
-REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-PREFIX="agentcore-fullstack"
-export AWS_REGION="$REGION"
-# Credentials already in the environment outrank .env's profile.
-[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.86}"   # engine = official lark-cli (not lark-mcp)

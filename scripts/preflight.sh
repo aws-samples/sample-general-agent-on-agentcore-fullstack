@@ -8,25 +8,9 @@
 # Usage: [PROFILE=p REGION=r] scripts/preflight.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
-
-# Command-line env vars win over .env, which wins over defaults (same as deploy.sh).
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
-_CLI_BUILD="${AGENT_BUILD:-}"
-[ -f .env ] && { set -a; . ./.env; set +a; }
-PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"
-REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
-AGENT_BUILD="${_CLI_BUILD:-${AGENT_BUILD:-codebuild}}"
-export AWS_REGION="$REGION"
-# Credentials already in the environment outrank .env's profile — otherwise this
-# would report (and check) an identity other than the one the caller supplied.
-if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
-  PROFILE=""
-elif [ -n "$PROFILE" ]; then
-  export AWS_PROFILE="$PROFILE"
-fi
+. "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
+WEB_SEARCH="${WEB_SEARCH:-false}"
+AGENT_BUILD="${AGENT_BUILD:-codebuild}"
 
 fail() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 

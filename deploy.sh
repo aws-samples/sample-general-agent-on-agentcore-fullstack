@@ -23,24 +23,7 @@ set -euo pipefail
 # made while this runs (an editor, another session) shifts what it reads next — measured as
 # a syntax error halfway through a deploy.
 {
-cd "$(cd "$(dirname "$0")" && pwd)"
-
-PREFIX="agentcore-fullstack"
-# .env holds the config, but an env var given on the command line has to win —
-# sourcing with `set -a` would otherwise clobber what the caller just asked for.
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
-_CLI_FILES="${FILES_STORAGE:-}" _CLI_NAT="${NAT_GATEWAY:-}" _CLI_BUILD="${AGENT_BUILD:-}"
-[ -f .env ] && { set -a; . ./.env; set +a; }
-PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"
-REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-export AWS_REGION="$REGION"
-# Credentials already in the environment outrank .env's profile.
-[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
-# Each step re-sources .env, so an override has to be exported to reach them.
-[ -n "$_CLI_WEB_SEARCH" ] && export WEB_SEARCH="$_CLI_WEB_SEARCH"
-[ -n "$_CLI_FILES" ] && export FILES_STORAGE="$_CLI_FILES"
-[ -n "$_CLI_NAT" ] && export NAT_GATEWAY="$_CLI_NAT"
-[ -n "$_CLI_BUILD" ] && export AGENT_BUILD="$_CLI_BUILD"
+. "$(cd "$(dirname "$0")" && pwd)/scripts/lib/env.sh"
 
 step() { printf '\n\033[1;36m### %s\033[0m\n' "$*"; }
 note() { printf '\033[1;33m%s\033[0m\n' "$*"; }
