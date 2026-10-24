@@ -265,8 +265,8 @@ async function runCommand(command) {
 }
 
 async function ask(content) {
-  // Neither actorId nor threadId carries authority: the agent verifies the actor against
-  // the vaulted token's real owner, and derives the thread from it.
+  // Neither actorId nor threadId carries authority: the agent takes the actor from the
+  // verified bearer, and derives the thread from it.
   // No thread id: it addresses a conversation by user alone, so a forged one would read
   // somebody else's. The agent resolves it — and because this tab shares the router's
   // runtime session id, it lands in the same container and inherits the same thread.

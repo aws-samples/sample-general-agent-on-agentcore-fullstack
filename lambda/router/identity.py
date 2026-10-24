@@ -178,6 +178,20 @@ def session_info(user_id: str) -> dict:
             "lastActivity": int(item.get("lastActivity", 0) or 0)}
 
 
+def _default_thread(actor_id: str) -> str:
+    return "sess-" + hashlib.sha256(actor_id.encode()).hexdigest()[:32]
+
+
+def thread_belongs(actor_id: str, mem_sid: str) -> bool:
+    """The agent honours a thread only under the actor's own prefix — the checkpoint is
+    keyed by thread id alone and the default is computable by anyone. Kept in step with
+    agent_core.thread_belongs."""
+    default = _default_thread(actor_id)
+    suffix = mem_sid[len(default) + 1:] if mem_sid.startswith(default + "-") else ""
+    return mem_sid == default or (len(suffix) == 12
+                                  and all(c in "0123456789abcdef" for c in suffix))
+
+
 def get_or_create_memory_session(user_id: str, actor_id: str) -> str:
     """The Memory thread the agent writes history under. Stored separately from the
     runtime session so the two can be rotated independently: /reset rotates only
@@ -185,18 +199,23 @@ def get_or_create_memory_session(user_id: str, actor_id: str) -> str:
     means "use a new id" — no events are deleted."""
     item = _table.get_item(Key={"PK": f"USER#{user_id}", "SK": "MEMSESSION"}).get("Item")
     if item and item.get("memorySessionId"):
-        return item["memorySessionId"]
+        if thread_belongs(actor_id, item["memorySessionId"]):
+            return item["memorySessionId"]
+        # A rotated id from before threads carried the actor's prefix: the agent refuses it
+        # now, so it is replaced once. The thread is kept, just no longer read.
+        log.info("memory session for %s predates the actor prefix; rotating", actor_id)
+        return rotate_memory_session(user_id, actor_id)
     # Seed with the agent's legacy per-user id so existing history stays visible.
-    mem_sid = "sess-" + hashlib.sha256(actor_id.encode()).hexdigest()[:32]
+    mem_sid = _default_thread(actor_id)
     _table.put_item(Item={"PK": f"USER#{user_id}", "SK": "MEMSESSION",
                           "memorySessionId": mem_sid, "createdAt": int(time.time())})
     return mem_sid
 
 
-def rotate_memory_session(user_id: str) -> str:
+def rotate_memory_session(user_id: str, actor_id: str) -> str:
     """Point the user at a brand-new Memory thread (old events are kept, just no
-    longer read). Returns the new id."""
-    mem_sid = f"sess-{uuid.uuid4().hex}"
+    longer read). Returns the new id, under the actor's prefix."""
+    mem_sid = f"{_default_thread(actor_id)}-{uuid.uuid4().hex[:12]}"
     _table.put_item(Item={"PK": f"USER#{user_id}", "SK": "MEMSESSION",
                           "memorySessionId": mem_sid, "createdAt": int(time.time())})
     return mem_sid

@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import boto3
@@ -190,6 +192,70 @@ def upload_image(data: bytes, name: str = "cover.jpg", timeout: int = 120) -> st
     return key
 
 
+def _seg(value: str) -> str:
+    """An id as one path segment. Ids that reach a URL can come from a request, and one
+    carrying `?` or `/` would address a different endpoint — `messages/{id}?` is the recall
+    endpoint, not the reaction one — so anything but an id's own characters is refused."""
+    if not re.fullmatch(r"[A-Za-z0-9_=-]+", value or ""):
+        raise ValueError(f"not an id: {value!r}")
+    return value
+
+
+def _get(path: str) -> dict:
+    tok = _tenant_token()
+    if not tok:
+        return {"code": -1, "msg": "no tenant token"}
+    req = urllib.request.Request(f"{_API_DOMAIN}{path}",
+                                 headers={"Authorization": f"Bearer {tok}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
+            return json.loads(r.read().decode())
+    except Exception as e:  # noqa: BLE001 — callers read the code
+        return {"code": -1, "msg": f"{type(e).__name__}: {e}"}
+
+
+# A chat a caller names is only acted on — answered into, its pictures read — when the
+# caller is in it: the bot's tenant token reaches every chat the bot is in. Membership is
+# cached for a while, since it is asked every turn.
+_MEMBER_TTL = 600
+_members: dict[tuple[str, str], float] = {}
+
+
+def in_chat(chat_id: str, open_id: str) -> bool:
+    """Whether `open_id` is a member of `chat_id` — a p2p chat lists the user too
+    (measured). False when Lark cannot say."""
+    if not (chat_id and open_id):
+        return False
+    if time.monotonic() - _members.get((chat_id, open_id), -_MEMBER_TTL) < _MEMBER_TTL:
+        return True
+    token = ""
+    for _ in range(50):          # 50 pages of 100: past that, refuse rather than walk on
+        q = urllib.parse.urlencode({"member_id_type": "open_id", "page_size": 100,
+                                    **({"page_token": token} if token else {})})
+        body = _get(f"/open-apis/im/v1/chats/{_seg(chat_id)}/members?{q}")
+        if body.get("code") not in (0, "0"):
+            log.warning("could not read members of %s: %s", chat_id, body.get("msg"))
+            return False
+        data = body.get("data") or {}
+        if any(m.get("member_id") == open_id for m in data.get("items") or []):
+            _members[(chat_id, open_id)] = time.monotonic()
+            return True
+        token = data.get("page_token") or ""
+        if not data.get("has_more") or not token:
+            return False
+    return False
+
+
+def chat_of(message_id: str) -> str:
+    """The chat a message was sent in, or "" when Lark cannot say."""
+    try:
+        body = _get(f"/open-apis/im/v1/messages/{_seg(message_id)}")
+    except ValueError:
+        return ""
+    items = (body.get("data") or {}).get("items") or []
+    return (items[0].get("chat_id") or "") if items else ""
+
+
 def fetch_message_resource(message_id: str, key: str, kind: str = "image") -> bytes:
     """The bytes of something somebody sent, read back from the message that carried it.
 
@@ -200,8 +266,11 @@ def fetch_message_resource(message_id: str, key: str, kind: str = "image") -> by
     tok = _tenant_token()
     if not tok:
         raise LarkError("no tenant token, so the attachment cannot be read")
-    url = (f"{_API_DOMAIN}/open-apis/im/v1/messages/{message_id}"
-           f"/resources/{key}?type={kind}")
+    try:
+        url = (f"{_API_DOMAIN}/open-apis/im/v1/messages/{_seg(message_id)}"
+               f"/resources/{_seg(key)}?type={'file' if kind == 'file' else 'image'}")
+    except ValueError as e:
+        raise LarkError(f"this attachment cannot be read: {e}") from e
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
@@ -270,9 +339,12 @@ def remove_reaction(message_id: str, reaction_id: str) -> bool:
     tok = _tenant_token()
     if not tok:
         return False
-    body = _call("DELETE",
-                 f"{_API_DOMAIN}/open-apis/im/v1/messages/{message_id}"
-                 f"/reactions/{reaction_id}", {}, bearer=tok)
+    try:
+        path = f"/open-apis/im/v1/messages/{_seg(message_id)}/reactions/{_seg(reaction_id)}"
+    except ValueError:
+        log.warning("refusing to remove a reaction by a malformed id")
+        return False
+    body = _call("DELETE", f"{_API_DOMAIN}{path}", {}, bearer=tok)
     if body.get("code") not in (0, "0"):
         log.warning("remove reaction failed: %s", body.get("msg", body))
         return False

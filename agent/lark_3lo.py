@@ -164,32 +164,6 @@ def pending_session_id(authorization_url: str | None) -> str:
         return "?"
 
 
-def actor_from_workload_token(workload_token: str) -> tuple[str, str]:
-    """Who this request is, derived rather than declared → ("actor", "lark:{open_id}").
-
-    A browser on the AG-UI path and a peer on the A2A path cannot be trusted to name a user:
-    that would be naming whose conversation and whose files to open. The workload token the
-    platform derived from the verified JWT already scopes the vault lookup, and Lark itself
-    says who the resulting token belongs to.
-
-    ("needs_consent", "") when nothing is vaulted — the actor is unknowable then, and a web
-    or peer turn cannot start a consent flow because completing one needs the actor in
-    `state`. Authorising once in Lark chat is the way in."""
-    try:
-        resp = _fetch_vaulted(workload_token, "resolve")
-    except Exception:  # noqa: BLE001
-        log.exception("could not resolve the caller from the workload token")
-        return "error", ""
-    token = resp.get("accessToken")
-    if not token:
-        return "needs_consent", ""
-    owner = _token_owner(token)
-    if not owner:
-        log.error("vaulted token has no establishable owner — refusing it")
-        return "error", ""
-    return "actor", f"lark:{owner}"
-
-
 def get_user_lark_token(actor_id: str, force: bool = False,
                         workload_token: str = "") -> tuple[str, str]:
     """Return ("token", <lark token>) if vaulted, else ("auth_url", <url>).
@@ -199,9 +173,8 @@ def get_user_lark_token(actor_id: str, force: bool = False,
     vaulted token.
 
     `workload_token` is the workload access token the Runtime delivered with this
-    request, derived from the caller's verified JWT. Passing it is what makes the
-    identity unforgeable: this code never gets to *name* a user, it can only use the one
-    the platform already authenticated. Absent it (no CUSTOM_JWT inbound) we fall back to
+    request, derived from the caller's verified JWT. Passing it is what scopes the vault
+    lookup to the caller: a token fetched is theirs, whichever actor is named. Absent it (no CUSTOM_JWT inbound) we fall back to
     deriving one from actor_id, which is a trusted-caller assumption — and a different
     vault namespace, so the two are not interchangeable for an existing deployment.
 
@@ -255,8 +228,7 @@ def _workload_token_for(actor_id: str, workload_token: str = "") -> str:
     """The workload identity to fetch a vaulted token under.
 
     The platform's own token when there is one: derived from the verified inbound JWT, which
-    is what makes the identity unforgeable — this code never names a user, it uses the one
-    already authenticated. Falling back to ForUserId is a trusted-caller assumption *and* a
+    scopes the lookup to the caller — this code never names whose grant to read. Falling back to ForUserId is a trusted-caller assumption *and* a
     different vault namespace, so the two are not interchangeable for a deployment that has
     consents already."""
     if workload_token:

@@ -23,6 +23,8 @@ uvicorn>=0.30.0
 bedrock-agentcore>=0.1.0
 mcp>=1.23.0
 httpx>=0.27.0
+# Verifies the caller's Cognito access token against the pool's keys (caller.py).
+pyjwt[crypto]>=2.10.0
 # Downscales an image a user sent before it reaches the model: cost is by pixel area, and
 # past a long edge of ~1568 px the model gains no detail. Floor is 13.0.0 because every
 # release up to 12.3.0 is affected by the vulnerabilities fixed there.

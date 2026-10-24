@@ -339,6 +339,9 @@ print(json.dumps({
     "roleArn": e["ROLE"],
     "networkConfiguration": net,
     "protocolConfiguration": {"serverProtocol": "HTTP"},
+    # The agent verifies the caller's token itself and takes the actor from it (caller.py);
+    # Authorization is stripped at the edge unless listed.
+    "requestHeaderConfiguration": {"requestHeaderAllowlist": ["Authorization"]},
     "environmentVariables": {k: v for k, v in env.items() if v},
     # Inbound CUSTOM_JWT: the platform verifies the caller and hands the agent a workload
     # token derived from that identity, so the agent never names a user itself.

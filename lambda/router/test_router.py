@@ -158,9 +158,14 @@ def test_memory_session_is_stable_then_rotates():
         first = identity.get_or_create_memory_session("u1", "lark:ou_x")
         again = identity.get_or_create_memory_session("u1", "lark:ou_x")
         assert again == first                      # stable while not rotated
-        rotated = identity.rotate_memory_session("u1")
-        assert rotated != first
+        rotated = identity.rotate_memory_session("u1", "lark:ou_x")
+        assert rotated != first and rotated.startswith(first + "-")
         assert identity.get_or_create_memory_session("u1", "lark:ou_x") == rotated
+        # An id rotated before threads carried the actor's prefix is refused by the agent,
+        # so it is replaced once rather than sent.
+        stored[("USER#u1", "MEMSESSION")]["memorySessionId"] = "sess-" + "a" * 32
+        migrated = identity.get_or_create_memory_session("u1", "lark:ou_x")
+        assert identity.thread_belongs("lark:ou_x", migrated) and migrated != first
 
 
 # --- The status probe ------------------------------------------------------

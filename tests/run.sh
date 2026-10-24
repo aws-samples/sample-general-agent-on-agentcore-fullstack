@@ -14,14 +14,14 @@ echo "== agent =="
 # loop is tested through a real compiled graph rather than a copy of its source.
 uv run --with boto3 --with aiohttp --with httpx --with pytest \
        --with langchain --with langchain-aws --with langgraph \
-       --with langchain-mcp-adapters --with langgraph-checkpoint-aws \
+       --with langchain-mcp-adapters --with langgraph-checkpoint-aws --with "pyjwt[crypto]" \
        python -m pytest agent/test_agent.py -q
 
 echo "== code tools =="
 # Needs the agent's stack because it asserts against agent_core's session teardown.
 uv run --with boto3 --with aiohttp --with httpx --with pytest \
        --with langchain --with langchain-aws --with langgraph \
-       --with langchain-mcp-adapters --with langgraph-checkpoint-aws \
+       --with langchain-mcp-adapters --with langgraph-checkpoint-aws --with "pyjwt[crypto]" \
        python -m pytest agent/test_code_tools.py -q
 
 echo "== a2a adapter =="

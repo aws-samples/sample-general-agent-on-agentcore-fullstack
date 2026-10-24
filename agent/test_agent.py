@@ -267,11 +267,13 @@ def test_the_thread_comes_from_the_router_never_from_a_client():
     agent_core._thread_named.clear()
     derived = agent_core._session_id_for("lark:ou_x")
     assert agent_core.thread_for("lark:ou_x") == derived      # before anything is named
-    agent_core.remember_thread("lark:ou_x", "sess-rotated-by-reset")
-    assert agent_core.thread_for("lark:ou_x") == "sess-rotated-by-reset"
-    # An empty value must not erase what the router said.
+    rotated = derived + "-0123456789ab"
+    agent_core.remember_thread("lark:ou_x", rotated)
+    assert agent_core.thread_for("lark:ou_x") == rotated
+    # An empty value must not erase what the router said, nor may another user's thread.
     agent_core.remember_thread("lark:ou_x", "")
-    assert agent_core.thread_for("lark:ou_x") == "sess-rotated-by-reset"
+    agent_core.remember_thread("lark:ou_x", agent_core._session_id_for("lark:ou_other"))
+    assert agent_core.thread_for("lark:ou_x") == rotated
     # And it is per actor.
     assert agent_core.thread_for("lark:ou_other") == agent_core._session_id_for("lark:ou_other")
 
@@ -1290,16 +1292,13 @@ def test_transcript_is_blank_rather_than_broken_when_unreadable():
     assert out == {"messages": [], "unavailable": True}
 
 
-def test_the_transcript_action_does_not_believe_the_claimed_actor():
-    """A thread is addressed by the actor alone, so trusting the claim would hand any valid
-    token holder somebody else's conversation. The session build is the check."""
+def test_the_transcript_reads_the_verified_callers_thread():
     import inspect
     import server
     src = inspect.getsource(server.handle_invocations)
     i = src.index('action == "transcript"')
-    block = src[i:i + 900]
-    assert "aget_session" in block and 'session["mem_sid"]' in block
-    assert "identity_error" in block and "auth_url" in block
+    block = src[i:i + 500]
+    assert 'payload["actorId"]' in block and "agent_core.thread_for(actor_id)" in block
 
 
 def test_history_stats_degrades_instead_of_failing_status():
@@ -2146,39 +2145,159 @@ def test_agui_requests_are_told_apart_from_the_router_protocol():
     assert agui.is_agui_request({}) is False
 
 
-def test_agui_verifies_a_claimed_actor_rather_than_trusting_or_deriving_it():
-    """A claimed actor is safe only because fetching that actor's vaulted token runs the
-    ownership check, which asks Lark whose token it is and refuses a mismatch. Deriving the
-    actor instead is not possible: customState participates in the vault lookup and is built
-    from the actor. threadId still comes from the session, never from the request."""
+def test_agui_takes_its_thread_from_the_session_not_the_page():
     import agui, inspect
     src = inspect.getsource(agui.handle)
-    # Session building is what fetches the token and runs the ownership check; an unverified
-    # claim surfaces as auth_url rather than as somebody else's conversation.
-    assert "aget_session" in src and 'session.get("auth_url")' in src
     assert 'thread_id = session["mem_sid"]' in src and '"threadId": thread_id' in src
     assert 'payload.get("threadId")' not in src
 
 
-def test_the_actor_is_derived_from_the_vaulted_token_owner():
-    """Lark is asked who the token belongs to; an unestablishable owner is refused rather
-    than assumed."""
-    import lark_3lo
-    with mock.patch.object(lark_3lo, "_agentcore") as ac, \
-         mock.patch.object(lark_3lo, "_token_owner", return_value="ou_alice"):
-        ac.get_resource_oauth2_token.return_value = {"accessToken": "lark-tok"}
-        assert lark_3lo.actor_from_workload_token("WAT") == ("actor", "lark:ou_alice")
-    with mock.patch.object(lark_3lo, "_agentcore") as ac, \
-         mock.patch.object(lark_3lo, "_token_owner", return_value=""):
-        ac.get_resource_oauth2_token.return_value = {"accessToken": "lark-tok"}
-        assert lark_3lo.actor_from_workload_token("WAT") == ("error", "")
+# --------------------------- who is calling ----------------------------------
+# Any allowlisted user can take their own token from the web page and call the Runtime
+# directly, so the actor comes from a verified bearer and the payload may only agree with it.
+
+_POOL_ISSUER = "https://cognito-idp.ap-northeast-1.amazonaws.com/pool-1"
 
 
-def test_an_unconsented_caller_gets_needs_consent_not_a_guess():
-    import lark_3lo
-    with mock.patch.object(lark_3lo, "_agentcore") as ac:
-        ac.get_resource_oauth2_token.return_value = {"authorizationUrl": "https://x"}
-        assert lark_3lo.actor_from_workload_token("WAT") == ("needs_consent", "")
+@pytest.fixture
+def _signer():
+    """A key pair standing in for the pool's, and a way to mint tokens with it."""
+    import jwt as pyjwt, time as _t, caller
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    keys = mock.Mock()
+    keys.get_signing_key_from_jwt.return_value = mock.Mock(key=key.public_key())
+
+    def mint(signing_key=key, **over):
+        claims = {"iss": _POOL_ISSUER, "token_use": "access", "client_id": "client-1",
+                  "username": "lark:ou_alice", "exp": int(_t.time()) + 600, **over}
+        return "Bearer " + pyjwt.encode(claims, signing_key, algorithm="RS256")
+    with mock.patch.object(caller, "_ISSUER", _POOL_ISSUER), \
+         mock.patch.object(caller, "_CLIENT", "client-1"), \
+         mock.patch.object(caller, "_keys", return_value=keys):
+        yield mint
+
+
+def test_the_actor_is_the_username_of_a_verified_access_token(_signer):
+    import caller, time as _t
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    assert caller.actor([_signer()]) == "lark:ou_alice"
+    other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    for bad in (_signer(signing_key=other_key),          # not the pool's signature
+                _signer(client_id="someone-else"),       # another app's token
+                _signer(token_use="id"),                 # an ID token
+                _signer(iss="https://evil.example"),
+                _signer(exp=int(_t.time()) - 60)):
+        assert caller.actor([bad]) == "", bad
+    # Which of two headers the platform checked is unknown, so two are refused outright.
+    assert caller.actor([_signer(), _signer(username="lark:ou_bob")]) == ""
+    assert caller.actor([]) == "" and caller.actor(["Basic abc"]) == ""
+    # A container clock a little behind Cognito's must not lock out a token minted just now.
+    assert caller.actor([_signer(iat=int(_t.time()) + 30)]) == "lark:ou_alice"
+    assert caller.actor(["bearer" + _signer()[len("Bearer"):]]) == "lark:ou_alice"
+
+
+def _bind(headers, payload):
+    import server
+    from multidict import CIMultiDict
+    request = mock.Mock(headers=CIMultiDict(headers))
+    return server._bind_caller(request, payload)
+
+
+def test_a_payload_may_only_agree_with_the_verified_caller(_signer):
+    import agent_core
+    alice = agent_core._session_id_for("lark:ou_alice")
+    payload = {"action": "chat", "actorId": "lark:ou_alice", "userId": "user_abc",
+               "memorySessionId": alice}
+    assert _bind([("Authorization", _signer())], payload) is None
+    # The router's userId is an internal key, never an actor, so it is not compared.
+    assert payload["actorId"] == "lark:ou_alice"
+    # Absent, the actor is filled in from the token — the A2A adapter names nobody.
+    payload = {"action": "chat"}
+    assert _bind([("Authorization", _signer())], payload) is None
+    assert payload["actorId"] == "lark:ou_alice"
+    for payload, status in (({"action": "chat", "actorId": "lark:ou_bob"}, 403),
+                            ({"action": "history_stats"}, None)):
+        r = _bind([("Authorization", _signer())], payload)
+        assert (r.status if r else None) == status
+    assert _bind([], {"action": "chat"}).status == 401
+
+
+def test_a_thread_is_honoured_only_under_the_callers_own_prefix(_signer):
+    """The checkpoint is keyed by thread id alone and the default id is computable by
+    anyone, so naming another user's thread under your own identity has to fail too."""
+    import agent_core
+    bob = agent_core._session_id_for("lark:ou_bob")
+    alice = agent_core._session_id_for("lark:ou_alice")
+    for thread in (bob, bob + "-0123456789ab", "sess-" + "0" * 32):
+        r = _bind([("Authorization", _signer())], {"action": "clear_history",
+                                                   "memorySessionId": thread})
+        assert r is not None and r.status == 403, thread
+    assert agent_core.thread_belongs("lark:ou_alice", alice)
+    assert agent_core.thread_belongs("lark:ou_alice", alice + "-0123456789ab")
+    assert not agent_core.thread_belongs("lark:ou_alice", alice + "-xyz")
+    assert not agent_core.thread_belongs("lark:ou_alice", alice + "-0123456789abc")
+
+
+def test_a_turn_is_answered_only_into_a_chat_the_caller_is_in():
+    """The bot's token reaches every chat the bot is in, so a verified caller naming some
+    other chat — or another chat's message to pull a picture from — is refused."""
+    import server
+    member = lambda chat, who: (chat, who) == ("oc_mine", "ou_alice")
+    chat_of = {"om_mine": "oc_mine", "om_theirs": "oc_theirs"}.get
+    with mock.patch.object(server.lark_notify, "in_chat", side_effect=member), \
+         mock.patch.object(server.lark_notify, "chat_of", side_effect=lambda m: chat_of(m, "")):
+        ok = lambda chat, imgs=(): server._chat_refusal("lark:ou_alice", chat, list(imgs))
+        assert ok("oc_mine") == "" and ok("ou_alice") == ""
+        assert ok("oc_theirs") == "foreign_chat" and ok("ou_bob") == "foreign_chat"
+        assert ok("oc_mine", [{"message_id": "om_mine", "key": "k"}]) == ""
+        assert ok("oc_mine", [{"message_id": "om_theirs", "key": "k"}]) == "foreign_message"
+        assert ok("oc_mine", [{"key": "k"}]) == "foreign_message"
+        # The message being answered is reacted to with the bot's token: it must be there too.
+        msg = lambda mid: server._chat_refusal("lark:ou_alice", "oc_mine", [], mid)
+        assert msg("om_mine") == "" and msg("om_theirs") == "foreign_message"
+
+
+def test_an_id_from_a_request_cannot_address_another_endpoint():
+    """`messages/{id}?` is the recall endpoint, so a reaction id carrying `?` would have
+    recalled any message the bot sent; a key carrying `../` would read another chat's."""
+    sys.path.insert(0, os.path.dirname(__file__))
+    import importlib, lark_notify
+    importlib.reload(lark_notify)
+    calls = []
+    with mock.patch.object(lark_notify, "_tenant_token", return_value="t"), \
+         mock.patch.object(lark_notify, "_call", side_effect=lambda *a, **k: calls.append(a) or {"code": 0}):
+        assert lark_notify.remove_reaction("om_victim?", "x") is False
+        assert lark_notify.remove_reaction("om_1", "../chats/oc_x") is False
+        assert lark_notify.remove_reaction("om_1", "ZCaCIjUBVVW-rm5L_3Z=") is True
+    assert len(calls) == 1
+    with mock.patch.object(lark_notify, "_tenant_token", return_value="t"):
+        with pytest.raises(lark_notify.LarkError):
+            lark_notify.fetch_message_resource("om_mine", "../../om_theirs/resources/img_x")
+    assert lark_notify.chat_of("om_1/../om_2") == ""
+
+
+def test_membership_is_read_from_lark_and_cached_only_when_true():
+    sys.path.insert(0, os.path.dirname(__file__))
+    import importlib, lark_notify
+    importlib.reload(lark_notify)
+    pages = [{"code": 0, "data": {"items": [{"member_id": "ou_x"}], "has_more": True,
+                                  "page_token": "p2"}},
+             {"code": 0, "data": {"items": [{"member_id": "ou_alice"}], "has_more": False}}]
+    with mock.patch.object(lark_notify, "_get", side_effect=pages) as get:
+        assert lark_notify.in_chat("oc_1", "ou_alice") is True
+        assert lark_notify.in_chat("oc_1", "ou_alice") is True      # cached
+    assert get.call_count == 2
+    with mock.patch.object(lark_notify, "_get", return_value={"code": 1, "msg": "no"}):
+        assert lark_notify.in_chat("oc_2", "ou_alice") is False
+
+
+def test_only_the_probes_go_without_a_bearer():
+    import server, inspect
+    src = inspect.getsource(server.handle_invocations)
+    gate = src.index("_bind_caller, request, payload")
+    assert src.index('if action == "status"') > gate and src.index("if is_agui:") > gate
+    assert 'action not in ("status", "warmup")' in src
 
 
 def test_consent_is_asked_for_the_system_the_tool_acts_on():

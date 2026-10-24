@@ -610,7 +610,7 @@ _thread_named: dict[str, str] = {}
 
 
 def remember_thread(actor_id: str, mem_sid: str) -> None:
-    if mem_sid:
+    if mem_sid and thread_belongs(actor_id, mem_sid):
         _thread_named[actor_id] = mem_sid
 
 
@@ -623,6 +623,18 @@ def _session_id_for(actor_id: str) -> str:
     """Deterministic per-user session id: one long conversation thread per user,
     shared across reconnects and entrypoints (STM retains it 30 days)."""
     return "sess-" + hashlib.sha256(actor_id.encode()).hexdigest()[:32]
+
+
+def thread_belongs(actor_id: str, thread_id: str) -> bool:
+    """Whether `thread_id` is one of this actor's threads: the derived default, or the
+    default plus the 12-hex suffix the router gives a rotated one. The checkpoint is keyed
+    by thread id alone, and the default is computable by anyone, so an id the caller names
+    is only honoured under this prefix. Kept in step with lambda/router/identity.py."""
+    default = _session_id_for(actor_id)
+    if thread_id == default:
+        return True
+    suffix = thread_id[len(default) + 1:] if thread_id.startswith(default + "-") else ""
+    return len(suffix) == 12 and all(c in "0123456789abcdef" for c in suffix)
 
 
 # Shared only by the fallback: an InMemorySaver rebuilt with every session would drop

@@ -89,12 +89,17 @@ def build_app():
                     "This task carries no end-user identity, so it cannot be attributed to "
                     "anyone. Present the user's bearer token."))
                 return
-            # The peer names whom it acts for; the agent verifies that against the vaulted
-            # token's owner, so a wrong name yields a consent prompt rather than their data.
+            # The peer may name whom it acts for; the agent takes the actor from the verified
+            # bearer and refuses a name that differs.
             actor = (context.metadata or {}).get("actorId", "") if context.metadata else ""
             try:
                 reply = await _invoke_agent(bearer, context.get_user_input(), actor)
             except Exception as e:  # noqa: BLE001
+                if getattr(getattr(e, "response", None), "status_code", 0) in (401, 403):
+                    await event_queue.enqueue_event(_reply(
+                        "Refused: the bearer does not belong to the user this task names, "
+                        "so nothing was done and nobody's data was read."))
+                    return
                 log.exception("a2a forward failed")
                 await event_queue.enqueue_event(_reply(f"Delegation failed ({type(e).__name__})."))
                 return

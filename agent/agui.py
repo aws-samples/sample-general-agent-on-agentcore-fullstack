@@ -5,9 +5,8 @@ as the container writes them, `text/event-stream` passes through), so the AG-UI 
 served from the existing agent Runtime rather than a second one with `serverProtocol=AGUI`.
 One runtime, one image, one deployment. See docs/agentcore-behavior.md.
 
-The browser calls `/invocations` directly with its Cognito JWT as Bearer; the platform's
-CUSTOM_JWT authorizer verifies it. It also names the actor, and is not believed on it —
-building that actor's session runs the ownership check that refuses a mismatch.
+The browser calls `/invocations` directly with its Cognito JWT as Bearer. server.py has
+verified it and put the actor it names on the payload before this module sees the request.
 """
 
 from __future__ import annotations
@@ -53,15 +52,7 @@ async def _error_stream(request: web.Request, message: str) -> web.StreamRespons
 async def handle(request: web.Request, payload: dict,
                  workload_token: str) -> web.StreamResponse:
     """Run one AG-UI turn, streaming events as they are produced."""
-    # The caller names the actor and is not believed on it: building the session fetches
-    # that actor's vaulted token, and lark_3lo's ownership check asks Lark whose token it is
-    # and refuses a mismatch. So a page claiming somebody else gets a consent prompt, never
-    # their data. Deriving the actor instead is not possible — customState participates in
-    # the vault lookup and is built from the actor (see docs/agentcore-behavior.md).
-    #
-    # Session building is the one path that has been proven end to end, so it is reused
-    # rather than re-implemented: a parallel check drifted and reported "not authorised" for
-    # a user the proven path could serve.
+    # Verified by server.py from the bearer, not taken from what the page sent.
     actor_id = payload.get("actorId") or ""
     if not actor_id:
         return await _error_stream(request, "请求缺少身份信息，请重新打开页面。")

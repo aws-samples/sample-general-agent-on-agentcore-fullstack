@@ -26,7 +26,9 @@ from aiohttp import web
 
 import agent_core   # pulls in langchain/langgraph, boto3 and mcp — the bulk of start-up
 import agui
-import lark_3lo
+import caller
+import lark_notify
+import telemetry
 
 _T_IMPORT_DONE = time.monotonic()
 
@@ -98,6 +100,52 @@ async def handle_ping(request: web.Request) -> web.Response:
     return web.json_response({"status": status})
 
 
+def _bind_caller(request: web.Request, payload: dict) -> web.Response | None:
+    """Put the verified actor on the payload, or answer the refusal. A payload that names
+    another actor, or a thread that is not this actor's, is refused rather than corrected:
+    either is somebody asking for what is not theirs. The router's own `userId` is an
+    internal key, not an actor, so only `actorId` is compared."""
+    actor = caller.actor(request.headers.getall("Authorization", []))
+    reason = ""
+    if not actor:
+        reason = "unverified"
+    elif payload.get("actorId") and payload["actorId"] != actor:
+        reason = "claim_mismatch"
+    elif payload.get("memorySessionId") and not agent_core.thread_belongs(
+            actor, payload["memorySessionId"]):
+        reason = "foreign_thread"
+    if reason:
+        # AgentCore drops the body of a non-2xx answer, so the reason lives in this log.
+        log.warning("refused %s: %s (claimed %s)", payload.get("action") or "agui", reason,
+                    payload.get("actorId") or "-")
+        telemetry.count("identity_refused", reason=reason)
+        return web.json_response({"error": "forbidden"},
+                                 status=401 if reason == "unverified" else 403)
+    payload["actorId"] = actor
+    return None
+
+
+def _chat_refusal(actor_id: str, chat_id: str, image_handles: list,
+                  message_id: str = "") -> str:
+    """Why this actor may not have a turn answered into `chat_id`, or "". The bot's token
+    reaches every chat the bot is in, so the chat to answer into and the messages whose
+    pictures are read have to be the caller's own. An `ou_` id is a direct message to that
+    person — the approval path addresses its turns that way."""
+    open_id = actor_id.split(":", 1)[-1]
+    if chat_id.startswith("ou_"):
+        if chat_id != open_id:
+            return "foreign_chat"
+    elif not lark_notify.in_chat(chat_id, open_id):
+        return "foreign_chat"
+    # The message being answered is reacted to and un-reacted with the bot's token, so it
+    # has to be in that chat as well.
+    mids = [(h or {}).get("message_id", "") for h in image_handles]
+    for mid in mids + ([message_id] if message_id else []):
+        if not mid or lark_notify.chat_of(mid) != chat_id:
+            return "foreign_message"
+    return ""
+
+
 async def handle_invocations(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
@@ -112,19 +160,30 @@ async def handle_invocations(request: web.Request) -> web.Response:
     sid = request.headers.get("x-amzn-bedrock-agentcore-runtime-session-id", "")
     # Under CUSTOM_JWT inbound the Runtime validates the caller's JWT and hands us a
     # workload access token derived from it. Three header aliases carry the same value
-    # (measured); read them in order and pass it down — using it instead of naming a
-    # user is what makes this turn's identity unforgeable. Empty under SigV4 inbound.
+    # (measured); read them in order and pass it down — the vault is looked up under it, so
+    # a token fetched is the caller's own. Who the caller is comes from caller.py.
     workload_token = next(
         (request.headers[h] for h in (
             "x-amzn-bedrock-agentcore-runtime-workload-accesstoken",
             "x-amz-bedrock-agentcore-identity-wat",
             "workloadaccesstoken",
         ) if request.headers.get(h)), "")
+    # Who is calling is taken from the verified bearer, never from the payload: any user can
+    # get their own token from the web page and call this Runtime directly. Only the probes
+    # that read nothing of anybody's go without one.
+    is_agui = agui.is_agui_request(payload)
+    if is_agui or action not in ("status", "warmup"):
+        # Off the loop: the first call per instance fetches the pool's keys.
+        refused = await asyncio.get_event_loop().run_in_executor(
+            None, _bind_caller, request, payload)
+        if refused:
+            return refused
+
     # A browser on the AG-UI path posts a RunAgentInput, which carries no `action`. It is
     # answered as an SSE event stream; everything below is the router's JSON protocol. Placed
     # after workload_token so both paths use the one value — reading the headers separately
     # here is how the two drifted.
-    if agui.is_agui_request(payload):
+    if is_agui:
         log.info("dispatch: agui  instance=%s session=%s", _instance(), sid[:24])
         return await agui.handle(request, payload, workload_token)
 
@@ -177,21 +236,13 @@ async def handle_invocations(request: web.Request) -> web.Response:
             log.exception("%s failed", action)
             return web.json_response({"error": str(e)})
 
-    # The transcript for a reloaded browser tab. The claimed actorId cannot be trusted here
-    # the way it can on the chat path: a thread is addressed by the actor alone, so believing
-    # the claim would hand any valid token holder somebody else's conversation. Building the
-    # session first is what checks it — lark_3lo asks Lark whose vaulted token this is and
-    # refuses a mismatch — and it is the one identity path proven end to end.
+    # The transcript for a reloaded browser tab: the thread the router last named for this
+    # actor, which is the one the page's turns run on.
     if action == "transcript":
-        actor_id = payload.get("actorId") or ""
-        if not actor_id:
-            return web.json_response({"messages": [], "error": "actorId required"})
-        session = await agent_core.aget_session(actor_id, workload_token=workload_token)
-        if session.get("identity_error") or session.get("auth_url"):
-            return web.json_response({"messages": [], "unverified": True})
+        actor_id = payload["actorId"]
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.transcript, actor_id, session["mem_sid"])
+                None, agent_core.transcript, actor_id, agent_core.thread_for(actor_id))
             return web.json_response(result)
         except Exception as e:
             log.exception("transcript failed")
@@ -259,6 +310,12 @@ async def handle_invocations(request: web.Request) -> web.Response:
         if not (message or image_handles) or not chat_id:
             return web.json_response({"error": "chatId and a message or image required"},
                                      status=400)
+        refused = await asyncio.get_event_loop().run_in_executor(
+            None, _chat_refusal, actor_id, chat_id, image_handles, msg_id)
+        if refused:
+            log.warning("refused chat_async for %s: %s", actor_id, refused)
+            telemetry.count("identity_refused", reason=refused)
+            return web.json_response({"error": "forbidden"}, status=403)
         try:
             # Returns as soon as the work is accepted; the result is pushed to the
             # chat later. Consent still comes back inline (see chat_async).
@@ -274,18 +331,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
 
     if action == "chat":
         log.info("dispatch: chat  instance=%s session=%s", _instance(), sid[:24])
-        # A caller that cannot name the user — the A2A adapter forwards a bearer and nothing
-        # else — gets the actor derived from the token instead of defaulting to "anonymous",
-        # which would fail the ownership check and ask for consent forever.
-        actor_id = payload.get("actorId") or payload.get("userId") or ""
-        if not actor_id:
-            kind, derived = await asyncio.get_event_loop().run_in_executor(
-                None, lark_3lo.actor_from_workload_token, workload_token)
-            if kind != "actor":
-                return web.json_response(
-                    {"reply": "无法确认这次请求代表谁。请先在 Lark 里完成一次授权。",
-                     "needs_auth": True}, status=200)
-            actor_id = derived
+        actor_id = payload["actorId"]
         message = payload.get("message", "")
         email = payload.get("email", "")
         # Memory thread id is chosen by the caller (router) — that's what makes

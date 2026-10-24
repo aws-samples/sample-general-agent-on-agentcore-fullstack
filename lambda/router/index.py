@@ -646,13 +646,13 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
     # The runtime session (which microVM serves you) and the checkpoint thread (your
     # conversation history) are independent ids, so each command rotates one or the other.
     if cmd == "/reset":
-        mem_sid = identity.rotate_memory_session(user_id)
+        mem_sid = identity.rotate_memory_session(user_id, actor_id)
         logger.info("memory session rotated for %s -> %s", actor_id, mem_sid)
         return {"text": "已开始新的对话记录（运行实例不变）。"}
 
     if cmd == "/new":
         identity.drop_session(user_id)
-        mem_sid = identity.rotate_memory_session(user_id)
+        mem_sid = identity.rotate_memory_session(user_id, actor_id)
         logger.info("runtime + memory session rotated for %s -> %s", actor_id, mem_sid)
         return {"text": "已开启新会话：新的对话记录，且由新的运行实例处理。"}
 
@@ -983,8 +983,8 @@ def _web_session(body: str) -> dict:
     logger.info("web session issued for %s", actor_id)
     return _resp(200, {
         "token": cognito.user_jwt(actor_id),
-        # Echoed so the page can name itself. Not a credential: the agent verifies the
-        # claim against the vaulted token's real owner before using it.
+        # Echoed so the page can name itself. Not a credential: the agent takes the actor
+        # from the token and refuses a payload naming anybody else.
         "actorId": actor_id,
         # The same routing key Lark chat uses, so both surfaces land on one microVM and one
         # conversation. AgentCore maps a session id to exactly one microVM, which is what

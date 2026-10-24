@@ -156,7 +156,7 @@ echo
 case "$OTHER" in
   *"/identities/oauth2/authorize"*)
     printf '  \033[31m✗ offered a consent link — that would burn the real owner'"'"'s grant\033[0m\n' ;;
-  *不一致*|*[Aa]uthoriz*|*无法*)
+  *不一致*|*[Aa]uthoriz*|*无法*|*Refused*)
     printf '  \033[32m✓ refused — returned nobody'"'"'s data, and minted no consent link\033[0m\n' ;;
   *) printf '  \033[31m✗ look closely: this should not have produced an answer\033[0m\n' ;;
 esac
