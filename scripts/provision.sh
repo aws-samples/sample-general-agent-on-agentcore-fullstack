@@ -106,7 +106,8 @@ ensure_agent_image() {
 import glob, hashlib, os
 os.chdir("agent")
 h = hashlib.sha256()
-for f in sorted({"Dockerfile", "requirements.txt", "entrypoint.sh", *glob.glob("*.py")}):
+for f in sorted({"Dockerfile", "requirements.txt", "entrypoint.sh", *glob.glob("*.py"),
+                *glob.glob("assets/*")}):
     if f.startswith("test_"):
         continue
     h.update(f.encode() + b"\0" + open(f, "rb").read())

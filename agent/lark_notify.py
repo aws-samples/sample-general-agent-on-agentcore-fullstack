@@ -44,7 +44,12 @@ def _call(method: str, url: str, body: dict, bearer: str = "") -> dict:
         with urllib.request.urlopen(req, timeout=10) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        return json.loads(e.read().decode() or "{}")
+        try:
+            return json.loads(e.read().decode() or "{}")
+        except ValueError:          # a gateway's HTML error page
+            return {"code": e.code, "msg": f"HTTP {e.code}"}
+    except Exception as e:  # noqa: BLE001 — every caller reads the code; none expects a raise
+        return {"code": -1, "msg": f"{type(e).__name__}: {e}"}
 
 
 def _post(url: str, body: dict, bearer: str = "") -> dict:
@@ -128,7 +133,7 @@ def _reason(body: dict) -> str:
 
 
 def _upload(path: str, fields: dict, file_name: str, data: bytes,
-            part: str = "file") -> dict:
+            part: str = "file", timeout: int = 120) -> dict:
     """One multipart/form-data POST, built by hand because this module speaks urllib.
 
     Lark's upload endpoints take the file as a form part, so neither `_call` nor a JSON
@@ -154,7 +159,7 @@ def _upload(path: str, fields: dict, file_name: str, data: bytes,
                  "Authorization": f"Bearer {tok}"})
     try:
         # Longer than the 10 s the JSON calls use: this one carries the whole file.
-        with urllib.request.urlopen(req, timeout=120) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         return json.loads(e.read().decode() or "{}")
@@ -174,11 +179,11 @@ def upload_file(file_name: str, data: bytes, file_type: str = "stream",
     return key
 
 
-def upload_image(data: bytes) -> str:
+def upload_image(data: bytes, name: str = "cover.jpg", timeout: int = 120) -> str:
     """Upload an image, returning its image_key — also how a video gets its cover, which
     Lark requires for `media` and offers no default for."""
-    body = _upload("/open-apis/im/v1/images", {"image_type": "message"}, "cover.jpg", data,
-                   part="image")
+    body = _upload("/open-apis/im/v1/images", {"image_type": "message"}, name, data,
+                   part="image", timeout=timeout)
     key = (body.get("data") or {}).get("image_key", "")
     if not key:
         raise LarkError(f"Lark would not accept the cover image: {_reason(body)}")
@@ -281,123 +286,249 @@ def remove_reaction(message_id: str, reaction_id: str) -> bool:
 # type the answer into it. CardKit's streaming mode is the supported mechanism —
 # its updates don't count against the QPS limit, unlike editing a message.
 
-_ELEMENT_ID = "answer"
-_STATUS_ID = "status"
-# While waiting, the status line is refreshed this often so its seconds keep moving: a
-# long tool call emits no event, and a card that sits still reads as stuck.
-_HEARTBEAT_SECONDS = 3.0
 # Below this a step is noise — the model re-reading a tool result before it writes.
 _MIN_STEP_SECONDS = 0.5
-_STEP_LABEL = {"think": "思考", "tool": "调用工具", "write": "撰写回答",
-               "compact": "整理上下文"}
+# Measured: a card holds 200 components. A status line costs up to five and the text after
+# it one, so past this many the answer keeps writing into its last block, without lines.
+_MAX_GAPS = 30
 
 
 def _grey(text: str) -> str:
     return f"<font color='grey'>{text}</font>"
 
 
-def _status_element(text: str) -> dict:
-    return {"tag": "markdown", "element_id": _STATUS_ID, "text_size": "notation",
-            "content": _grey(text)}
+def _secs(seconds: float) -> int:
+    return max(1, round(seconds))
 
 
-def _card_json(status: str, streaming: bool) -> dict:
-    """A card that starts as a status line only. The answer element is inserted above it
-    when the first words arrive: CardKit rejects an empty text update, and an empty
-    element would leave a gap above the status while the model is still thinking."""
-    return {
-        "schema": "2.0",
-        "config": {"streaming_mode": streaming, "update_multi": True},
-        "body": {"elements": [_status_element(status)]},
-    }
+def _times(n: int) -> str:
+    return f" ×{n}" if n > 1 else ""
 
 
-def _summary_panel(title: str, steps: list[str]) -> dict:
-    """What the status line becomes when the turn ends: a collapsed, grey-filled panel,
-    so the record of what ran reads as a footnote rather than as more of the answer."""
-    icon = {"tag": "standard_icon", "token": "down-small-ccm_outlined",
-            "size": "16px 16px", "color": "grey"}
-    return {"tag": "collapsible_panel", "element_id": _STATUS_ID, "expanded": False,
-            "background_color": "grey-50", "padding": "4px 8px 4px 8px",
-            "header": {"title": {"tag": "markdown", "text_size": "notation",
-                                 "content": _grey(title)},
-                       "icon": icon, "icon_position": "right", "icon_expanded_angle": -180,
-                       "padding": "4px 0px 4px 0px"},
-            "elements": [{"tag": "markdown", "text_size": "notation",
-                          "content": _grey("\n".join(steps))}]}
+# --- the waiting animation --------------------------------------------------
+# A live status line moves by itself instead of counting seconds, so a wait costs one card
+# write per change of state rather than one every few seconds. Three grey dots, drawn at 4x
+# so the client's downscale smooths them: rising in turn while thinking, swelling in turn
+# while something else runs.
+
+_ANIM_FILES = {"think": "thinking.gif", "work": "working.gif"}
+_ANIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_ANIM_SIZE = "24px 12px"
+_anim_keys: dict[str, str] = {}
+_anim_lock = threading.Lock()
+_anim_failed_at = 0.0
+_ANIM_RETRY_SECONDS = 600
+# The first card of a process waits for this; a slow upload must not hold up the answer.
+_ANIM_UPLOAD_TIMEOUT = 3
+
+
+def _animation_keys() -> dict[str, str]:
+    """{kind: image_key}, uploaded once per process. Empty after a failure, and retried
+    only after a while: a status line without its dots is fine, a slow turn start is not."""
+    global _anim_failed_at
+    if _anim_keys:
+        return dict(_anim_keys)
+    # A turn arriving while another uploads goes without dots rather than wait for it.
+    if not _anim_lock.acquire(blocking=False):
+        return {}
+    try:
+        if _anim_keys:
+            return dict(_anim_keys)
+        if _anim_failed_at and time.monotonic() - _anim_failed_at < _ANIM_RETRY_SECONDS:
+            return {}
+        try:
+            keys = {}
+            for kind, name in _ANIM_FILES.items():
+                with open(os.path.join(_ANIM_DIR, name), "rb") as f:
+                    keys[kind] = upload_image(f.read(), name, timeout=_ANIM_UPLOAD_TIMEOUT)
+        except Exception:  # noqa: BLE001 — the dots are decoration
+            log.warning("could not upload the status animation", exc_info=True)
+            _anim_failed_at = time.monotonic()
+            return {}
+        _anim_keys.update(keys)
+        return dict(_anim_keys)
+    finally:
+        _anim_lock.release()
+
+
+def _pill(eid: str, text: str, image_key: str = "") -> dict:
+    """A status line set apart from the answer: grey text on a grey chip sized to it,
+    followed by the moving dots while it is live."""
+    label = {"tag": "markdown", "text_size": "notation", "content": _grey(text)}
+    inner = [label]
+    if image_key:
+        inner = [{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "6px",
+                  "columns": [
+                      {"tag": "column", "width": "auto", "vertical_align": "center",
+                       "elements": [label]},
+                      {"tag": "column", "width": "auto", "vertical_align": "center",
+                       "elements": [{"tag": "img", "img_key": image_key,
+                                     "scale_type": "crop_center", "size": _ANIM_SIZE,
+                                     "transparent": True, "preview": False,
+                                     "alt": {"tag": "plain_text", "content": ""}}]}]}]
+    return {"tag": "column_set", "element_id": eid, "flex_mode": "none",
+            "horizontal_align": "left",
+            "columns": [{"tag": "column", "width": "auto", "background_style": "grey-50",
+                         "padding": "2px 10px 2px 10px", "elements": inner}]}
+
+
+def _band(eid: str, text: str) -> dict:
+    """The turn's closing summary: a full-width grey band, so it reads as a footer."""
+    return {"tag": "column_set", "element_id": eid, "background_style": "grey-50",
+            "columns": [{"tag": "column", "width": "weighted", "weight": 1,
+                         "padding": "4px 8px 4px 8px",
+                         "elements": [{"tag": "markdown", "text_size": "notation",
+                                       "content": _grey(text)}]}]}
+
+
+class _Item:
+    """One top-level element of the card, in order. `content` is what it should say — the
+    text, or for a status line (text, animation) — and `created`/`written` are what CardKit
+    has; only the writer touches those two."""
+    __slots__ = ("id", "kind", "content", "dead", "created", "written")
+
+    def __init__(self, eid: str, kind: str, content, created: bool = False):
+        self.id, self.kind, self.content, self.dead = eid, kind, content, False
+        self.created, self.written = created, (content if created else None)
+
+    def element(self, content=None, keys: dict | None = None) -> dict:
+        content = self.content if content is None else content
+        if self.kind == "text":
+            return {"tag": "markdown", "element_id": self.id, "content": content}
+        if self.kind == "pill":
+            text, anim = content
+            return _pill(self.id, text, (keys or {}).get(anim, "") if anim else "")
+        return _band(self.id, content)
 
 
 class StreamingCard:
-    """One streaming card's lifecycle: an answer above, and below it a status line that
-    tracks what the turn is doing and ends as a collapsed summary of it.
+    """One streaming card's lifecycle: the answer's text with the turn's status lines in
+    between, where they happened, and a one-line summary at the end.
 
-    The status follows events, not a clock — a tool starting, a result arriving, the
-    first words of the answer — with a heartbeat only while nothing is happening, so the
-    seconds move during a long tool call and stop once the answer streams. Phases are
-    generic on purpose: naming each tool would be a mapping to maintain.
+    Between two runs of text there is one status line. While the turn waits it says what
+    is happening now — thinking, a tool running, the thread being summarised — with moving
+    dots instead of a clock, and when text arrives it freezes as a record of the wait
+    ("🤔 思考 · 3 秒 · 🔧 调用工具 ×2 · 5 秒"). Phases are generic on purpose: naming each
+    tool would be a mapping to maintain, and the chat is not a log.
 
-    All CardKit writes on a card share a single strictly-increasing sequence, so it lives
-    here rather than in the caller. Every method returns a bool or nothing and never
-    raises: streaming is an enhancement, and a failure must fall back to send_text rather
-    than lose the answer. `ok` tracks whether the card is usable."""
+    The card is kept as an ordered list of elements; the worker brings CardKit in line
+    with it, inserting each new element after the one before. All CardKit writes on a
+    card share a single strictly-increasing sequence, so it lives here. Every method
+    returns a bool or nothing and never raises: streaming is an enhancement, and a failure
+    must fall back to send_text rather than lose the answer. `ok` tracks whether the card
+    is usable."""
 
     def __init__(self, chat_id: str):
         self.chat_id = chat_id
         self.card_id = ""
         self._seq = 0
         self.ok = False
+        self.sent = False          # posted to the chat, so somebody is looking at it
         # Sending happens on its own thread. Measured, one CardKit write takes ~470 ms
         # (361–606 ms), so writing from the token loop stalled it for longer than the
-        # flush interval it was tuned against — the loop spent over half its time
-        # waiting on HTTP instead of reading the model, and the text arrived in visible
-        # jerks. Now the loop only ever hands over the latest accumulated text.
-        self._lock = threading.Lock()      # guards _pending, the phase and the steps
+        # flush interval it was tuned against. Now the loop only hands over state.
+        self._lock = threading.Lock()       # guards the items, the phase and the counts
         self._send_lock = threading.Lock()  # one write in flight, so _seq stays ordered
-        self._pending: str | None = None
+        self._flush_lock = threading.Lock()  # one flusher, so created/written have one writer
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
-        self._answer_shown = False
         self._t0 = time.monotonic()
         self._phase = "think"
         self._phase_since = self._t0
         self._tools_done = 0
         self._steps: list[tuple[str, float]] = []
-        self._status_due = False
-        self._status_written_at = self._t0
+        self._full = ""            # the whole answer so far, as the caller hands it over
+        self._text_from = 0        # where in it the open (or next) text block starts
+        self._gaps = 0
+        self._gap_tools = 0
+        self._gap_think_secs = 0.0
+        self._gap_tool_secs = 0.0
+        self._gap_compact_secs = 0.0
+        self._n = 0
+        self._keys: dict[str, str] = {}     # animation image keys, fetched on open()
+        self._live: _Item | None = _Item("p0", "pill", self._live_text(), created=True)
+        self._text: _Item | None = None
+        self._items: list[_Item] = [self._live]
 
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
 
+    def _next_id(self, prefix: str) -> str:
+        self._n += 1
+        return f"{prefix}{self._n}"
+
     # --- what the turn is doing ---------------------------------------------
 
     def _elapsed(self) -> int:
-        return max(1, round(time.monotonic() - self._t0))
+        return _secs(time.monotonic() - self._t0)
 
     def _enter(self, phase: str) -> None:
         """Close the running step and start the next. Caller holds _lock."""
         now = time.monotonic()
         spent = now - self._phase_since
-        if self._phase in _STEP_LABEL and (self._phase == "tool"
-                                           or spent >= _MIN_STEP_SECONDS):
-            last = self._steps[-1] if self._steps else None
-            # Consecutive thinking or writing is one step; each tool call is its own.
-            if last and last[0] == self._phase and self._phase != "tool":
-                self._steps[-1] = (self._phase, last[1] + spent)
-            else:
-                self._steps.append((self._phase, spent))
-        self._phase, self._phase_since = phase, now
-        self._status_due = True
-
-    def _status_text(self) -> str:
         if self._phase == "tool":
-            return f"🛠️ 正在调用工具(第 {self._tools_done + 1} 次)· {self._elapsed()} 秒"
-        if self._phase == "write":
-            return "✍️ 正在撰写回答"
+            self._gap_tool_secs += spent
+        elif self._phase == "compact":
+            self._gap_compact_secs += spent
+        elif self._phase == "think" and self._live is not None:
+            self._gap_think_secs += spent
+        if self._phase in ("think", "tool", "write", "compact") and (
+                self._phase == "tool" or spent >= _MIN_STEP_SECONDS):
+            self._steps.append((self._phase, spent))
+        self._phase, self._phase_since = phase, now
+        if self._live is not None:
+            self._live.content = self._live_text()
+
+    def _frozen_text(self, thinking: bool = True) -> str:
+        """What a finished wait leaves behind: how long it thought and what ran in it.
+        Caller holds _lock."""
+        parts = []
+        if thinking and self._gap_think_secs >= 1:
+            parts.append(f"🤔 思考 · {_secs(self._gap_think_secs)} 秒")
+        if self._gap_compact_secs:
+            parts.append(f"🗜️ 整理较早的对话 · {_secs(self._gap_compact_secs)} 秒")
+        if self._gap_tools:
+            parts.append(f"🔧 调用工具{_times(self._gap_tools)} · "
+                         f"{_secs(self._gap_tool_secs)} 秒")
+        return " · ".join(parts)
+
+    def _live_text(self) -> tuple[str, str]:
+        """The status line of the wait in progress, and which dots go with it. Caller
+        holds _lock."""
+        if self._phase == "tool":
+            return f"🔧 调用工具{_times(self._gap_tools + 1)}", "work"
         if self._phase == "compact":
-            return f"🗜️ 正在整理较早的对话 · {self._elapsed()} 秒"
-        return f"🤔 思考中 · {self._elapsed()} 秒"
+            return "🗜️ 正在整理较早的对话", "work"
+        done = self._frozen_text(thinking=False)
+        return (f"{done} · 🤔 思考中" if done else "🤔 思考中"), "think"
+
+    def _start_wait(self) -> None:
+        """Text stopped and something else began: the open text block is finished, and a
+        status line goes after it. Caller holds _lock."""
+        if self._text is not None:
+            if self._gaps >= _MAX_GAPS:
+                return                      # keep writing into the last block
+            self._gaps += 1
+            self._text, self._text_from = None, len(self._full)
+        if self._live is None:
+            self._live = _Item(self._next_id("p"), "pill", ("", ""))
+            self._items.append(self._live)
+        self._live.content = self._live_text()
+
+    def _end_wait(self) -> None:
+        """The wait is over: its status line freezes as a record, or goes. Caller holds
+        _lock."""
+        if self._live is not None:
+            done = self._frozen_text()
+            if done:
+                self._live.content = (done, "")
+            else:
+                self._live.dead = True      # under a second of thought: not worth a line
+            self._live = None
+        self._gap_tools = 0
+        self._gap_think_secs = self._gap_tool_secs = self._gap_compact_secs = 0.0
 
     def tool_started(self) -> None:
         """The model began a tool call. Counted on the result instead: a streamed call
@@ -406,6 +537,7 @@ class StreamingCard:
             return
         with self._lock:
             if self._phase != "tool":
+                self._start_wait()
                 self._enter("tool")
         self._wake.set()
 
@@ -414,6 +546,8 @@ class StreamingCard:
             return
         with self._lock:
             self._tools_done += 1
+            if self._live is not None:
+                self._gap_tools += 1
             self._enter("think")
         self._wake.set()
 
@@ -423,37 +557,114 @@ class StreamingCard:
         if not self.ok:
             return
         with self._lock:
+            if started:
+                self._start_wait()
             self._enter("compact" if started else "think")
         self._wake.set()
 
-    def summary(self) -> tuple[str, list[str]]:
-        """The panel's title and its steps, as they stand."""
+    def summary(self) -> str:
+        """The closing line: the whole turn's time, and where it went."""
         with self._lock:
-            title = (f"⚙️ 执行过程 · 调用 {self._tools_done} 次工具 · 耗时 {self._elapsed()} 秒"
-                     if self._tools_done else f"⚙️ 执行过程 · 耗时 {self._elapsed()} 秒")
-            steps = [f"{_STEP_LABEL[p]} {max(1, round(t))} 秒" for p, t in self._steps]
-        return title, steps
+            spent: dict[str, float] = {}
+            for phase, t in self._steps:
+                spent[phase] = spent.get(phase, 0.0) + t
+            parts = []
+            if "compact" in spent:
+                parts.append(f"整理上下文 {_secs(spent['compact'])} 秒")
+            if "think" in spent:
+                parts.append(f"思考 {_secs(spent['think'])} 秒")
+            if self._tools_done:
+                parts.append(f"{self._tools_done} 次工具调用 "
+                             f"{_secs(spent.get('tool', 0.0))} 秒")
+            if "write" in spent:
+                parts.append(f"撰写回答 {_secs(spent['write'])} 秒")
+            line = f"⏱️ 耗时 {self._elapsed()} 秒"
+        return f"{line}（{' · '.join(parts)}）" if parts else line
 
     # --- writing ------------------------------------------------------------
 
+    def _set_text(self, segment: str) -> None:
+        """Show `segment` as the open text block, opening one if needed. CardKit rejects
+        empty text, so a block exists only once there are words for it. Caller holds
+        _lock."""
+        shown = segment.lstrip()
+        if not shown:
+            return
+        if self._text is None:
+            self._end_wait()
+            self._text = _Item(self._next_id("t"), "text", shown)
+            self._items.append(self._text)
+        else:
+            self._text.content = shown
+
     def _pump(self) -> None:
-        """Write the newest text and the current status, repeatedly. Superseded text is
-        dropped rather than queued: CardKit takes the full accumulated text on every
-        write, so the newest one subsumes every earlier one."""
-        while not self._stop.is_set():
+        """Bring the card in line with the items, repeatedly. Text superseded before it
+        was written is never sent: each write carries a block's whole text, so the
+        newest one subsumes every earlier one."""
+        while not self._stop.is_set() and self.ok:
             self._wake.wait(timeout=0.5)
             self._wake.clear()
-            with self._lock:
-                text, self._pending = self._pending, None
-                waiting = self._phase in ("think", "tool", "compact")
-                stale = time.monotonic() - self._status_written_at >= _HEARTBEAT_SECONDS
-                status = (self._status_text()
-                          if self._status_due or (waiting and stale) else None)
-                self._status_due = False
-            if text is not None:
-                self._write(text)
-            if status is not None:
-                self._write_status(status)
+            self._flush()
+
+    def _flush(self) -> None:
+        with self._flush_lock:
+            if self.ok:
+                self._flush_once()
+
+    def _flush_once(self) -> None:
+        """Insert what is new, rewrite what changed, then delete what went. Deletions come
+        last so a removed element can still anchor the one inserted after it."""
+        with self._lock:
+            plan = [(it, it.content, it.dead) for it in self._items]
+        anchor = ""
+        for it, content, dead in plan:
+            if not dead and not it.created:
+                if not self._put("/elements", {
+                        "type": "insert_after", "target_element_id": anchor,
+                        "elements": json.dumps([it.element(content, self._keys)])},
+                        method="POST"):
+                    if it.kind == "text":
+                        self.ok = False
+                        return
+                    it.dead = True          # a missing status line costs nothing
+                    continue
+                it.created, it.written = True, content
+            elif not dead and it.written != content:
+                # Text is rewritten in place, which CardKit types out; a status line is
+                # replaced whole, since its dots come and go with its state.
+                if it.kind == "text":
+                    ok = self._put(f"/elements/{it.id}/content", {"content": content})
+                else:
+                    ok = self._put(f"/elements/{it.id}", {
+                        "element": json.dumps(it.element(content, self._keys))})
+                if ok:
+                    it.written = content
+                elif it.kind == "text":
+                    self.ok = False
+                    return
+            if it.created:
+                anchor = it.id
+        for it, _, dead in plan:
+            if dead and it.created and self._put(f"/elements/{it.id}", {},
+                                                 method="DELETE"):
+                it.created = False
+        with self._lock:
+            self._items = [it for it in self._items if it.created or not it.dead]
+
+    def _abandon(self) -> None:
+        """The caller posts the answer as text instead. Best-effort, stop the card claiming
+        it is still working: drop any status line still showing its dots or already given
+        up, and end streaming."""
+        if not self.sent:
+            return
+        with self._lock:
+            stale = [it for it in self._items if it.created and (
+                it.dead or (it.kind == "pill" and (it.written or ("", ""))[1]))]
+        for it in stale:
+            self._put(f"/elements/{it.id}", {}, method="DELETE")
+        self._put("/settings",
+                  {"settings": json.dumps({"config": {"streaming_mode": False}})},
+                  method="PATCH")
 
     def _put(self, path: str, body: dict, method: str = "PUT") -> bool:
         with self._send_lock:
@@ -467,38 +678,18 @@ class StreamingCard:
             return False
         return True
 
-    def _write(self, full_text: str) -> bool:
-        """The answer. Inserted above the status on its first write, updated after."""
-        if not full_text:
-            return True
-        if self._answer_shown:
-            ok = self._put(f"/elements/{_ELEMENT_ID}/content", {"content": full_text})
-        else:
-            ok = self._put("/elements", {
-                "type": "insert_before", "target_element_id": _STATUS_ID,
-                "elements": json.dumps([{"tag": "markdown", "element_id": _ELEMENT_ID,
-                                         "content": full_text}])}, method="POST")
-            self._answer_shown = ok
-        if not ok:
-            self.ok = False
-        return ok
-
-    def _write_status(self, text: str) -> None:
-        # Best-effort: the status is decoration, so a failed write must not stop the
-        # answer from streaming.
-        if self._put(f"/elements/{_STATUS_ID}/content", {"content": _grey(text)}):
-            self._status_written_at = time.monotonic()
-
     def open(self) -> bool:
         """Create the card entity and post it. False if CardKit is unavailable
         (e.g. the cardkit:card:write scope was never granted) — caller falls back."""
         tok = _tenant_token()
         if not (tok and self.chat_id):
             return False
+        self._keys = _animation_keys()
+        card = {"schema": "2.0",
+                "config": {"streaming_mode": True, "update_multi": True},
+                "body": {"elements": [it.element(keys=self._keys) for it in self._items]}}
         created = _post(f"{_API_DOMAIN}/open-apis/cardkit/v1/cards",
-                        {"type": "card_json",
-                         "data": json.dumps(_card_json(self._status_text(), True))},
-                        bearer=tok)
+                        {"type": "card_json", "data": json.dumps(card)}, bearer=tok)
         if created.get("code") not in (0, "0"):
             log.warning("card create failed (falling back to text): %s",
                         created.get("msg", created))
@@ -515,7 +706,7 @@ class StreamingCard:
             log.warning("card send failed (falling back to text): %s",
                         sent.get("msg", sent))
             return False
-        self.ok = True
+        self.ok = self.sent = True
         self._worker = threading.Thread(target=self._pump, daemon=True,
                                         name="cardkit-stream")
         self._worker.start()
@@ -523,8 +714,8 @@ class StreamingCard:
 
     def update(self, full_text: str) -> bool:
         """Hand over the accumulated text and return at once — the write happens on the
-        worker. Must be the full text so far, not a delta: CardKit renders the appended
-        tail with a typewriter effect.
+        worker. Must be the full text so far, not a delta: the open block is cut from it,
+        and CardKit renders the appended tail with a typewriter effect.
 
         The bool reports whether the card is still usable, which is now known one call
         late — a write that fails is discovered by the worker, so this returns False from
@@ -533,32 +724,42 @@ class StreamingCard:
         if not self.ok:
             return False
         with self._lock:
-            self._pending = full_text
-            if self._phase != "write":
+            self._full = full_text
+            # Leading whitespace is not the answer starting: the wait goes on until words.
+            if self._phase != "write" and full_text[self._text_from:].strip():
                 self._enter("write")
+            self._set_text(full_text[self._text_from:])
         self._wake.set()
         return True
 
     def close(self, final_text: str) -> bool:
-        """Write the final text, turn the status line into the summary panel, and turn
+        """Write the final text, freeze the last status line, add the summary, and turn
         streaming off so the card stops showing the typewriter indicator."""
-        if not self.ok:
-            return False
-        # Stop the worker first, then write the final text synchronously: the worker
-        # drops superseded states, and the last one must not be dropped.
+        # Stop the worker first, then write the final state synchronously: the worker
+        # drops superseded states, and the last one must not be dropped. Stopped on the
+        # failure path too, or it would retry a dead card for the life of the process.
         self._stop.set()
         self._wake.set()
         if self._worker is not None:
             self._worker.join(timeout=10)
+        if not self.ok:
+            self._abandon()
+            return False
         with self._lock:
             self._enter("done")
-        self._write(final_text)
+            # The final text is normally the accumulated one; when the caller replaced it
+            # (a consent prompt), the replacement takes the open block's place.
+            head = self._full[:self._text_from]
+            self._set_text(final_text[len(head):] if final_text.startswith(head)
+                           else final_text)
+            self._end_wait()
+        tail = _Item("tail", "band", self.summary())
+        with self._lock:
+            self._items.append(tail)
+        self._flush()
         if not self.ok:
+            self._abandon()
             return False
-        title, steps = self.summary()
-        # Losing the panel loses a footnote, not the answer, so it does not fail close().
-        self._put(f"/elements/{_STATUS_ID}",
-                  {"element": json.dumps(_summary_panel(title, steps))})
         if not self._put("/settings",
                          {"settings": json.dumps({"config": {"streaming_mode": False}})},
                          method="PATCH"):

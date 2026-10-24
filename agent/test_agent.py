@@ -665,10 +665,10 @@ def _load_card(monkeypatch_calls):
 
     def fake_call(method, url, body, bearer=""):
         content = body.get("content")
-        if content is None and "elements" in body:       # the answer's first write
-            content = json.loads(body["elements"])[0]["content"]
+        if content is None and "elements" in body:       # a block's first write
+            content = json.loads(body["elements"])[0].get("content")
         # Only the answer's text is under test here; status writes are counted elsewhere.
-        if "/elements/status" in url or url.endswith("/settings"):
+        if "/elements/p" in url or "/elements/tail" in url or url.endswith("/settings"):
             content = None
         monkeypatch_calls.append((method, content, body.get("sequence")))
         return {"code": 0}
@@ -732,20 +732,67 @@ def _recording_card():
         return {"code": 0}
     lark_notify._call = fake_call
     card = lark_notify.StreamingCard("oc_1")
-    card.card_id, card.ok = "c1", True
+    card.card_id, card.ok, card.sent = "c1", True, True
     return lark_notify, card, writes
 
 
-def test_the_answer_appears_above_the_status_line_then_streams_in_place():
-    """CardKit rejects an empty text update, so the answer element does not exist until
-    there are words for it — and it goes above the status, which stays at the bottom."""
+def _inserted(writes):
+    """(element_id, after) for every element added to the card, in order."""
+    return [(json.loads(b["elements"])[0]["element_id"], b["target_element_id"])
+            for m, p, b in writes if m == "POST" and p == "/elements"]
+
+
+def _shown(writes, eid):
+    """The last thing CardKit was told a status line says, inserted or replaced."""
+    def label(el):
+        inner = el["columns"][0]["elements"][0]
+        if inner["tag"] == "column_set":            # live: label and dots side by side
+            inner = inner["columns"][0]["elements"][0]
+        return inner["content"]
+    last = None
+    for m, p, b in writes:
+        if m == "POST" and p == "/elements":
+            el = json.loads(b["elements"])[0]
+            if el["element_id"] == eid:
+                last = label(el)
+        elif m == "PUT" and p == f"/elements/{eid}":
+            last = label(json.loads(b["element"]))
+    return last
+
+
+def _deleted(writes):
+    return [p.split("/")[-1] for m, p, _ in writes if m == "DELETE"]
+
+
+def test_status_lines_sit_between_the_texts_where_they_happened():
+    """Text, a tool, more text: the tool's line goes after the first text and stays there
+    as a record, and the second text goes after it. Nothing already shown moves."""
     ln, card, writes = _recording_card()
-    card._write("我先")
-    card._write("我先看一下")
-    (m1, p1, b1), (m2, p2, b2) = writes
-    assert (m1, p1, b1["type"], b1["target_element_id"]) == (
-        "POST", "/elements", "insert_before", "status")
-    assert (m2, p2, b2["content"]) == ("PUT", "/elements/answer/content", "我先看一下")
+    card.update("我先把仓库拉下来。"); card._flush()
+    card.tool_started(); card._flush()
+    card.tool_finished()
+    card.update("我先把仓库拉下来。下载成功，看一下结构："); card._flush()
+    assert card.close("我先把仓库拉下来。下载成功，看一下结构：") is True
+    assert _inserted(writes) == [("t1", "p0"), ("p2", "t1"), ("t3", "p2"), ("tail", "t3")]
+    # The opening "thinking" line was only a wait, so it goes; the tool line stays.
+    assert _deleted(writes) == ["p0"]
+    assert "🔧 调用工具 · " in _shown(writes, "p2") and "思考中" not in _shown(writes, "p2")
+    t3 = [json.loads(b["elements"])[0]["content"] for m, p, b in writes
+          if m == "POST" and "t3" in b["elements"]]
+    assert t3 == ["下载成功，看一下结构："], "each block holds only its own text"
+    assert writes[-1][1] == "/settings"          # streaming turned off last
+
+
+def test_consecutive_tool_calls_share_one_line():
+    ln, card, writes = _recording_card()
+    card.update("先查一下。"); card._flush()
+    for _ in range(2):
+        card.tool_started(); card.tool_finished()
+    card.update("先查一下。查到了。")
+    card.close("先查一下。查到了。")
+    pills = [i for i, _ in _inserted(writes) if i.startswith("p")]
+    assert pills == ["p2"]
+    assert "调用工具 ×2" in _shown(writes, "p2") and "思考中" not in _shown(writes, "p2")
 
 
 def test_the_tool_count_comes_from_results_not_from_starts():
@@ -753,56 +800,112 @@ def test_the_tool_count_comes_from_results_not_from_starts():
     would overcount; a result is one call that really ran."""
     ln, card, _ = _recording_card()
     card.tool_started(); card.tool_started(); card.tool_finished()
-    title, steps = card.summary()
-    assert "调用 1 次工具" in title
-    assert any(s.startswith("调用工具") for s in steps)
+    assert "1 次工具调用" in card.summary()
 
 
 def test_a_turn_without_tools_says_only_how_long_it_took():
     ln, card, _ = _recording_card()
-    title, _ = card.summary()
-    assert title.startswith("⚙️ 执行过程 · 耗时") and "工具" not in title
+    line = card.summary()
+    assert line.startswith("⏱️ 耗时") and "工具" not in line
 
 
-def test_closing_turns_the_status_into_a_collapsed_panel():
+def test_the_summary_is_a_full_width_band_at_the_end():
     ln, card, writes = _recording_card()
     card.update("答案")
     assert card.close("答案") is True
-    panel = [b for m, p, b in writes if m == "PUT" and p == "/elements/status"]
-    assert panel, "the status line must be replaced by the summary panel"
-    el = json.loads(panel[-1]["element"])
-    assert el["tag"] == "collapsible_panel" and el["expanded"] is False
-    assert writes[-1][1] == "/settings"          # streaming turned off last
+    tail = [json.loads(b["elements"])[0] for m, p, b in writes
+            if m == "POST" and '"tail"' in b["elements"]]
+    assert tail and tail[0]["background_style"] == "grey-50"
+    assert tail[0]["columns"][0]["width"] == "weighted"
+    assert "⏱️ 耗时" in tail[0]["columns"][0]["elements"][0]["content"]
 
 
-def test_a_failed_panel_write_does_not_cost_the_answer():
-    """The panel is a footnote. If CardKit refuses it the answer is still delivered and
-    the card is still closed, so the caller must not fall back to posting text again."""
+def test_a_failed_status_line_does_not_cost_the_answer():
+    """A status line is decoration. If CardKit refuses one the answer is still delivered
+    and the card closed, so the caller must not fall back to posting text again."""
     ln, card, writes = _recording_card()
     orig = ln._call
-    ln._call = lambda m, u, b, bearer="": ({"code": 1, "msg": "no"}
-                                           if u.endswith("/elements/status") and m == "PUT"
-                                           else orig(m, u, b, bearer))
-    assert card.close("答案") is True
+    ln._call = lambda m, u, b, bearer="": (
+        {"code": 1, "msg": "no"} if m == "POST" and '"column_set"' in b.get("elements", "")
+        else orig(m, u, b, bearer))
+    card.update("先查。"); card._flush()
+    card.tool_started(); card.tool_finished()
+    card.update("先查。好了。")
+    assert card.close("先查。好了。") is True
+    assert ("t3", "t1") in _inserted(writes), "text anchors on the text before it"
 
 
-def test_the_heartbeat_moves_the_seconds_only_while_waiting():
-    """A long tool call emits no event, so the status is refreshed on a timer while the
-    turn waits — and not once the answer is streaming, where it would only add writes."""
+def test_a_consent_prompt_replaces_the_half_sentence():
+    ln, card, writes = _recording_card()
+    card.update("让我查一下"); card._flush()
+    card.close("🔐 这一步需要访问你的 Lark 账号")
+    assert [b["content"] for m, p, b in writes if p == "/elements/t1/content"] == [
+        "🔐 这一步需要访问你的 Lark 账号"]
+
+
+def test_past_the_component_limit_the_answer_keeps_writing_without_new_lines():
+    """Measured: a card holds 200 components, and an insert past that is refused."""
+    ln, card, writes = _recording_card()
+    ln._MAX_GAPS = 1
+    text = ""
+    for part in ("一。", "二。", "三。"):
+        text += part
+        card.update(text); card._flush()
+        card.tool_started(); card.tool_finished(); card._flush()
+    card.close(text)
+    ids = [i for i, _ in _inserted(writes)]
+    assert ids == ["t1", "p2", "t3", "tail"]
+    assert [b["content"] for m, p, b in writes if p == "/elements/t3/content"][-1] == "二。三。"
+
+
+def test_a_wait_writes_only_when_its_state_changes():
+    """The live line moves by itself, so a long tool call costs no writes while it runs."""
     import threading, time as _t
     ln, card, writes = _recording_card()
-    ln._HEARTBEAT_SECONDS = 0.05
+    card._keys = {"think": "img_think", "work": "img_work"}
     card._worker = threading.Thread(target=card._pump, daemon=True)
     card._worker.start()
     card.tool_started()
-    _t.sleep(1.3)  # nosemgrep: arbitrary-sleep — lets a few heartbeats land
-    waiting = sum(1 for m, p, _ in writes if p == "/elements/status/content")
-    assert waiting >= 2, "the seconds must move during a tool call"
-    card.update("开始回答")
-    _t.sleep(1.3)  # nosemgrep: arbitrary-sleep — would expose a heartbeat that kept going
+    _t.sleep(1.5)  # nosemgrep: arbitrary-sleep — a clock would have written by now
     card._stop.set(); card._wake.set(); card._worker.join(timeout=2)
-    after = [b["content"] for m, p, b in writes if p == "/elements/status/content"][waiting:]
-    assert all("撰写" in c for c in after), f"heartbeat kept running while writing: {after}"
+    replaced = [json.loads(b["element"]) for m, p, b in writes if p == "/elements/p0"]
+    assert len(replaced) == 1, "one write for thinking → tool, none while it runs"
+    dots = replaced[0]["columns"][0]["elements"][0]["columns"][1]["elements"][0]
+    assert dots["img_key"] == "img_work"
+    assert _shown(writes, "p0") == "<font color='grey'>🔧 调用工具</font>"
+
+
+def test_thinking_leaves_a_line_with_how_long_it_took():
+    ln, card, writes = _recording_card()
+    card._phase_since -= 3                       # three seconds of thought
+    card.update("答案"); card.close("答案")
+    assert _shown(writes, "p0") == "<font color='grey'>🤔 思考 · 3 秒</font>"
+    assert "p0" not in _deleted(writes)
+
+
+def test_the_status_animations_ship_with_the_image():
+    """Read from agent/assets at run time; the Dockerfile has to copy them, and the image
+    tag has to change with them or a new animation is never built."""
+    import pathlib
+    sys.path.insert(0, os.path.dirname(__file__))
+    import lark_notify
+    here = pathlib.Path(__file__).parent
+    for name in lark_notify._ANIM_FILES.values():
+        assert (here / "assets" / name).read_bytes()[:6] in (b"GIF89a", b"GIF87a"), name
+    assert "COPY assets/" in (here / "Dockerfile").read_text()
+    assert 'glob.glob("assets/*")' in (here.parent / "scripts" / "provision.sh").read_text()
+
+
+def test_a_failed_animation_upload_is_not_retried_on_every_turn():
+    sys.path.insert(0, os.path.dirname(__file__))
+    import importlib
+    import lark_notify
+    importlib.reload(lark_notify)
+    with mock.patch.object(lark_notify, "upload_image",
+                           side_effect=lark_notify.LarkError("no")) as up:
+        assert lark_notify._animation_keys() == {}
+        assert lark_notify._animation_keys() == {}
+    assert up.call_count == 1
 
 
 def test_card_update_reports_failure_on_the_next_call():
@@ -824,6 +927,50 @@ def test_card_update_reports_failure_on_the_next_call():
         _t.sleep(0.02)  # nosemgrep: arbitrary-sleep — polls the worker in a unit test
     assert card.ok is False
     assert card.update("ab") is False      # now the caller is told
+
+
+def test_a_failed_card_stops_writing_instead_of_racing_the_text_fallback():
+    """Once the caller has posted the answer as text, a worker still retrying the card
+    could land the same answer there too when CardKit recovers."""
+    import threading, time as _t
+    ln, card, writes = _recording_card()
+    ln._call = lambda *a, **k: {"code": 99991400, "msg": "nope"}
+    card._worker = threading.Thread(target=card._pump, daemon=True)
+    card._worker.start()
+    card.update("a")
+    for _ in range(50):
+        if not card.ok:
+            break
+        _t.sleep(0.02)  # nosemgrep: arbitrary-sleep — polls the worker in a unit test
+    assert card.close("a") is False
+    assert not card._worker.is_alive()
+
+
+def test_a_given_up_card_does_not_keep_its_dots():
+    """The answer goes out as text, so nothing on the card may still look busy — not the
+    live line, and not one already marked for removal when the failure stopped the flush."""
+    ln, card, writes = _recording_card()
+    orig = ln._call
+    ln._call = lambda m, u, b, bearer="": (
+        {"code": 1, "msg": "no"} if m == "POST" and '"t1"' in b.get("elements", "")
+        else orig(m, u, b, bearer))
+    card.update("答案"); card._flush()           # p0 is dead, t1 is refused
+    assert card.ok is False
+    assert card.close("答案") is False
+    assert "p0" in _deleted(writes)
+    assert writes[-1][1] == "/settings"
+
+
+def test_a_network_error_is_a_failed_write_not_an_exception():
+    """_call only knew HTTPError; a timeout or an HTML 502 escaped close() and skipped the
+    text fallback."""
+    sys.path.insert(0, os.path.dirname(__file__))
+    import importlib
+    import lark_notify
+    importlib.reload(lark_notify)           # earlier tests replace _call itself
+    with mock.patch.object(lark_notify.urllib.request, "urlopen",
+                           side_effect=TimeoutError("slow")):
+        assert lark_notify._call("PUT", "https://x", {})["code"] == -1
 
 
 def test_stream_hands_over_every_delta_cumulatively():
@@ -870,6 +1017,32 @@ def test_stream_does_not_abort_on_websearch_when_unauthorized():
         text = agent_core._stream_to_chat(session, "今天天气", "oc_1")
     assert "walled_tool" not in session
     assert text == "天气是…晴天"           # the turn ran to completion
+
+
+def test_the_card_hears_of_a_tool_only_after_the_words_before_it():
+    """The graph runs on the agent loop and the card is fed from the consumer thread. A
+    tool event sent straight from the loop could overtake the last words before it, and
+    the card would cut the text block there — the tool line lost, a fragment left alone.
+    So tool events travel in the same queue as the text."""
+    class Timeline(FakeCard):
+        def __init__(self):
+            super().__init__()
+            self.seen = []
+
+        def tool_started(self):
+            self.seen.append(("start", self.updates[-1] if self.updates else ""))
+
+        def tool_finished(self):
+            self.seen.append(("finish", self.updates[-1] if self.updates else ""))
+
+    card = Timeline()
+    session = _session_for(["我先", "看一下。"], tool_calls=["lark_lookup"],
+                           follow_up="查到了。")
+    with _patch_notify(card, []):
+        agent_core._stream_to_chat(session, "msg", "oc_1")
+    assert card.seen[0] == ("start", "我先看一下。")
+    assert ("finish", "我先看一下。") in card.seen
+    assert card.updates[-1] == "我先看一下。查到了。"
 
 
 def test_stream_does_not_abort_when_authorized():
@@ -1719,16 +1892,16 @@ def test_the_claim_holder_repairs_its_own_thread():
 
 def test_the_card_says_when_the_thread_is_being_summarised():
     """A summary streams nothing for tens of seconds, which read as "thinking" — and looked
-    stuck. The phase has its own line, its heartbeat, and its own step in the panel."""
+    stuck. The phase has its own line, its heartbeat, and its own share of the summary."""
     ln, card, _ = _recording_card()
     card.compacting(True)
-    assert "整理较早的对话" in card._status_text()
+    assert card._live.content == ("🗜️ 正在整理较早的对话", "work")
+    # The phase lasted long enough to count: rewind its start.
+    card._phase_since -= 2
     card.compacting(False)
-    assert card._status_text().startswith("🤔")
-    # The phase lasted long enough to be a step: rewind its start so it counts.
-    card._phase, card._phase_since = "compact", card._phase_since - 2
-    card.compacting(False)
-    assert any(step.startswith("整理上下文") for step in card.summary()[1])
+    text, dots = card._live.content
+    assert text.startswith("🗜️ 整理较早的对话 · 2 秒") and "思考中" in text and dots == "think"
+    assert "整理上下文" in card.summary()
 
 
 def test_a_summary_inside_a_turn_tells_that_turns_card_start_and_end():

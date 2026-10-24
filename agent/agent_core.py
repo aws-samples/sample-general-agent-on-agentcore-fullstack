@@ -1238,6 +1238,8 @@ def _message_text(msg) -> str:
 
 
 _STREAM_END = object()
+# Marks a queued call for the consumer to make, rather than text to yield.
+_EVENT = object()
 
 
 def _run_config(session: dict, channel: delivery.Delivery) -> dict:
@@ -1261,8 +1263,22 @@ def _turn_input(message, message_id: str | None = None) -> list:
     return [HumanMessage(item[0], id=item[1] or None) for item in message]
 
 
+class _InStreamOrder:
+    """A card's status calls, queued behind the text the stream produced before them. The
+    graph runs on the agent loop and the card is fed from the consumer thread, so a call
+    made straight from the loop could reach the card ahead of the last words before it."""
+
+    def __init__(self, events: queue.Queue, card):
+        self._events, self._card = events, card
+
+    def compacting(self, started: bool) -> None:
+        self._events.put((_EVENT, self._card.compacting, started))
+
+
 def _iter_deltas(graph, message, config: dict, on_tool_use=None,
-                 on_tool_result=None, message_id: str | None = None):
+                 on_tool_result=None, message_id: str | None = None,
+                 on_tool_started=None, on_tool_finished=None,
+                 events: queue.Queue | None = None):
     """Yield text chunks from the graph's async stream, as a synchronous generator.
 
     The stream runs on the agent loop (where the MCP sessions live) and hands chunks
@@ -1272,8 +1288,10 @@ def _iter_deltas(graph, message, config: dict, on_tool_use=None,
     `on_tool_use(tool_name) -> bool` is consulted when the model starts a tool call;
     returning True abandons the stream. Used to cut a turn short the moment the model
     reaches for a tool whose system has no grant. `on_tool_result(name, text)` receives
-    each tool result, which is how the auth-wall fallback sees a server's refusal."""
-    q: queue.Queue = queue.Queue()
+    each tool result, which is how the auth-wall fallback sees a server's refusal. Both run
+    on the loop. `on_tool_started()` / `on_tool_finished()` run on the consumer instead, in
+    stream order with the text — `events` is the queue they share, for others to join."""
+    q: queue.Queue = events if events is not None else queue.Queue()
 
     async def _pump() -> None:
         try:
@@ -1283,6 +1301,8 @@ def _iter_deltas(graph, message, config: dict, on_tool_use=None,
                 if isinstance(chunk, ToolMessage):
                     if on_tool_result is not None:
                         on_tool_result(chunk.name, _message_text(chunk))
+                    if on_tool_finished is not None:
+                        q.put((_EVENT, on_tool_finished))
                     continue
                 # Only the model's own words are an answer. A node's output is replayed
                 # on this stream too, so the summary and any steered message — both
@@ -1297,13 +1317,17 @@ def _iter_deltas(graph, message, config: dict, on_tool_use=None,
                 # a call to a system with no grant is certain to be refused, so seeing
                 # one begin means the turn is already lost — stop rather than let the
                 # model narrate the refusal at length.
+                # The chunk's own words first: a tool event queued ahead of them would cut
+                # the card's text block before them.
+                text = _message_text(chunk)
+                if text:
+                    q.put(text)
                 for tc in getattr(chunk, "tool_call_chunks", None) or []:
                     name = tc.get("name")
                     if name and on_tool_use is not None and on_tool_use(name):
                         return
-                text = _message_text(chunk)
-                if text:
-                    q.put(text)
+                    if name and on_tool_started is not None:
+                        q.put((_EVENT, on_tool_started))
         except Exception as e:  # noqa: BLE001 — re-raised in the consumer
             q.put(e)
         finally:
@@ -1316,6 +1340,9 @@ def _iter_deltas(graph, message, config: dict, on_tool_use=None,
             return
         if isinstance(item, Exception):
             raise item
+        if isinstance(item, tuple) and item[0] is _EVENT:
+            item[1](*item[2:])
+            continue
         yield item
 
 
@@ -1382,8 +1409,10 @@ def _stream_to_chat(session: dict, message, chat_id: str,
     card = lark_notify.StreamingCard(chat_id)
     streaming = card.open()
     thread_id = (session.get("config") or {}).get("configurable", {}).get("thread_id", "")
+    events: queue.Queue = queue.Queue()
+    in_order = _InStreamOrder(events, card)
     if streaming and thread_id:
-        _turn_cards[thread_id] = card
+        _turn_cards[thread_id] = in_order
     try:
 
         # A tool whose system has no grant is certain to be refused, and letting the turn run
@@ -1397,21 +1426,16 @@ def _stream_to_chat(session: dict, message, chat_id: str,
             log.info("aborting turn: %s needs %s consent", tool_name, idp)
             return True
 
-        def _on_tool_use(tool_name: str) -> bool:
-            if _abort_on_ungranted_tool(tool_name):
-                return True
-            card.tool_started()
-            return False
-
         def _on_tool_result(name: str, text: str) -> None:
             session["tool_texts"].append((name, text))
-            card.tool_finished()
 
         acc = []
         for delta in _iter_deltas(session["graph"], message,
                                   _run_config(session, delivery.LarkDelivery(chat_id)),
-                                  on_tool_use=_on_tool_use, on_tool_result=_on_tool_result,
-                                  message_id=message_id):
+                                  on_tool_use=_abort_on_ungranted_tool,
+                                  on_tool_result=_on_tool_result, message_id=message_id,
+                                  on_tool_started=card.tool_started,
+                                  on_tool_finished=card.tool_finished, events=events):
             acc.append(delta)
             if streaming and not card.update("".join(acc)):
                 streaming = False  # a failed write drops us to the fallback below
@@ -1427,6 +1451,8 @@ def _stream_to_chat(session: dict, message, chat_id: str,
         if streaming:
             if not card.close(text):
                 streaming = False
+        elif getattr(card, "sent", False):
+            card.close(text)    # failed mid-stream: stops its worker, clears its live line
         if not streaming:
             # Either CardKit was never available or it failed mid-stream. Post the whole
             # answer as plain text so the user still gets it.
@@ -1435,7 +1461,7 @@ def _stream_to_chat(session: dict, message, chat_id: str,
         return text
     finally:
         # Only this turn's card: a later turn may already have registered its own.
-        if _turn_cards.get(thread_id) is card:
+        if _turn_cards.get(thread_id) is in_order:
             _turn_cards.pop(thread_id, None)
 
 
