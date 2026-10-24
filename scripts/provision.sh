@@ -326,14 +326,12 @@ env = {
 net = {"networkMode": "PUBLIC"}
 print(json.dumps({
     "agentRuntimeName": e["RNAME"],
-    # V2 restores each instance from one snapshot per version, so the ~12 s of imports is
-    # paid once per deploy instead of at every cold start — and a cold start happens per
-    # user whenever their cached session has expired, so the saving scales with users.
-    # Three platform behaviours were measured before enabling it (docs/agentcore-behavior.md):
+    # V2 here demonstrates the platform version; what it costs and gains against V1 is measured
+    # in docs/agentcore-behavior.md. Three behaviours were checked before enabling it:
     # session-to-instance affinity still holds, so the in-process turn lock stays valid; the
     # module-scope event loop and its MCP sessions survive a restore; and anything derived
     # at import is snapshot-shared, which is why server.py takes its instance identity on
-    # the first request. Creation now takes 120-150 s rather than seconds.
+    # the first request. Creation now takes 120-190 s rather than seconds.
     "platformVersion": platform_version,
     "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": e["IMAGE"]}},
     "roleArn": e["ROLE"],

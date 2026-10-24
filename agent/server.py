@@ -366,13 +366,14 @@ def build_http_app() -> web.Application:
 
 
 def _log_startup_breakdown() -> None:
-    """Break down the cold start, since AgentCore documents none of it and X-Ray
-    can't see it (its trace root is this process, so everything before OTel starts is
-    invisible). Log-only on purpose: /status stays readable, and whoever is measuring
-    cold starts is reading CloudWatch anyway.
+    """Split this process's start into what came before our code and our imports, since
+    AgentCore documents none of it and X-Ray can't see it (its trace root is this process).
+    Log-only on purpose: /status stays readable, and whoever is measuring is reading
+    CloudWatch anyway.
 
-    kernel age is the microVM's; the gap between it and this process's age is what
-    AgentCore spent booting and pulling the image before we got control.
+    kernel age is the microVM's, and the gap between it and this process's age is time the
+    microVM existed before our code ran — which can include time before any request
+    arrived, so it is not how long a caller waited. Only the caller can time that.
 
     On Runtime V2 this describes the snapshot build, not a restore: it runs before the
     snapshot is taken, so every restored instance inherits the figures rather than
