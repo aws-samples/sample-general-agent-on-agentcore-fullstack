@@ -8,7 +8,7 @@ Two layers, deliberately separate.
 tests/run.sh
 ```
 
-No AWS needed; everything is mocked. The tests themselves live next to the code they cover (`agent/test_agent.py`, `lambda/router/test_router.py`, `lambda/shim/test_shim.py`) and `run.sh` walks them, one process per suite: the router and shim dirs both define `index.py`, and the agent and router both define `identity.py`, so a single pytest session would import the wrong module for one of them. Each suite runs on the Python and requirements its code ships with: the agent suites on 3.11 with `agent/requirements.txt` (the image's), the Lambda suites on 3.13.
+No AWS needed; everything is mocked. The tests themselves live next to the code they cover (`agent/test_agent.py`, `lambda/router/test_router.py`, `lambda/shim/test_shim.py`) and `run.sh` walks them, one process per suite: the router and shim dirs both define `index.py`, and the agent and router both define `identity.py`, so a single pytest session would import the wrong module for one of them. Each suite runs on the Python and requirements its code ships with: Python 3.13 throughout, the agent suites with `agent/requirements.txt` (the image's).
 
 CI (`.github/workflows/test.yml`) runs `tests/run.sh` on every push to main and every pull request, and `bash -n` plus `shellcheck -S warning` over every tracked shell script. The deploy scripts have no unit tests: they are a sequence of AWS calls, so a real deploy is what verifies them.
 

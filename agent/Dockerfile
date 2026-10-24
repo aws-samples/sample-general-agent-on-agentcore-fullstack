@@ -1,26 +1,27 @@
 # Agent container for Bedrock AgentCore Runtime (ARM64).
 #
-# Amazon Linux 2023 because the agent's dependencies install cleanly on its python3.11.
+# Amazon Linux 2023 because the agent's dependencies install cleanly on its packaged Python.
 # It used to be here for a stronger reason — `mount.s3files` from amazon-efs-utils, which
 # needed root — and that reason is gone: the per-user mount now happens inside the Code
 # Interpreter session, not in this container. So nothing here needs root, and it runs as a
 # dedicated user.
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023
 
-# python3.11 is what AL2023 packages. shadow-utils is for useradd: the minimal AL2023 image
-# has none, and without it the USER line below fails the build with exit 127.
-RUN dnf install -y --setopt=install_weak_deps=False python3.11 python3.11-pip shadow-utils \
+# python3.13 matches the Lambdas and the CDK app; AL2023 packages 3.11 to 3.14.
+# shadow-utils is for useradd: the minimal AL2023 image has none, and without it the USER
+# line below fails the build with exit 127.
+RUN dnf install -y --setopt=install_weak_deps=False python3.13 python3.13-pip shadow-utils \
     && dnf clean all && rm -rf /var/cache/dnf
 
 WORKDIR /app
 
 # Install deps first for layer caching.
 COPY requirements.txt /app/requirements.txt
-RUN python3.11 -m pip install --no-cache-dir -r /app/requirements.txt
+RUN python3.13 -m pip install --no-cache-dir -r /app/requirements.txt
 
 # `python3` must reach the interpreter that has the agent's dependencies, which is what
 # entrypoint.sh invokes.
-RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+RUN ln -sf /usr/bin/python3.13 /usr/local/bin/python3
 
 COPY *.py /app/
 COPY assets/ /app/assets/

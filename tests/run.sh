@@ -10,8 +10,8 @@ set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 # Each suite runs on the Python and the requirements its code is deployed with, outside the
-# root project (the CDK app). The agent image is AL2023's python3.11; the Lambdas are 3.13.
-agent_py()  { uv run --no-project --python 3.11 --with-requirements agent/requirements.txt --with pytest "$@"; }
+# root project (the CDK app). The agent image and the Lambdas are all Python 3.13.
+agent_py()  { uv run --no-project --python 3.13 --with-requirements agent/requirements.txt --with pytest "$@"; }
 lambda_py() { uv run --no-project --python 3.13 --with boto3 --with pytest "$@"; }
 
 echo "== agent =="
