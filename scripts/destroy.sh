@@ -8,7 +8,7 @@
 #
 # Order: what the CLI created (runtimes, code interpreters, gateway, Memory, images) →
 # S3 Files access points → every CDK stack → identity and secrets → log groups last.
-# The access points belong to no stack yet pin the storage stack's file system. AgentCore's
+# The access points belong to no stack yet pin the sandbox stack's file system. AgentCore's
 # network interfaces in its subnets pin it too, until AgentCore releases them (up to 8 h);
 # while they remain, that stack and the two it imports from are left for a re-run.
 # Everything is discovered dynamically by name (no hardcoded ids), so this is
@@ -174,14 +174,14 @@ fi
 # --- 1c. S3 Files Access Points (created at runtime by the broker) --------
 # One per user, created on first mount — so CloudFormation has never heard of them, and
 # deleting the file system while they exist either fails or orphans them. They also keep
-# the file system undeletable, which then blocks the whole storage stack.
+# the file system undeletable, which then blocks the whole sandbox stack.
 #
 # Done through boto3 rather than `aws s3files`: that subcommand is missing from AWS CLI
 # 2.34 (verified), so a CLI-based delete fails silently on an otherwise current machine.
 # The service itself is fine — the API answers, the CLI just has no word for it yet.
-if aws cloudformation describe-stacks --stack-name "$PREFIX-storage" >/dev/null 2>&1; then
+if aws cloudformation describe-stacks --stack-name "$PREFIX-sandbox" >/dev/null 2>&1; then
   log "S3 Files — per-user access points"
-  fs_id="$(aws cloudformation describe-stacks --stack-name "$PREFIX-storage" \
+  fs_id="$(aws cloudformation describe-stacks --stack-name "$PREFIX-sandbox" \
     --query "Stacks[0].Outputs[?OutputKey=='FileSystemId'].OutputValue" \
     --output text 2>/dev/null)"
   if [ -n "$fs_id" ] && [ "$fs_id" != "None" ]; then
@@ -216,11 +216,11 @@ fi
 # never deployed is skipped, and CDK orders the deletions by dependency.
 CDK_CTX=(-c "deployment_name=$PREFIX" -c files_storage=true -c webui=true
          -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}" --output "$CDK_OUT")
-# While AgentCore still holds interfaces in the sandbox subnets, the storage stack cannot
+# While AgentCore still holds interfaces in the sandbox subnets, the sandbox stack cannot
 # delete them (DependencyViolation), and agentcore and security, which it imports from,
 # cannot go before it. Trying anyway leaves all three DELETE_FAILED; leaving them for a
 # re-run does not.
-vpc="$(aws ec2 describe-vpcs --filters "Name=tag:aws:cloudformation:stack-name,Values=$PREFIX-storage" \
+vpc="$(aws ec2 describe-vpcs --filters "Name=tag:aws:cloudformation:stack-name,Values=$PREFIX-sandbox" \
          --query 'Vpcs[0].VpcId' --output text 2>/dev/null || true)"
 held=""
 if [ -n "$vpc" ] && [ "$vpc" != "None" ]; then
@@ -228,7 +228,7 @@ if [ -n "$vpc" ] && [ "$vpc" != "None" ]; then
             "Name=interface-type,Values=agentic_ai" --query 'NetworkInterfaces[].NetworkInterfaceId' \
             --output text 2>/dev/null || true)"
 fi
-KEPT=("$PREFIX-storage" "$PREFIX-agentcore" "$PREFIX-security")
+KEPT=("$PREFIX-sandbox" "$PREFIX-agentcore" "$PREFIX-security")
 if [ -z "$held" ]; then
   log "CDK — destroy every stack of this app"
   $CDK destroy --all "${CDK_CTX[@]}" --force

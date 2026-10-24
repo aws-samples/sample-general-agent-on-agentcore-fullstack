@@ -74,7 +74,7 @@ Four layers ship switched off, because each adds cost or console work: `WEB_SEAR
 |---|---|
 | `app.py`, `cdk.json` | CDK app (uv-managed deps). Deployment state goes to `.cdk-state.<DEPLOYMENT_NAME>.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
-| `stacks/` | security, agentcore, router, shim, gateway, observability, plus storage and webui when their flags are on |
+| `stacks/` | security, agentcore, router, shim, gateway, observability, plus sandbox and webui when their flags are on |
 | `agent/` | the agent container: HTTP contract + DynamoDB checkpoints + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`). `code_tools.py` runs generated code in a per-user sandbox; `agui.py` serves the browser off the same Runtime; `a2a_server.py` is a second entrypoint on the same image (`SERVER_MODE=a2a`) |
 | `webui/` | the web chat page — one static file, no build step; deploy-time values arrive as `config.js` |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |

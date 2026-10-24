@@ -1,4 +1,5 @@
-"""Per-user file storage for code execution: S3 Files, mounted into the sandbox.
+"""The code sandbox: its VPC, its execution role, and the per-user S3 Files workspace
+mounted into it.
 
 Only deployed when the `files_storage` context flag is true. What sits in this VPC is the
 Code Interpreter session; it reaches S3 through a free gateway endpoint, and the agent
@@ -34,7 +35,7 @@ _NFS_PORT = 2049
 _SANDBOX_SUBNETS = "isolated"
 
 
-class StorageStack(Stack):
+class SandboxStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, *,
                  user_files_bucket: s3.IBucket, nat_gateway: bool = False,
                  **kwargs) -> None:
@@ -197,6 +198,9 @@ class StorageStack(Stack):
                 f"arn:aws:elasticfilesystem:{region}:{account}:file-system/"
                 f"{self.file_system.attr_file_system_id}",
             ]))
+        self.code_interpreter_role.add_to_policy(iam.PolicyStatement(
+            actions=["polly:*", "transcribe:*"],
+            resources=["*"]))
 
         # Code Interpreter traffic is the only S3 traffic in this VPC, and it needs only the
         # user-files bucket (the mount's backing store). Without this, any credential or

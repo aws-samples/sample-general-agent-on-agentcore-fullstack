@@ -139,10 +139,10 @@ base_cdk_stacks() {
   log "Base — CDK stacks"
   local stacks=("$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router"
                 "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability")
-  # The storage stack only exists when the flag is on (app.py skips it otherwise), so
+  # The sandbox stack only exists when the flag is on (app.py skips it otherwise), so
   # naming it unconditionally would fail the deploy rather than skip it.
   if [ "$FILES_STORAGE" = "true" ]; then
-    stacks+=("$PREFIX-storage")
+    stacks+=("$PREFIX-sandbox")
     if [ "$NAT_GATEWAY" = "true" ]; then
       echo "  code execution: on (VPC with a NAT gateway + S3 Files; the sandbox has internet)"
     else
@@ -257,10 +257,10 @@ phase2_runtime() {
     echo "${PREFIX//-/_}_mcp runtime not found — run ./deploy.sh mcp first"; exit 1; }
 
   # Code execution: the Runtime stays PUBLIC. Only the Code Interpreter session joins the
-  # storage VPC, and only the ids it needs are baked in here. See docs/architecture.md.
+  # sandbox VPC, and only the ids it needs are baked in here. See docs/architecture.md.
   local fs_arn="" ci_id=""
   if [ "$FILES_STORAGE" = "true" ]; then
-    fs_arn="$(cfn_out "$PREFIX-storage" FileSystemArn)"
+    fs_arn="$(cfn_out "$PREFIX-sandbox" FileSystemArn)"
     ci_id="$(ctx_get code_interpreter_id)"
     [ -n "$ci_id" ] || { echo "no code interpreter — run --code first"; exit 1; }
     echo "  code execution: on (interpreter $ci_id)"
@@ -405,16 +405,16 @@ phase_code() {
     echo "  code execution: off (set FILES_STORAGE=true in .env)"; return 0
   fi
   local role subnets sg name existing
-  role="$(cfn_out "$PREFIX-storage" CodeInterpreterRoleArn)"
-  subnets="$(cfn_out "$PREFIX-storage" SandboxSubnetIds)"
-  sg="$(cfn_out "$PREFIX-storage" SandboxSecurityGroupId)"
+  role="$(cfn_out "$PREFIX-sandbox" CodeInterpreterRoleArn)"
+  subnets="$(cfn_out "$PREFIX-sandbox" SandboxSubnetIds)"
+  sg="$(cfn_out "$PREFIX-sandbox" SandboxSecurityGroupId)"
   [ -n "$subnets" ] && [ "$subnets" != "None" ] && [ -n "$role" ] && [ "$role" != "None" ] || {
-    echo "storage stack outputs missing — run --base with FILES_STORAGE=true first"; exit 1; }
+    echo "sandbox stack outputs missing — run --base with FILES_STORAGE=true first"; exit 1; }
   name="${PREFIX//-/_}_code"
 
   # VPC mode, not SANDBOX: measured — filesystemConfigurations is refused outside VPC mode
   # ("VPC network mode is required when filesystemConfigurations are provided"). The mount
-  # needs only the S3 gateway endpoint the storage stack creates; NAT_GATEWAY adds internet.
+  # needs only the S3 gateway endpoint the sandbox stack creates; NAT_GATEWAY adds internet.
   #
   # No filesystemConfigurations here on purpose: the mount is named per session, so one
   # shared interpreter serves every user with their own Access Point. See docs/architecture.md.

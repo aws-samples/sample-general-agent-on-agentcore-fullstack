@@ -8,7 +8,7 @@ in a custom header, holding no downstream credential of its own.
 
 Deployment is hybrid:
   CDK:  security, agentcore base (role/ECR/S3), shim, router, gateway, observability,
-        and storage when files_storage=true
+        and sandbox when files_storage=true
   CLI:  the AgentCore Runtimes, Memory, the OAuth provider and the Web Search gateway,
         created by deploy.sh through control-plane APIs; ids fed back via .cdk-state.<name>.json
 """
@@ -25,7 +25,7 @@ from stacks.router_stack import RouterStack
 from stacks.gateway_stack import GatewayStack
 from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
-from stacks.storage_stack import StorageStack
+from stacks.sandbox_stack import SandboxStack
 from stacks.webui_stack import WebUiStack
 
 app = cdk.App()
@@ -89,16 +89,16 @@ shim = ShimStack(
     env=env,
 )
 
-# --- Storage: S3 Files, mounted per user into the code sandbox (opt-in) ---
+# --- Sandbox: the code sandbox's VPC, role and per-user S3 Files workspace (opt-in) ---
 # Off unless files_storage=true. Only the Code Interpreter session sits in this VPC and it
 # reaches S3 through a free gateway endpoint; nat_gateway=true adds a NAT for internet —
 # see docs/architecture.md. Declared before the router so its ids are available to the
 # phases that need them.
-storage = None
+sandbox = None
 if _flag("files_storage"):
-    storage = StorageStack(
+    sandbox = SandboxStack(
         app,
-        f"{prefix}-storage",
+        f"{prefix}-sandbox",
         user_files_bucket=agentcore.user_files_bucket,
         nat_gateway=_flag("nat_gateway"),
         env=env,
@@ -135,7 +135,7 @@ if _flag("webui"):
         f"{prefix}-webui",
         # From .cdk-state.<name>.json, not router.api_url: a CDK reference makes the router
         # unable to change an export this stack imports (UPDATE_ROLLBACK, measured), the
-        # same deadlock the storage stack hit.
+        # same deadlock the sandbox stack hit.
         router_api_url=ctx("router_api_url") or "",
         # From .env, which deploy.sh sources — the page needs it for requestAuthCode.
         lark_app_id=os.environ.get("LARK_APP_ID", ""),

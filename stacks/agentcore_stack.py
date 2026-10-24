@@ -222,7 +222,7 @@ class AgentCoreStack(Stack):
 
         # Code execution: one shared Code Interpreter, one Access Point per user, and the
         # session mounts that user's Access Point. The agent creates the Access Point on
-        # first use and drives sessions; the sandbox runs under its own role (storage
+        # first use and drives sessions; the sandbox runs under its own role (sandbox
         # stack), so model-written code never holds this one. See docs/architecture.md.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -246,7 +246,7 @@ class AgentCoreStack(Stack):
                 resources=["*"],
             )
         )
-        # Mounting is not here: it is the Code Interpreter's own role (storage stack) that
+        # Mounting is not here: it is the Code Interpreter's own role (sandbox stack) that
         # mounts, and this role never does.
 
         # ECR pull (agent image lives in the CDK assets repo).
