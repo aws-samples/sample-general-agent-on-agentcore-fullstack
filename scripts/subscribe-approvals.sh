@@ -21,7 +21,7 @@ ACTION="subscribe"
 
 : "${LARK_APP_ID:?set LARK_APP_ID in .env}"
 : "${LARK_APP_SECRET:?set LARK_APP_SECRET in .env}"
-DOMAIN="${LARK_API_DOMAIN:-https://open.larksuite.com}"
+DOMAIN="${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}"
 
 if [ -z "${AGENT_DECIDE_APPROVAL_CODES:-}" ]; then
   echo "AGENT_DECIDE_APPROVAL_CODES is empty — nothing to $ACTION."

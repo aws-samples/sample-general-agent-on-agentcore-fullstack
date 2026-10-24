@@ -15,6 +15,7 @@ from unittest import mock
 import pytest
 
 os.environ.setdefault("AWS_REGION", "us-west-2")
+os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
 os.environ.setdefault("IDENTITY_TABLE_NAME", "test-identity")
 os.environ.setdefault("LARK_SECRET_ID", "test/lark")
 os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:1:runtime/x")

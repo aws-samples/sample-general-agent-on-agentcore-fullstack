@@ -9,6 +9,7 @@ vanish, or worse, belong to somebody else.
 from __future__ import annotations
 
 import inspect
+import os
 import sys
 from pathlib import Path
 from unittest import mock
@@ -16,6 +17,9 @@ from unittest import mock
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+# What a deploy injects; the modules read it at import and have no fallback.
+os.environ.setdefault("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
+os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
 
 import code_tools  # noqa: E402
 import delivery  # noqa: E402

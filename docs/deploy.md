@@ -4,7 +4,7 @@ The README has the short version. This page is the detail: every step, every opt
 
 ## Steps
 
-Prereqs: `uv`, Docker, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `agentcore-fullstack` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
+Prereqs: `uv` (Docker only with `AGENT_BUILD=local`), the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `agentcore-fullstack` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
 
 ```bash
 cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID) + Lark appId/appSecret/encryptKey/token + your open_id
@@ -65,7 +65,7 @@ The allowlist gates *conversations*. It also gates whether an approval event is 
 
 This deploys billable AWS resources. All the always-on pieces are consumption- or per-unit-priced (no fixed reservation), so an idle single-user demo in us-west-2 is on the order of a couple USD/month before model usage; the variable cost is dominated by the agent's Bedrock calls. Verify current rates on the AWS pricing pages — figures below are as researched, not a quote.
 
-- **Bedrock model invocations** — the main usage-sensitive line; priced per input/output token on the model in `default_model_id`. A chatty demo is cents-to-dollars; a load test is not.
+- **Bedrock model invocations** — the main usage-sensitive line; priced per input/output token on the model in `MODEL_ID`. A chatty demo is cents-to-dollars; a load test is not.
 - **AgentCore Runtime ×2–3** — the agent and the lark-cli MCP server always, plus the approval MCP server if `AGENT_DECIDE_APPROVAL_CODES` is set. Each is metered per-second: CPU (`~$0.0895/vCPU-hour`) only during active processing, memory (`~$0.00945/GB-hour`) continuously while the microVM is alive. So each extra MCP server adds idle memory-time even when nothing calls it — which is why the approval one is gated on that variable rather than always deployed, and why grouping tools by trust boundary has a running cost.
 - **AgentCore Identity Token Vault (3LO)** — stores/refreshes/injects each user's Lark token natively. No separate per-user Secrets Manager charge (unlike the interceptor variant).
 - **DynamoDB + S3 (checkpoints)** — on-demand writes, one item per superstep, with state over ~350 KB spilled to S3. Table TTL expires old threads; nothing is billed for retention beyond storage.
@@ -87,7 +87,7 @@ The four extension points that need no new plumbing:
 |---|---|
 | A tool server | Create `mcp-servers/<name>/` with a `Dockerfile`, a server speaking MCP on `:8000`, and a `runtime.env` (`RUNTIME_SUFFIX`, `IMAGE_TAG`, `RUNTIME_ENV_MAP`, optional `DEPLOY_IF` gate and `REQUIRE_VARS`), then `./deploy.sh mcp <name>`. `scripts/build-mcp.sh` needs no edit — each server describes itself. The agent must be pointed at the new Runtime's URL, the way `APPROVAL_MCP_URL` is in `scripts/provision.sh` |
 | A downstream system with its own login | Register an OAuth credential provider, add an MCP server, and one entry each in `IDP_REGISTRY` (router) and `_DOWNSTREAMS` (agent) — `/auth` then reports it, `/auth <key>` consents to it, and its tools ask for that system's consent. Built-in vendors need no shim; anything non-standard needs one like `lambda/shim/`. Recipe: `docs/per-user-oauth.md` |
-| A different model | `MODEL_ID` in `.env` (falls back to `default_model_id` in `cdk.json`), then `./deploy.sh runtime` |
+| A different model | `MODEL_ID` in `.env`, then `./deploy.sh runtime` |
 | A different system prompt | `AGENT_SYSTEM_PROMPT` in `.env`, passed through to the Runtime by `./deploy.sh runtime`. Blank keeps the default in `agent/agent_core.py`, which is short on purpose |
 
 Two structural constraints shape anything larger. **One Runtime per MCP server** — `protocolConfiguration.serverProtocol` is a single value and a container exposes one MCP endpoint, so tools are grouped by trust boundary rather than packed together, which is why `lark-cli` (acts as the user) and `approval` (acts as the app) are separate servers. And **a Runtime-hosted MCP server cannot receive a per-user token from the Gateway**, so the agent fetches tokens itself and passes them in a custom header; a tool server on an addressable HTTPS endpoint could use the managed Gateway path instead. Both are explained in `docs/agentcore-behavior.md`.

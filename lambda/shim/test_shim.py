@@ -3,8 +3,12 @@
 import base64
 import io
 import json
+import os
 import urllib.error
 from unittest import mock
+
+# What the stack injects; index reads it at import and has no fallback.
+os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
 
 import index
 
@@ -175,3 +179,16 @@ def test_return_url_reports_a_failed_completion():
 def test_return_url_missing_userid():
     r = index.handler(_evt("GET", "/return", qs={"session_id": "sess-uri"}), None)
     assert r["statusCode"] == 400 and "userId" in r["body"]
+
+
+def test_the_authorize_host_follows_the_api_domain():
+    """One source: Lark and Feishu both put authorize on accounts.* next to open.*."""
+    assert index._authorize_domain("https://open.larksuite.com") == "https://accounts.larksuite.com"
+    assert index._authorize_domain("https://open.feishu.cn") == "https://accounts.feishu.cn"
+
+
+def test_an_api_domain_it_cannot_map_is_refused():
+    import pytest
+    for bad in ("https://accounts.larksuite.com", "open.feishu.cn", "https://example.com"):
+        with pytest.raises(ValueError):
+            index._authorize_domain(bad)

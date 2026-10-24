@@ -47,7 +47,7 @@ _SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on
 _LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
 _SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 _CUSTOM_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"
-_API_DOMAIN = os.environ.get("LARK_API_DOMAIN", "https://open.larksuite.com").rstrip("/")
+_API_DOMAIN = os.environ["LARK_API_DOMAIN"].rstrip("/")  # injected at deploy, from .env
 
 log = logging.getLogger("agent.lark_3lo")
 

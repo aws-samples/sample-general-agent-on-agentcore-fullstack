@@ -48,6 +48,12 @@ export AWS_REGION="$REGION" UV_LINK_MODE=copy
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"
 CDK="npx --yes aws-cdk@2"
+: "${MODEL_ID:?set MODEL_ID in .env}"
+: "${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}"
+# Every cdk deploy gets the same context: a deploy that omitted one would synth that stack
+# with the switch off and tear the resources out.
+CDK_CTX=(-c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY"
+         -c "agent_build=$AGENT_BUILD" -c "lark_api_domain=$LARK_API_DOMAIN")
 . scripts/lib/codebuild.sh
 
 # Control-plane calls whose parameters are newer than the AWS CLI's bundled service model.
@@ -155,7 +161,7 @@ base_cdk_stacks() {
   else
     echo "  code execution: off"
   fi
-  $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" \
+  $CDK deploy "${stacks[@]}" "${CDK_CTX[@]}" \
              --require-approval never --outputs-file cdk.out/outputs.json
   # The web page needs this and CDK assigns it, so it travels through state rather than a
   # cross-stack export — importing it would freeze the router's own exports.
@@ -222,7 +228,7 @@ phase2_runtime() {
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
   pwsecret="$PREFIX/cognito-password-secret"
   ws_url="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('websearch_gateway_url',''))" 2>/dev/null)"
-  model="${MODEL_ID:-$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['default_model_id'])")}"
+  model="$MODEL_ID"
   memory="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('memory_id',''))" 2>/dev/null)"
   shim="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
 
@@ -278,7 +284,7 @@ phase2_runtime() {
     CODE_NET="$([ -n "$ci_id" ] && [ "$NAT_GATEWAY" = "true" ] && echo true || true)" \
     GOOGLE_URL="$google_url" \
     CKPT_TABLE="$ckpt_table" CKPT_BUCKET="$ckpt_bucket" \
-    LARK_DOMAIN="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
+    LARK_DOMAIN="$LARK_API_DOMAIN" \
     uv run python - <<'PYEOF'
 import json, os
 e = os.environ
@@ -383,7 +389,7 @@ print(json.dumps(p))')" >/dev/null
   # The router's AGENTCORE_RUNTIME_ARN was synthesised before the runtime existed (a
   # PLACEHOLDER), so re-deploy it now that the real id is known.
   log "Router — re-deploy with the real runtime ARN"
-  $CDK deploy "$PREFIX-router" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" --require-approval never
+  $CDK deploy "$PREFIX-router" "${CDK_CTX[@]}" --require-approval never
 
   # AgentCore keeps serving existing sessions from the OLD container, so stored session
   # ids would pin users to the previous image. Drop them: the next message starts a new
@@ -551,7 +557,7 @@ phase_webui() {
   if [ "${WEBUI:-false}" != "true" ]; then
     echo "  webui: off (set WEBUI=true in .env)"; return 0
   fi
-  $CDK deploy "$PREFIX-webui" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" \
+  $CDK deploy "$PREFIX-webui" -c webui=true "${CDK_CTX[@]}" \
              --require-approval never
   local url
   url="$(cfn_out "$PREFIX-webui" WebUiUrl)"
@@ -559,7 +565,7 @@ phase_webui() {
   # assigns the domain now — so it travels through .cdk-state.json and the router is
   # re-deployed, the same route the file system id takes.
   ctx_set web_origin "$url"
-  $CDK deploy "$PREFIX-router" -c webui=true -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY" -c "agent_build=$AGENT_BUILD" \
+  $CDK deploy "$PREFIX-router" -c webui=true "${CDK_CTX[@]}" \
              --exclusively --require-approval never
   log "Web chat: $url  (register this domain on the Lark h5 app)"
 }

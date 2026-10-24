@@ -32,7 +32,7 @@ export AWS_REGION="$REGION"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.86}"   # engine = official lark-cli (not lark-mcp)
-LARK_API_DOMAIN="${LARK_API_DOMAIN:-https://open.larksuite.com}"   # CN: open.feishu.cn
+: "${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}"
 : "${LARK_APP_ID:?set LARK_APP_ID in .env}"
 
 . scripts/lib/codebuild.sh

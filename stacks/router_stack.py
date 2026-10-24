@@ -35,6 +35,7 @@ class RouterStack(Stack):
         runtime_arn: str,
         runtime_endpoint_qualifier: str,
         lark_secret_name: str,
+        lark_api_domain: str,
         shim_return_url: str,
         user_pool_id: str,
         user_pool_arn: str,
@@ -52,7 +53,6 @@ class RouterStack(Stack):
         timeout = int(self.node.try_get_context("lambda_timeout_seconds") or "60")
         memory = int(self.node.try_get_context("lambda_memory_mb") or "256")
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
-        lark_api_domain = self.node.try_get_context("lark_api_domain") or "https://open.larksuite.com"
         fn_name = f"{prefix}-router"
 
         # --- DynamoDB identity table (shared with WebUI stack) ---

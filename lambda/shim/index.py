@@ -12,8 +12,8 @@ Routes (API Gateway HTTP API, payload v2):
   GET  /return     -> 3LO return-url: calls CompleteResourceTokenAuth, shows a done page
 
 The authorize host (accounts.larksuite.com) differs from the token host
-(open.larksuite.com) — token domain comes from LARK_API_DOMAIN, authorize domain
-is derived from it.
+(open.larksuite.com). Both come from LARK_API_DOMAIN: the authorize host is the same host
+with accounts. in place of open., which holds for Lark and Feishu alike.
 """
 
 from __future__ import annotations
@@ -32,13 +32,20 @@ logger.setLevel(logging.INFO)
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 # Token host, e.g. https://open.larksuite.com (or open.feishu.cn).
-_TOKEN_DOMAIN = os.environ.get("LARK_API_DOMAIN", "https://open.larksuite.com").rstrip("/")
+_TOKEN_DOMAIN = os.environ["LARK_API_DOMAIN"].rstrip("/")
+
+
+def _authorize_domain(api_domain: str) -> str:
+    """The accounts.* host for an open.* API domain. Refuses anything else, rather than
+    authorizing against the token host and failing only when a user clicks the link."""
+    scheme, sep, host = api_domain.partition("://")
+    if not sep or not host.startswith("open."):
+        raise ValueError(f"LARK_API_DOMAIN must be https://open.<host>, not {api_domain!r}")
+    return f"{scheme}://accounts.{host[len('open.'):]}"
+
+
 # Authorize lives on the accounts.* host, not open.*.
-_AUTHORIZE_DOMAIN = (
-    os.environ.get("LARK_ACCOUNTS_DOMAIN")
-    or _TOKEN_DOMAIN.replace("open.larksuite.com", "accounts.larksuite.com")
-              .replace("open.feishu.cn", "accounts.feishu.cn")
-)
+_AUTHORIZE_DOMAIN = _authorize_domain(_TOKEN_DOMAIN)
 _TOKEN_URL = f"{_TOKEN_DOMAIN}/open-apis/authen/v2/oauth/token"
 _AUTHORIZE_URL = f"{_AUTHORIZE_DOMAIN}/open-apis/authen/v1/authorize"
 

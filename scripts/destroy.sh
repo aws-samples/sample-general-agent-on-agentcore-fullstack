@@ -208,7 +208,7 @@ fi
 # --- 2. CDK stacks --------------------------------------------------------
 # Every optional stack switched on, so whatever was deployed is in the app; a stack that was
 # never deployed is skipped, and CDK orders the deletions by dependency.
-CDK_CTX=(-c files_storage=true -c webui=true)
+CDK_CTX=(-c files_storage=true -c webui=true -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}")
 # While AgentCore still holds interfaces in the sandbox subnets, the storage stack cannot
 # delete them (DependencyViolation), and agentcore and security, which it imports from,
 # cannot go before it. Trying anyway leaves all three DELETE_FAILED; leaving them for a

@@ -41,9 +41,14 @@ if _state.is_file():
 ctx = app.node.try_get_context
 
 env = cdk.Environment(
-    account=ctx("account") or os.environ.get("CDK_DEFAULT_ACCOUNT"),
-    region=ctx("region") or os.environ.get("CDK_DEFAULT_REGION") or "us-west-2",
+    account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
+    region=os.environ.get("CDK_DEFAULT_REGION") or "us-west-2",
 )
+# From .env via the deploy scripts (-c lark_api_domain=...); no default here, so a missing
+# value stops the synth instead of quietly pointing a Feishu tenant at Lark.
+lark_api_domain = ctx("lark_api_domain")
+if not lark_api_domain:
+    raise SystemExit("lark_api_domain context is missing — set LARK_API_DOMAIN in .env and deploy with ./deploy.sh")
 
 prefix = ctx("resource_prefix") or "agentcore-fullstack"
 
@@ -75,7 +80,7 @@ agentcore = AgentCoreStack(
 shim = ShimStack(
     app,
     f"{prefix}-shim",
-    lark_api_domain=ctx("lark_api_domain") or "https://open.larksuite.com",
+    lark_api_domain=lark_api_domain,
     lark_secret_name=security.lark_secret.secret_name,
     env=env,
 )
@@ -105,6 +110,7 @@ router = RouterStack(
     web_allowed_origins=ctx("web_origin") or "",
     runtime_arn=agentcore.runtime_arn,
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
+    lark_api_domain=lark_api_domain,
     lark_secret_name=security.lark_secret.secret_name,
     shim_return_url=shim.return_url,
     user_pool_id=security.user_pool_id,

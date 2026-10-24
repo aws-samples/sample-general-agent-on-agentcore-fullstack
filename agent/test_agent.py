@@ -24,6 +24,9 @@ from unittest import mock
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+# What a deploy injects; the modules read it at import and have no fallback.
+os.environ.setdefault("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
+os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
 
 import agent_core
 

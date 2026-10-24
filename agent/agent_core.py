@@ -62,7 +62,7 @@ import websearch
 log = logging.getLogger("agent.core")
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
-_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
+_MODEL_ID = os.environ["BEDROCK_MODEL_ID"]  # injected at deploy, from MODEL_ID in .env
 _MEMORY_ID = os.environ.get("BEDROCK_AGENTCORE_MEMORY_ID", "")
 _CHECKPOINT_TABLE = os.environ.get("CHECKPOINT_TABLE", "")
 _CHECKPOINT_BUCKET = os.environ.get("CHECKPOINT_BUCKET", "")

@@ -30,9 +30,9 @@ export AWS_REGION="$REGION"
 
 WORKLOAD="$PREFIX-wl"
 PROVIDER="$PREFIX-3lo"
-LARK_AUTH_HOST="${LARK_AUTH_HOST:-https://accounts.larksuite.com}"   # CN: accounts.feishu.cn
 
 : "${LARK_APP_ID:?set LARK_APP_ID in .env}"
+: "${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}"
 : "${LARK_APP_SECRET:?set LARK_APP_SECRET in .env}"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -124,8 +124,8 @@ echo
 echo "Also confirm under Permissions & Scopes → User Token Scopes (admin approval needed):"
 echo "  drive:drive, docx:document, offline_access"
 echo
-echo "Lark authorize host in use: $LARK_AUTH_HOST"
-echo "  (set LARK_AUTH_HOST=https://accounts.feishu.cn in .env for the CN edition)"
+# The shim derives Lark's authorize host from LARK_API_DOMAIN (open.* -> accounts.*).
+echo "Lark API domain in use: $LARK_API_DOMAIN"
 
 
 # --- Google: the second downstream system -----------------------------------

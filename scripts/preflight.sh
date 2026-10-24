@@ -50,9 +50,11 @@ IDENT="$(aws sts get-caller-identity --output json 2>/dev/null)" \
 ACCOUNT="$(printf '%s' "$IDENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Account"])')"
 
 # The agent can't run without the model, and access is per-region opt-in.
-MODEL="${MODEL_ID:-global.anthropic.claude-sonnet-4-6}"
-aws bedrock get-foundation-model --model-identifier "${MODEL#global.}" >/dev/null 2>&1 \
-  || printf '\033[1;33m%s\033[0m\n' "  warning: can't confirm $MODEL in $REGION — enable model access if the agent 403s"
+# An unset MODEL_ID is reported with the rest of .env below.
+if [ -n "${MODEL_ID:-}" ]; then
+  aws bedrock get-foundation-model --model-identifier "${MODEL_ID#global.}" >/dev/null 2>&1 \
+    || printf '\033[1;33m%s\033[0m\n' "  warning: can't confirm $MODEL_ID in $REGION — enable model access if the agent 403s"
+fi
 
 # --- permissions ---------------------------------------------------------
 # One harmless read per service the deploy writes to. This catches the case that
@@ -92,7 +94,7 @@ fi
 # --- config --------------------------------------------------------------
 [ -f .env ] || fail ".env is missing — start from: cp .env.example .env"
 blank=""
-for k in LARK_APP_ID LARK_APP_SECRET LARK_ENCRYPT_KEY LARK_VERIFICATION_TOKEN LARK_ADMIN_OPEN_ID; do
+for k in MODEL_ID LARK_API_DOMAIN LARK_APP_ID LARK_APP_SECRET LARK_ENCRYPT_KEY LARK_VERIFICATION_TOKEN LARK_ADMIN_OPEN_ID; do
   [ -n "${!k:-}" ] || blank="$blank $k"
 done
 [ -z "$blank" ] || fail "unset in .env:$blank
@@ -100,7 +102,8 @@ done
 
 echo "  account : $ACCOUNT"
 echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
-echo "  model   : $MODEL"
+echo "  model   : $MODEL_ID"
+echo "  lark    : $LARK_API_DOMAIN"
 echo "  build   : $AGENT_BUILD$([ "$AGENT_BUILD" = "local" ] && echo '  (local Docker)' || echo '  (CodeBuild, ARM64 native)')"
 echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"
 echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && echo "  (creates a VPC + S3 Files)" || true)"
