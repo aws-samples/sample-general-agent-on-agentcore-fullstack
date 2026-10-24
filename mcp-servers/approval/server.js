@@ -58,6 +58,7 @@ function policyNote() {
     'CURRENTLY PERMITTED (enforced in this server, not by you):',
     `  approval_code in: ${codes}`,
     `  ${ceiling}`,
+    '  the definition and the amount are read from the instance itself, not from your arguments',
     '  the approver must have their own 3LO grant on record',
     'Do not refuse on your own judgement of scope — attempt the decision and this server',
     'will refuse with a reason if it is not allowed. Judge the case on its merits',
@@ -66,16 +67,65 @@ function policyNote() {
   ].join('\n');
 }
 
-function checkAutoDecisionAllowed(args) {
-  if (!AGENT_DECIDE_APPROVAL_CODES.includes(args.approval_code)) {
-    return `refused: approval_code ${args.approval_code} is not in AGENT_DECIDE_APPROVAL_CODES — a human must handle this`;
+// The facts a decision is checked against come from the instance, read here with the app's
+// token — never from the model's arguments. The form's text reaches the model, so a figure
+// or a definition the model passes along is exactly what an injected note would change.
+//
+// Every `amount` widget at any depth is summed: an expense form nests one per row of its
+// detail list (measured). Only `value` is walked — a detail list repeats its total in `ext`.
+function formAmount(form) {
+  let total = null;
+  let unreadable = false;
+  const walk = (w) => {
+    if (Array.isArray(w)) { w.forEach(walk); return; }
+    if (!w || typeof w !== 'object') return;
+    if (w.type === 'amount') {
+      // Number, not parseFloat: "1,234.00" would read as 1. A negative row would lower the
+      // total, so it is not taken as an amount either.
+      const v = typeof w.value === 'number' ? w.value : Number(String(w.value).trim() || NaN);
+      if (Number.isFinite(v) && v >= 0) total = (total || 0) + v;
+      else unreadable = true;
+    }
+    if (Array.isArray(w.value)) walk(w.value);
+  };
+  walk(form);
+  return { amount: total, unreadable };
+}
+
+// The task has to be a pending one of this instance, assigned to this approver: otherwise
+// the facts above would be read from one instance and the decision written to another.
+async function readInstance(instanceCode, taskId, userId, getToken) {
+  try {
+    const r = await fetch(`${API}/open-apis/approval/v4/instances/${encodeURIComponent(instanceCode || '')}`, {
+      headers: { Authorization: `Bearer ${await getToken()}` },
+    });
+    const b = await r.json();
+    const d = b.data || {};
+    if (b.code !== 0 || !d.approval_code) {
+      return { error: `refused: could not read instance ${instanceCode} (${b.msg || r.status}) — a human must handle this` };
+    }
+    const task = (d.task_list || []).find((t) => t.id === taskId);
+    if (!task || task.status !== 'PENDING' || task.open_id !== userId) {
+      return { error: `refused: task ${taskId} is not a pending task of ${userId} on instance ${instanceCode}` };
+    }
+    return { approval_code: d.approval_code, ...formAmount(JSON.parse(d.form || '[]')) };
+  } catch (e) {
+    return { error: `refused: could not read instance ${instanceCode} (${e.message}) — a human must handle this` };
+  }
+}
+
+function checkAutoDecisionAllowed(facts) {
+  if (!AGENT_DECIDE_APPROVAL_CODES.includes(facts.approval_code)) {
+    return `refused: approval_code ${facts.approval_code} is not in AGENT_DECIDE_APPROVAL_CODES — a human must handle this`;
   }
   if (AGENT_DECIDE_MAX_AMOUNT <= 0) {
     return 'refused: automatic decisions are disabled (AGENT_DECIDE_MAX_AMOUNT=0)';
   }
-  const amount = parseFloat(args.amount);
-  if (Number.isFinite(amount) && amount > AGENT_DECIDE_MAX_AMOUNT) {
-    return `refused: amount ${amount} exceeds the automatic limit ${AGENT_DECIDE_MAX_AMOUNT} — a human must handle this`;
+  if (facts.unreadable) {
+    return 'refused: the form has an amount that could not be read — a human must handle this';
+  }
+  if (facts.amount !== null && facts.amount > AGENT_DECIDE_MAX_AMOUNT) {
+    return `refused: amount ${facts.amount} exceeds the automatic limit ${AGENT_DECIDE_MAX_AMOUNT} — a human must handle this`;
   }
   return null;   // allowed
 }
@@ -86,27 +136,33 @@ function checkAutoDecisionAllowed(args) {
 // leaked appSecret (that bypasses this code entirely). It is a self-imposed rule, and
 // the reason to impose it is that "the app can decide for anyone, consent or not" is a
 // dangerous default for a sample to demonstrate. Verified 2026-08-12; see adr/0006.
+// Whose token is it? authen/v1/user_info needs no extra scope (the lark-cli server already
+// reads it for whoami). → { who } or { error }.
+async function tokenOwner(userToken) {
+  try {
+    const r = await fetch(`${API}/open-apis/authen/v1/user_info`, {
+      headers: { Authorization: `Bearer ${userToken}` },
+    });
+    const b = await r.json();
+    const who = (b.data || {}).open_id;
+    if (!who) return { error: `refused: could not establish whose authorization this is (${b.msg || r.status}).` };
+    return { who };
+  } catch (e) {
+    return { error: `refused: could not verify the authorizing identity (${e.message}).` };
+  }
+}
+
 async function requireConsentOnRecord(userToken, userId) {
   if (!userToken) {
     return 'refused: this approver has no on-record authorization for the assistant to '
          + 'act for them. Ask them to run /auth lark in the bot chat first. (Lark itself '
          + 'would allow this — the app token suffices — so the limit is ours.)';
   }
-  // Whose token is it? Checking only that *a* token exists would let a decision be
-  // made in A's name using B's grant — the agent holds tokens for every user who has
-  // ever consented, so the two are not the same question. authen/v1/user_info needs
-  // no extra scope (the lark-cli server already reads it for whoami).
-  let who;
-  try {
-    const r = await fetch(`${API}/open-apis/authen/v1/user_info`, {
-      headers: { Authorization: `Bearer ${userToken}` },
-    });
-    const b = await r.json();
-    who = (b.data || {}).open_id;
-    if (!who) return `refused: could not establish whose authorization this is (${b.msg || r.status}).`;
-  } catch (e) {
-    return `refused: could not verify the authorizing identity (${e.message}).`;
-  }
+  // Checking only that *a* token exists would let a decision be made in A's name using
+  // B's grant — the agent holds tokens for every user who has ever consented, so the two
+  // are not the same question.
+  const { who, error } = await tokenOwner(userToken);
+  if (error) return error;
   if (who !== userId) {
     return `refused: the authorization on hand belongs to ${who.slice(0, 12)}…, not to the `
          + `approver this decision would be recorded under. A decision may only be made `
@@ -115,6 +171,17 @@ async function requireConsentOnRecord(userToken, userId) {
   return null;
 }
 
+
+// Reading runs on the app token too, which sees every queue and every instance in the
+// tenant. So a read is limited to what the caller could see in Lark themselves: their own
+// queue, and instances they started, are assigned on, or are copied on.
+function isParticipant(instance, openId) {
+  if (!instance || !openId) return false;
+  const people = [instance.open_id,
+    ...(instance.task_list || []).map((t) => t.open_id),
+    ...(instance.cc_list || []).map((c) => c.open_id)];
+  return people.includes(openId);
+}
 
 function consentNote(hasVaultedGrant) {
   return hasVaultedGrant
@@ -132,6 +199,7 @@ const TOOLS = [
     // `user_id` names whose queue — the same shape as approve/reject, and the same
     // consequence: the app can read any user's queue, not just the caller's.
     as: 'tenant',
+    ownQueue: true,
     description: "List a user's approval tasks. topic: 1=pending (default), 2=done, 3=initiated. Runs on the APP identity — Lark offers no user-token variant — so user_id decides whose queue is read. Requires approval:approval:readonly or approval:task:list_by_user (tenant scopes).",
     inputSchema: {
       type: 'object',
@@ -151,6 +219,7 @@ const TOOLS = [
   {
     name: 'approval_get_instance',
     as: 'tenant',
+    participantsOnly: true,
     description: 'Read one approval instance: form contents, current approvers, status and timeline. Uses the app identity, so it works for any instance the app can see — useful for summarising a request before deciding.',
     inputSchema: {
       type: 'object',
@@ -171,7 +240,6 @@ const TOOLS = [
         instance_code: { type: 'string' },
         task_id: { type: 'string' },
         user_id: { type: 'string', description: "open_id of the task's assigned approver — the name the approval is recorded under" },
-        amount: { type: 'number', description: 'the amount under review, if the form has one — checked against the automatic limit in code' },
         comment: { type: 'string', description: 'optional comment' },
       },
       required: ['approval_code', 'instance_code', 'task_id', 'user_id'],
@@ -194,7 +262,6 @@ const TOOLS = [
         instance_code: { type: 'string' },
         task_id: { type: 'string' },
         user_id: { type: 'string', description: "open_id of the task's assigned approver" },
-        amount: { type: 'number', description: 'the amount under review, if the form has one' },
         comment: { type: 'string', description: 'reason for rejection' },
       },
       required: ['approval_code', 'instance_code', 'task_id', 'user_id'],
@@ -222,6 +289,9 @@ const TOOLS = [
       },
       required: ['approval_code', 'instance_code', 'task_id', 'user_id', 'transfer_user_id'],
     },
+    // Not a decision, but it decides who makes one: moving someone's task to another
+    // approver needs the same grant and the same limits.
+    guarded: true,
     req: (a) => ({ method: 'POST', path: '/open-apis/approval/v4/tasks/transfer',
       body: {
       approval_code: a.approval_code, instance_code: a.instance_code,
@@ -305,7 +375,7 @@ async function callLark(req, as, userToken) {
   // real reason lives (a missing required param reads as 99992402, which looks like
   // a permission problem until you read that array).
   const failed = !parsed || (parsed.code !== undefined && parsed.code !== 0);
-  return { isError: failed, text: text.slice(0, 8000) };
+  return { isError: failed, text: text.slice(0, 8000), parsed };
 }
 
 function sse(res, obj) {
@@ -369,6 +439,22 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
       if (tool.as === 'user' && !userToken) {
         return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: 'no user token (authorize first)' }], isError: true } });
       }
+      const refuse = (text) => sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text }], isError: true } });
+      if (tool.ownQueue) {
+        const notOwn = await requireConsentOnRecord(userToken, args.user_id);
+        if (notOwn) return refuse(notOwn);
+      }
+      if (tool.participantsOnly) {
+        if (!userToken) return refuse('refused: no user token (authorize first) — reading an instance is limited to its participants');
+        const { who, error } = await tokenOwner(userToken);
+        if (error) return refuse(error);
+        const out = await callLark(tool.req(args), tool.as, userToken);
+        if (!out.isError && !isParticipant((out.parsed || {}).data, who)) {
+          console.log(`refused ${name}: ${who.slice(0, 12)}… is not a participant`);
+          return refuse('refused: you did not start this approval and are not an approver or copied on it');
+        }
+        return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
+      }
       // Code-enforced limits before any decision is written back to Lark. Returned
       // as a tool error so the model sees the refusal and can explain it, rather
       // than being able to talk its way past it.
@@ -376,7 +462,7 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
         // Logged before the guards run, so an attempt is visible even when it passes.
         // Previously only refusals logged, which meant "the model never tried" and "the
         // model tried and succeeded" looked identical here.
-        console.log(`guarded call ${name}: code=${args.approval_code} amount=${args.amount ?? '-'}`);
+        console.log(`guarded call ${name}: instance=${args.instance_code} user=${args.user_id}`);
         // Consent first: deciding in someone's name without their grant is the one
         // thing this server will not do, even though Lark would permit it.
         const noConsent = await requireConsentOnRecord(userToken, args.user_id);
@@ -384,11 +470,15 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
           console.log(`guard refused ${name}: no consent on record`);
           return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: noConsent }], isError: true } });
         }
-        const refusal = checkAutoDecisionAllowed(args);
+        const facts = await readInstance(args.instance_code, args.task_id, args.user_id, tenantToken);
+        const refusal = facts.error || checkAutoDecisionAllowed(facts);
         if (refusal) {
           console.log(`guard refused ${name}: ${refusal}`);
           return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: refusal }], isError: true } });
         }
+        console.log(`guard passed ${name}: code=${facts.approval_code} amount=${facts.amount ?? '-'}`);
+        // What Lark acts on is what was checked, not what the model named.
+        args.approval_code = facts.approval_code;
         // Stamp the record so the decision is traceable to automation rather than
         // looking like the approver acted in person — they will see their own name
         // on it either way.

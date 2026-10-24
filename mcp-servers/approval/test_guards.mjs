@@ -19,7 +19,7 @@ function loadGuards(env = {}, fetchImpl = undefined) {
   const end = src.indexOf('const TOOLS = [');
   assert.ok(start > 0 && end > start, 'guard block not found — did server.js move?');
   const fn = new Function('process', 'fetch', 'API', `${src.slice(start, end)}
-    return { checkAutoDecisionAllowed, requireConsentOnRecord, consentNote, policyNote, AGENT_DECIDE_MAX_AMOUNT, AGENT_DECIDE_APPROVAL_CODES };`);
+    return { checkAutoDecisionAllowed, requireConsentOnRecord, consentNote, policyNote, formAmount, readInstance, isParticipant, AGENT_DECIDE_MAX_AMOUNT, AGENT_DECIDE_APPROVAL_CODES };`);
   return fn({ env }, fetchImpl, 'https://open.larksuite.com');
 }
 
@@ -49,15 +49,74 @@ test('a kill switch exists: 0 disables automation even for allow-listed codes', 
                /disabled/);
 });
 
-test('a missing or unparseable amount does not bypass the limit check', () => {
-  // Forms without an amount still have to be allow-listed; what must not happen is
-  // a non-numeric amount silently reading as "under the limit" on a form that has
-  // one. Both cases fall through to the allow-list, which is the fail-closed gate.
-  const g = loadGuards({ AGENT_DECIDE_APPROVAL_CODES: 'LEAVE_V1', AGENT_DECIDE_MAX_AMOUNT: '1000' });
-  assert.equal(g.checkAutoDecisionAllowed({ approval_code: 'LEAVE_V1' }), null);
-  assert.equal(g.checkAutoDecisionAllowed({ approval_code: 'LEAVE_V1', amount: 'lots' }), null);
-  assert.match(g.checkAutoDecisionAllowed({ approval_code: 'OTHER_V1', amount: 'lots' }),
-               /not in AGENT_DECIDE_APPROVAL_CODES/);
+test('an amount the form carries but cannot be read is refused', () => {
+  const g = loadGuards({ AGENT_DECIDE_APPROVAL_CODES: 'EXPENSE_V1', AGENT_DECIDE_MAX_AMOUNT: '1000' });
+  assert.match(g.checkAutoDecisionAllowed({ approval_code: 'EXPENSE_V1', amount: null, unreadable: true }),
+               /could not be read/);
+  // A form with no amount at all (a trip request) is limited by the allow-list alone.
+  assert.equal(g.checkAutoDecisionAllowed({ approval_code: 'EXPENSE_V1', amount: null }), null);
+});
+
+test('the amount is summed from the form, rows of a detail list included', () => {
+  // Shape measured on a real expense instance: the amount sits in each row of a
+  // fieldList, and the list repeats its total in `ext`, which must not count twice.
+  const g = loadGuards({});
+  const form = [
+    { type: 'textarea', value: 'travel to guangzhou' },
+    { type: 'fieldList', value: [[{ type: 'amount', value: 375 }], [{ type: 'amount', value: '900.5' }]],
+      ext: [{ type: 'amount', value: '1275.50' }] },
+  ];
+  assert.deepEqual(g.formAmount(form), { amount: 1275.5, unreadable: false });
+  assert.deepEqual(g.formAmount([{ type: 'tripGroup', value: {} }]), { amount: null, unreadable: false });
+  assert.equal(g.formAmount([{ type: 'amount', value: 'lots' }]).unreadable, true);
+  // Neither a malformed figure nor a negative row may lower what is checked.
+  for (const value of ['1,234.00', '12abc', -8500, '']) {
+    assert.equal(g.formAmount([{ type: 'amount', value: 9000 }, { type: 'amount', value }]).unreadable, true, String(value));
+  }
+});
+
+function instanceFetch(instance) {
+  return async () => ({ status: 200, json: async () => ({ code: 0, data: instance }) });
+}
+
+const INSTANCE = {
+  approval_code: 'EXPENSE_V1',
+  form: JSON.stringify([{ type: 'amount', value: 5000 }]),
+  task_list: [{ id: 't1', open_id: 'ou_alice', status: 'PENDING' }],
+};
+
+test("the guard reads the instance, so the model's arguments cannot lower the amount", async () => {
+  // The bypass this replaced: approve without `amount` sailed past the limit, because the
+  // only figure checked was the one the model chose to pass.
+  const g = loadGuards({ AGENT_DECIDE_APPROVAL_CODES: 'EXPENSE_V1', AGENT_DECIDE_MAX_AMOUNT: '1000' },
+                       instanceFetch(INSTANCE));
+  const facts = await g.readInstance('i1', 't1', 'ou_alice', async () => 'tok');
+  assert.equal(facts.approval_code, 'EXPENSE_V1');
+  assert.match(g.checkAutoDecisionAllowed(facts), /exceeds the automatic limit/);
+});
+
+test('a task that is not a pending task of this approver on this instance is refused', async () => {
+  const g = loadGuards({}, instanceFetch(INSTANCE));
+  for (const [task, user] of [['t2', 'ou_alice'], ['t1', 'ou_bob']]) {
+    assert.match((await g.readInstance('i1', task, user, async () => 'tok')).error, /not a pending task/);
+  }
+  const done = loadGuards({}, instanceFetch({ ...INSTANCE, task_list: [{ id: 't1', open_id: 'ou_alice', status: 'APPROVED' }] }));
+  assert.match((await done.readInstance('i1', 't1', 'ou_alice', async () => 'tok')).error, /not a pending task/);
+});
+
+test('an instance that cannot be read is refused, not waved through', async () => {
+  const g = loadGuards({}, async () => ({ status: 200, json: async () => ({ code: 1, msg: 'no permission' }) }));
+  assert.match((await g.readInstance('i1', 't1', 'ou_alice', async () => 'tok')).error, /could not read instance/);
+  const down = loadGuards({}, async () => { throw new Error('ECONNRESET'); });
+  assert.match((await down.readInstance('i1', 't1', 'ou_alice', async () => 'tok')).error, /ECONNRESET/);
+});
+
+test('every tool that moves a task is guarded, transfer included', () => {
+  const src = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
+  for (const name of ['approval_approve', 'approval_reject', 'approval_transfer']) {
+    const block = src.slice(src.indexOf(`name: '${name}'`), src.indexOf('req:', src.indexOf(`name: '${name}'`)));
+    assert.match(block, /guarded: true/, name);
+  }
 });
 
 test('refuses to decide when no authorization is on hand', async () => {
@@ -124,4 +183,18 @@ test('the consent note distinguishes an on-record grant from app authority alone
   // The wording must stay explicit: the record is what tells a reader afterwards
   // whether anyone had agreed to be acted for.
   assert.notEqual(g.consentNote(true), g.consentNote(false));
+});
+
+test("reads are limited to what the caller could see in Lark: their queue, their instances", () => {
+  // The app token sees every queue and instance in the tenant; asked for someone else's,
+  // the model would otherwise read it.
+  const g = loadGuards({});
+  const instance = { open_id: 'ou_starter', task_list: [{ open_id: 'ou_approver' }], cc_list: [{ open_id: 'ou_cc' }] };
+  for (const who of ['ou_starter', 'ou_approver', 'ou_cc']) assert.equal(g.isParticipant(instance, who), true, who);
+  assert.equal(g.isParticipant(instance, 'ou_stranger'), false);
+  assert.equal(g.isParticipant(undefined, 'ou_starter'), false);
+  const src = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
+  const block = (name) => src.slice(src.indexOf(`name: '${name}'`), src.indexOf('req:', src.indexOf(`name: '${name}'`)));
+  assert.match(block('approval_list_pending'), /ownQueue: true/);
+  assert.match(block('approval_get_instance'), /participantsOnly: true/);
 });

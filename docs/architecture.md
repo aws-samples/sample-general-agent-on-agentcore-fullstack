@@ -137,9 +137,10 @@ Everything above rests on the downstream call carrying the user's own token. Lar
 **The guards, in code rather than in the prompt** (`mcp-servers/approval/server.js`, tested in `test_guards.mjs`):
 
 - An **allow-list of approval definitions** (`AGENT_DECIDE_APPROVAL_CODES`) and an **amount ceiling** (`AGENT_DECIDE_MAX_AMOUNT`). Empty allow-list decides nothing — fail closed, so the demo is inert until switched on. `0` is a kill switch.
+- **The facts come from the instance, not from the model.** The form's text reaches the model, so a figure the model passes along is exactly what an injected note would change. Before approve, reject or transfer, the server reads the instance with the app token and takes the definition and the amount from it (every `amount` widget, detail-list rows included); the task must be a pending task of `user_id` on that instance. An instance it cannot read, or an amount it cannot parse, refuses.
 - **The approver's own grant must be on record.** "A token was passed" and "this approver consented" are different questions: the token is resolved to its owner and compared with `user_id`. Mismatch refuses; an owner that can't be established refuses too.
 
-Both are **self-imposed** — Lark would permit every decision they block — and neither survives a leaked `appSecret`, which bypasses this server entirely. The honest description is that they raise the bar from "knows a task_id" to "has compromised the app". A production design would split messaging and approvals into two Lark apps so the agent holds only the former's secret.
+All of these apply to transfer as well: it is not a decision, but it decides who makes one. They are **self-imposed** — Lark would permit every decision they block — and none survives a leaked `appSecret`, which bypasses this server entirely. The honest description is that they raise the bar from "knows a task_id" to "has compromised the app". A production design would split messaging and approvals into two Lark apps so the agent holds only the former's secret.
 
 **Event-driven: a turn with nobody present.** This is also the general shape of any non-human trigger on this architecture — the router has to synthesize both the identity and the delivery address.
 
