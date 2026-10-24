@@ -2135,6 +2135,14 @@ def test_the_summariser_sees_the_whole_slice_and_stays_off_the_chat():
     assert mw.model.timeout == agent_core._SUMMARY_TIMEOUT
 
 
+def test_the_turn_model_outlasts_a_silent_tool_call():
+    """A model can go quiet for over a minute while it writes one large tool argument;
+    the read timeout must outlast that, while a dead connection still fails to connect fast."""
+    client = agent_core._model.client
+    assert client.meta.config.read_timeout == agent_core._MODEL_READ_TIMEOUT >= 300
+    assert client.meta.config.connect_timeout == 60
+
+
 class _SummaryModel(BaseChatModel):
     """Answers every summary request with one recognisable line, streamed or not."""
 

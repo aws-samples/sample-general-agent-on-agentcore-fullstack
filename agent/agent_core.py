@@ -44,6 +44,8 @@ import time
 import uuid
 from contextlib import AsyncExitStack
 
+from botocore.config import Config
+
 from langchain.agents import create_agent
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -155,8 +157,13 @@ class _CachingChatBedrockConverse(ChatBedrockConverse):
 # The class defines no _agenerate/_astream, so the async paths run these in a thread —
 # overriding the two synchronous entry points covers streaming and non-streaming, sync
 # and async alike.
+# A model may send a tool call's arguments in one piece once they are all generated, so the
+# stream is silent while it writes a large file: Kimi K3 sent 13 KB after 18.5 s of silence
+# (measured), and botocore's 60 s default cut a longer one off. Connecting keeps the default.
+_MODEL_READ_TIMEOUT = 300
 _model = _CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
-                                     cache_ttl=_CACHE_TTL)
+                                     cache_ttl=_CACHE_TTL,
+                                     config=Config(read_timeout=_MODEL_READ_TIMEOUT))
 
 # --------------------------- bounding an endless thread ----------------------
 # The thread is permanent per user and DynamoDBSaver has no prune, so summarisation is the
