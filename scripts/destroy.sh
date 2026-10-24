@@ -32,16 +32,34 @@ U="${PREFIX//-/_}"
 # The Web Search connector exists only in us-east-1, so its gateway does too.
 WS_REGION="us-east-1"
 
+# Exactly the names a deploy creates. Never a prefix scan: another deployment's name can
+# extend this one ("agentcore-fullstack-b" starts with "agentcore-fullstack"), so a prefix
+# would reach into it.
+MCP_SUFFIXES=() MCP_DIRS=()
+for d in mcp-servers/*/; do
+  [ -f "$d/runtime.env" ] || continue
+  MCP_DIRS+=("$(basename "$d")")
+  MCP_SUFFIXES+=("$(RUNTIME_SUFFIX=""; . "$d/runtime.env"; echo "$RUNTIME_SUFFIX")")
+done
+RUNTIMES=("${U}_agent" "${U}_a2a")
+for sfx in "${MCP_SUFFIXES[@]}"; do RUNTIMES+=("${U}_$sfx"); done
+INTERPRETER="${U}_code"
+MEMORY="${U}_ltm"
+GATEWAY="$PREFIX-websearch-gw"
+PROVIDERS=("$PREFIX-3lo" "$PREFIX-google")
+REPOS=("$PREFIX-agent")
+for d in "${MCP_DIRS[@]}"; do REPOS+=("$PREFIX-mcp-$d"); done
+
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 
 # --- confirmation --------------------------------------------------------
 if [ "${1:-}" != "--yes" ]; then
   warn "This will DELETE all $PREFIX resources in account $ACCOUNT / $REGION:"
-  warn "  every ${U}_* Runtime and Code Interpreter, the Memory (all long-term records),"
+  warn "  its Runtimes (${RUNTIMES[*]}), Code Interpreter and Memory (all long-term records),"
   warn "  the Web Search gateway in $WS_REGION, and every CDK stack of this app."
   warn "  Conversation state goes with the agentcore stack."
-  warn "  Image builds go too: the $PREFIX-* ECR repos and their images, the CodeBuild"
+  warn "  Image builds go too: its ECR repos and their images, the CodeBuild"
   warn "  image builder and its role $PREFIX-image-builder-$REGION."
   warn "  With files storage deployed: every user's access point goes too (their files stay"
   warn "  in the bucket until the bucket itself is removed), along with the VPC."
@@ -61,31 +79,33 @@ gone() { # seconds, then a command that succeeds while the thing still exists
   return 1
 }
 
-log "Runtimes — every ${U}_* AgentCore Runtime"
-for rid in $(aws bedrock-agentcore-control list-agent-runtimes \
-               --query "agentRuntimes[?starts_with(agentRuntimeName,'${U}_')].agentRuntimeId" \
-               --output text 2>/dev/null || true); do
-  echo "  deleting runtime $rid"
-  aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "$rid" >/dev/null 2>&1 \
-    || warn "  (runtime $rid delete failed)"
+log "Runtimes — ${RUNTIMES[*]}"
+for rname in "${RUNTIMES[@]}"; do
+  for rid in $(aws bedrock-agentcore-control list-agent-runtimes \
+                 --query "agentRuntimes[?agentRuntimeName=='$rname'].agentRuntimeId" \
+                 --output text 2>/dev/null || true); do
+    echo "  deleting runtime $rid"
+    aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "$rid" >/dev/null 2>&1 \
+      || warn "  (runtime $rid delete failed)"
+  done
 done
 
 # Deletion is requested and not waited for. The network interfaces an interpreter leaves in
 # the sandbox subnets belong to AgentCore, which releases them on its own schedule — up to
 # 8 hours, per its VPC docs — and nothing in this account can detach them. Step 2 deals with
 # what that holds up.
-log "Code Interpreters — every ${U}_* interpreter"
+log "Code Interpreter — $INTERPRETER"
 for cid in $(aws bedrock-agentcore-control list-code-interpreters \
-               --query "codeInterpreterSummaries[?starts_with(name,'${U}_') && status!='DELETED'].codeInterpreterId" \
+               --query "codeInterpreterSummaries[?name=='$INTERPRETER' && status!='DELETED'].codeInterpreterId" \
                --output text 2>/dev/null || true); do
   echo "  deleting code interpreter $cid"
   aws bedrock-agentcore-control delete-code-interpreter --code-interpreter-id "$cid" >/dev/null 2>&1 \
     || warn "  (code interpreter $cid delete failed)"
 done
 
-log "Gateway — Web Search in $WS_REGION"
+log "Gateway — $GATEWAY in $WS_REGION"
 for gid in $(aws bedrock-agentcore-control list-gateways --region "$WS_REGION" \
-               --query "items[?starts_with(name,'$PREFIX')].gatewayId" --output text 2>/dev/null || true); do
+               --query "items[?name=='$GATEWAY'].gatewayId" --output text 2>/dev/null || true); do
   # A gateway with targets cannot be deleted.
   for tid in $(aws bedrock-agentcore-control list-gateway-targets --region "$WS_REGION" \
                  --gateway-identifier "$gid" --query 'items[].targetId' --output text 2>/dev/null || true); do
@@ -107,34 +127,32 @@ done
 # events, and the ECR repo keeps paying for image storage. A redeploy creates a
 # new Memory rather than adopting this one, so it would just accumulate.
 log "Memory / ECR / CodeBuild — CLI-created leftovers"
-MEM_PREFIX="${PREFIX//-/_}"
+# A Memory's id is its name plus "-" and a random suffix.
 for mid in $(aws bedrock-agentcore-control list-memories --max-results 100 \
-               --query "memories[?starts_with(id,'$MEM_PREFIX')].id" --output text 2>/dev/null || true); do
+               --query "memories[?starts_with(id,'$MEMORY-')].id" --output text 2>/dev/null || true); do
   echo "  deleting memory $mid (conversation history)"
   aws bedrock-agentcore-control delete-memory --memory-id "$mid" >/dev/null 2>&1 \
     || warn "  (memory $mid delete failed)"
 done
 
-# Two naming schemes: our own $PREFIX-*, and the AgentCore CLI's
-# bedrock-agentcore-<runtime_name>* (repo and builder project alike).
-for repo in $(aws ecr describe-repositories \
-                --query "repositories[?starts_with(repositoryName,'$PREFIX') || starts_with(repositoryName,'bedrock-agentcore-${PREFIX//-/_}')].repositoryName" \
-                --output text 2>/dev/null || true); do
+for repo in "${REPOS[@]}"; do
+  aws ecr describe-repositories --repository-names "$repo" >/dev/null 2>&1 || continue
   echo "  deleting ECR repo $repo (with images)"
   aws ecr delete-repository --repository-name "$repo" --force >/dev/null 2>&1 \
     || warn "  (ECR repo $repo delete failed)"
 done
 
-for proj in $(aws codebuild list-projects --query "projects[?starts_with(@,'$PREFIX') || starts_with(@,'bedrock-agentcore-${PREFIX//-/_}')]" \
-                --output text 2>/dev/null || true); do
-  echo "  deleting CodeBuild project $proj"
-  aws codebuild delete-project --name "$proj" >/dev/null 2>&1 \
-    || warn "  (CodeBuild project $proj delete failed)"
-done
+# Project and role names come from scripts/lib/codebuild.sh, which provision.sh sources.
+. scripts/lib/codebuild.sh
+if aws codebuild batch-get-projects --names "$CB_PROJECT" --query 'projects[0].name' --output text 2>/dev/null \
+     | grep -qx "$CB_PROJECT"; then
+  echo "  deleting CodeBuild project $CB_PROJECT"
+  aws codebuild delete-project --name "$CB_PROJECT" >/dev/null 2>&1 \
+    || warn "  (CodeBuild project $CB_PROJECT delete failed)"
+fi
 
-# The image builder's service role (scripts/lib/codebuild.sh). Not a CDK resource, and
-# named per region, so only this region's is removed.
-CB_ROLE_NAME="$PREFIX-image-builder-$REGION"
+# The image builder's service role: not a CDK resource, and named per region, so only this
+# region's is removed.
 if aws iam get-role --role-name "$CB_ROLE_NAME" >/dev/null 2>&1; then
   for pol in $(aws iam list-role-policies --role-name "$CB_ROLE_NAME" --query 'PolicyNames' --output text); do
     aws iam delete-role-policy --role-name "$CB_ROLE_NAME" --policy-name "$pol" >/dev/null 2>&1 || true
@@ -146,11 +164,11 @@ fi
 # The CodeBuild source bucket is shared by every AgentCore project in the account
 # (its name carries no project prefix), so delete only our own source keys and
 # leave the bucket alone.
-SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
-if aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1; then
-  # One key per image, <repo>/source.zip, every repo named $PREFIX-*.
-  aws s3 rm "s3://$SRC_BUCKET/" --recursive --exclude '*' --include "$PREFIX-*/source.zip" 2>/dev/null \
-    | sed 's/^delete: /  removed /' || true
+if aws s3api head-bucket --bucket "$CB_SRC_BUCKET" >/dev/null 2>&1; then
+  for repo in "${REPOS[@]}"; do   # one key per image: <repo>/source.zip
+    aws s3api delete-object --bucket "$CB_SRC_BUCKET" --key "$repo/source.zip" >/dev/null 2>&1 \
+      && echo "  removed s3://$CB_SRC_BUCKET/$repo/source.zip" || true
+  done
 fi
 
 # --- 1c. S3 Files Access Points (created at runtime by the broker) --------
@@ -196,7 +214,8 @@ fi
 # --- 2. CDK stacks --------------------------------------------------------
 # Every optional stack switched on, so whatever was deployed is in the app; a stack that was
 # never deployed is skipped, and CDK orders the deletions by dependency.
-CDK_CTX=(-c files_storage=true -c webui=true -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}")
+CDK_CTX=(-c "deployment_name=$PREFIX" -c files_storage=true -c webui=true
+         -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}" --output "$CDK_OUT")
 # While AgentCore still holds interfaces in the sandbox subnets, the storage stack cannot
 # delete them (DependencyViolation), and agentcore and security, which it imports from,
 # cannot go before it. Trying anyway leaves all three DELETE_FAILED; leaving them for a
@@ -229,9 +248,9 @@ fi
 # be registered in the Lark console. Both are region-scoped: leaving them behind
 # is what litters an account after moving regions.
 log "AgentCore Identity — OAuth provider + workload identity"
-# Every $PREFIX-* provider: Lark (-3lo) and, when configured, Google (-google).
-for prov in $(aws bedrock-agentcore-control list-oauth2-credential-providers \
-                --query "credentialProviders[?starts_with(name,'$PREFIX')].name" --output text 2>/dev/null || true); do
+# Lark's provider (-3lo) and, when configured, Google's (-google).
+for prov in "${PROVIDERS[@]}"; do
+  aws bedrock-agentcore-control get-oauth2-credential-provider --name "$prov" >/dev/null 2>&1 || continue
   aws bedrock-agentcore-control delete-oauth2-credential-provider --name "$prov" >/dev/null 2>&1 \
     && echo "  deleted provider $prov (vaulted tokens purged)" \
     || warn "  (provider $prov delete failed)"
@@ -258,8 +277,13 @@ done
 # --- 4. Log groups (auto-created by runtimes / CodeBuild / Memory) --------
 # Last, because everything above can still write logs while it is being deleted.
 log "Log groups — runtime / CodeBuild / Memory leftovers"
-for g in $(aws logs describe-log-groups \
-             --query "logGroups[?contains(logGroupName,'$PREFIX') || contains(logGroupName,'${PREFIX//-/_}')].logGroupName" \
+# This deployment's own: /<name>/... (its Lambdas), its builder's, and those AgentCore names
+# after a resource id — "<resource name>-<suffix>", so the "-" keeps a longer name out.
+lg_query="starts_with(logGroupName,'/$PREFIX/') || logGroupName=='/aws/codebuild/$CB_PROJECT'"
+for n in "${RUNTIMES[@]}" "$INTERPRETER" "$MEMORY"; do
+  lg_query="$lg_query || contains(logGroupName,'/$n-')"
+done
+for g in $(aws logs describe-log-groups --query "logGroups[?$lg_query].logGroupName" \
              --output text 2>/dev/null || true); do
   aws logs delete-log-group --log-group-name "$g" >/dev/null 2>&1 \
     && echo "  deleted $g" || true
@@ -270,9 +294,9 @@ log "Local — clear the AgentCore CLI config so a fresh deploy reconfigures"
 [ -f .bedrock_agentcore.yaml ] && { rm -f .bedrock_agentcore.yaml; echo "  removed .bedrock_agentcore.yaml"; }  # safe-rm-ok
 rm -rf .bedrock_agentcore 2>/dev/null || true  # safe-rm-ok
 
-# .cdk-state.json holds this deployment's ids; a stale one would point a fresh
-# deploy at resources that no longer exist.
-[ -f .cdk-state.json ] && { rm -f .cdk-state.json; echo "  removed .cdk-state.json"; }  # safe-rm-ok
+# $STATE_FILE holds this deployment's ids; a stale one would point a fresh deploy at
+# resources that no longer exist.
+[ -f "$STATE_FILE" ] && { rm -f "$STATE_FILE"; echo "  removed $STATE_FILE"; }  # safe-rm-ok
 
 if [ -n "$held" ]; then
   log "Done, except ${KEPT[*]}."

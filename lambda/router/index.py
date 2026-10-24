@@ -341,8 +341,8 @@ def _secs(seconds) -> str:
 # How long the async Lambda holds, waiting for the user to finish 3LO consent.
 # Bounded by the Lambda timeout (see the agentcore read_timeout above); on
 # timeout we fall back to "send your message again".
-LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "agentcore-fullstack-3lo")
-AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "agentcore-fullstack-wl")
+LARK_OAUTH_PROVIDER = os.environ["LARK_OAUTH_PROVIDER"]
+AGENT_WORKLOAD_NAME = os.environ["AGENT_WORKLOAD_NAME"]
 LARK_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # required by GetResourceOauth2Token
 

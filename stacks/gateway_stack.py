@@ -18,7 +18,7 @@ class GatewayStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         region = Stack.of(self).region
-        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
+        prefix = self.node.get_context("deployment_name")
         agentcore_principal = iam.ServicePrincipal("bedrock-agentcore.amazonaws.com")
 
         # Gateway service role — what the Web Search target calls the connector as.

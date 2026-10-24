@@ -32,9 +32,9 @@ Order matters in one place: `3lo` and `gateway` precede `runtime`, because the a
 
 `setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console ([step 4](docs/console-setup.md#lark-console-setup)) before the first 3LO consent.
 
-Per-deployment ids (runtime/gateway) go to `.cdk-state.json` (gitignored), so `cdk.json` stays free of environment state.
+Per-deployment ids (runtime/gateway) go to `.cdk-state.<DEPLOYMENT_NAME>.json` (gitignored), so `cdk.json` stays free of environment state. `DEPLOYMENT_NAME` starts every resource name, so deployments with different names live side by side in one account and region; `scripts/destroy.sh` removes only the one `.env` (or the environment) names.
 
-Optional web chat: set `WEBUI=true` in `.env`, then register the printed domain on the Lark app ([step 5](docs/console-setup.md#lark-console-setup)). CloudFront only assigns the domain at deploy time and the router must allow that exact origin to trade an h5 code for a JWT, so `./deploy.sh webui` writes it to `.cdk-state.json` and re-deploys the router itself — the same route the file system id takes. Off by default: without the Lark-side registration the page loads but can establish nobody.
+Optional web chat: set `WEBUI=true` in `.env`, then register the printed domain on the Lark app ([step 5](docs/console-setup.md#lark-console-setup)). CloudFront only assigns the domain at deploy time and the router must allow that exact origin to trade an h5 code for a JWT, so `./deploy.sh webui` writes it to `.cdk-state.<name>.json` and re-deploys the router itself — the same route the file system id takes. Off by default: without the Lark-side registration the page loads but can establish nobody.
 
 Optional web search: set `WEB_SEARCH=true` in `.env` before deploying (or run `./deploy.sh gateway` then `./deploy.sh runtime`). That provisions a Gateway fronting AgentCore's built-in Web Search connector — **in us-east-1, the only region offering it**, so the agent calls it cross-region. Search carries no end-user identity, so it uses `GATEWAY_IAM_ROLE` and never touches the per-user 3LO path the Lark tools have to avoid. Off by default; the agent just runs without the tool.
 

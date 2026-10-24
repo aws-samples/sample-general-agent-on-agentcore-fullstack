@@ -12,7 +12,6 @@
     ]
   },
   "context": {
-    "resource_prefix": "agentcore-fullstack",
     "runtime_endpoint_id": "DEFAULT",
     "registration_open": false,
     "cloudwatch_log_retention_days": 30,

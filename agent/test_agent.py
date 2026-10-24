@@ -27,6 +27,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 # What a deploy injects; the modules read it at import and have no fallback.
 os.environ.setdefault("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
 os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
+os.environ.setdefault("LARK_OAUTH_PROVIDER", "test-3lo")
+os.environ.setdefault("AGENT_WORKLOAD_NAME", "test-wl")
+os.environ.setdefault("METRICS_NAMESPACE", "test/agent")
 
 import agent_core
 

@@ -72,7 +72,7 @@
 
 | 路径 | 内容 |
 |---|---|
-| `app.py`、`cdk.json` | CDK 应用(依赖由 uv 管理)。部署状态写入 `.cdk-state.json`,不在这里 |
+| `app.py`、`cdk.json` | CDK 应用(依赖由 uv 管理)。部署状态写入 `.cdk-state.<DEPLOYMENT_NAME>.json`,不在这里 |
 | `.env` | 部署目标(`PROFILE`/`REGION`/`MODEL_ID`)+ Lark 凭证——已加入 .gitignore,每个脚本都会读取 |
 | `stacks/` | security、agentcore、router、shim、gateway、observability,以及开启对应 flag 时的 storage 和 webui |
 | `agent/` | Agent 容器:HTTP 契约 + DynamoDB checkpoint + 按用户的 3LO(`lark_3lo`)+ 面向 lark-cli server 的 MCP 客户端,以及可选的网络搜索(`websearch`);在后台运行每一轮对话,并将答案流式写入卡片(`lark_notify`)。`code_tools.py` 在按用户隔离的沙箱中运行生成的代码;`agui.py` 在同一个 Runtime 上为浏览器提供服务;`a2a_server.py` 是同一镜像上的第二个入口(`SERVER_MODE=a2a`) |

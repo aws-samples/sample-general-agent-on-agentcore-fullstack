@@ -28,7 +28,8 @@ import boto3
 log = logging.getLogger("agent.telemetry")
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
-_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "agentcore-fullstack/agent")
+# <deployment>/agent: the execution role may only write that namespace (agentcore stack).
+_NAMESPACE = os.environ["METRICS_NAMESPACE"]
 # Batched because PutMetricData is billed per call, not per datum, and a turn emits several.
 _FLUSH_AFTER = int(os.environ.get("METRICS_FLUSH_AFTER", "20"))
 _FLUSH_SECONDS = float(os.environ.get("METRICS_FLUSH_SECONDS", "30"))

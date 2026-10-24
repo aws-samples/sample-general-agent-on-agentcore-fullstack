@@ -84,6 +84,7 @@ done
 [ -z "$blank" ] || fail "unset in .env:$blank
   Get these from the Lark developer console (README → Lark console setup)."
 
+echo "  deploy  : $DEPLOYMENT_NAME   (state: $STATE_FILE)"
 echo "  account : $ACCOUNT"
 echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
 echo "  model   : $MODEL_ID"

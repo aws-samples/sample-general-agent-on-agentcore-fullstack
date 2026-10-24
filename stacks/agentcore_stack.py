@@ -45,7 +45,7 @@ class AgentCoreStack(Stack):
 
         region = Stack.of(self).region
         account = Stack.of(self).account
-        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
+        prefix = self.node.get_context("deployment_name")
 
         # --- Execution role: what the agent container may do -----------------
         execution_role_name = f"{prefix}-execution-role-{region}"
@@ -383,7 +383,7 @@ class AgentCoreStack(Stack):
         # Built here only for AGENT_BUILD=local, from ./agent with the host's Docker.
         # The default builds it natively in CodeBuild instead (scripts/provision.sh), so a
         # deploy needs neither Docker nor an ARM64 host; its URI then travels through
-        # .cdk-state.json rather than this stack.
+        # .cdk-state.<name>.json rather than this stack.
         self.agent_image = None
         if (self.node.try_get_context("agent_build") or "codebuild") == "local":
             self.agent_image = ecr_assets.DockerImageAsset(

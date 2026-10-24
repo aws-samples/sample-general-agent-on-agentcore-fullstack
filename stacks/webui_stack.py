@@ -33,7 +33,7 @@ class WebUiStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
+        prefix = self.node.get_context("deployment_name")
 
         bucket = s3.Bucket(
             self,

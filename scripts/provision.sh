@@ -41,8 +41,8 @@ CDK="npx --yes aws-cdk@2"
 : "${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}"
 # Every cdk deploy gets the same context: a deploy that omitted one would synth that stack
 # with the switch off and tear the resources out.
-CDK_CTX=(-c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY"
-         -c "agent_build=$AGENT_BUILD" -c "lark_api_domain=$LARK_API_DOMAIN")
+CDK_CTX=(-c "deployment_name=$PREFIX" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY"
+         -c "agent_build=$AGENT_BUILD" -c "lark_api_domain=$LARK_API_DOMAIN" --output "$CDK_OUT")
 . scripts/lib/codebuild.sh
 
 # Control-plane calls whose parameters are newer than the AWS CLI's bundled service model.
@@ -72,23 +72,23 @@ cfn_out() { # stack, output-key
     --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null
 }
 
-ctx_get() { # key — read a deployment id back out of .cdk-state.json ("" when absent)
-  uv run python - "$1" <<'PYGET'
+ctx_get() { # key — read a deployment id back out of $STATE_FILE ("" when absent)
+  STATE_FILE="$STATE_FILE" uv run python - "$1" <<'PYGET'
 import json, os, sys
-f = ".cdk-state.json"
+f = os.environ["STATE_FILE"]
 print((json.load(open(f)) if os.path.isfile(f) else {}).get(sys.argv[1], ""))
 PYGET
 }
 
-ctx_set() { # key value  — persist a deployment id into .cdk-state.json (gitignored)
-  uv run python - "$1" "$2" <<'PY'
+ctx_set() { # key value  — persist a deployment id into $STATE_FILE (gitignored)
+  STATE_FILE="$STATE_FILE" uv run python - "$1" "$2" <<'PY'
 import json, os, sys
 k, v = sys.argv[1], sys.argv[2]
-f = ".cdk-state.json"
+f = os.environ["STATE_FILE"]
 d = json.load(open(f)) if os.path.isfile(f) else {}
 d[k] = v
 with open(f, "w") as fh: json.dump(d, fh, indent=2); fh.write("\n")
-print(f".cdk-state.json: {k} = {v}")
+print(f"{f}: {k} = {v}")
 PY
 }
 
@@ -151,7 +151,7 @@ base_cdk_stacks() {
     echo "  code execution: off"
   fi
   $CDK deploy "${stacks[@]}" "${CDK_CTX[@]}" \
-             --require-approval never --outputs-file cdk.out/outputs.json
+             --require-approval never --outputs-file "$CDK_OUT/outputs.json"
   # The web page needs this and CDK assigns it, so it travels through state rather than a
   # cross-stack export — importing it would freeze the router's own exports.
   ctx_set router_api_url "$(cfn_out "$PREFIX-router" ApiUrl)"
@@ -216,9 +216,9 @@ phase2_runtime() {
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
   pwsecret="$PREFIX/cognito-password-secret"
-  ws_url="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('websearch_gateway_url',''))" 2>/dev/null)"
+  ws_url="$(ctx_get websearch_gateway_url)"
   model="$MODEL_ID"
-  memory="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('memory_id',''))" 2>/dev/null)"
+  memory="$(ctx_get memory_id)"
   shim="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
 
   mcp_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
@@ -299,6 +299,8 @@ env = {
     "SHIM_RETURN_URL": e["SHIM"],
     "LARK_OAUTH_PROVIDER": e["PREFIX"] + "-3lo",
     "AGENT_WORKLOAD_NAME": e["PREFIX"] + "-wl",
+    # The execution role may write metrics only to this namespace (agentcore stack).
+    "METRICS_NAMESPACE": e["PREFIX"] + "/agent",
     "LARK_SCOPES": "drive:drive docx:document offline_access",
     "LARK_SECRET_ID": e["PREFIX"] + "/channels/lark",
     "LARK_API_DOMAIN": e["LARK_DOMAIN"],
@@ -551,7 +553,7 @@ phase_webui() {
   local url
   url="$(cfn_out "$PREFIX-webui" WebUiUrl)"
   # The router must allow this origin to trade an h5 code for a JWT, and CloudFront only
-  # assigns the domain now — so it travels through .cdk-state.json and the router is
+  # assigns the domain now — so it travels through .cdk-state.<name>.json and the router is
   # re-deployed, the same route the file system id takes.
   ctx_set web_origin "$url"
   $CDK deploy "$PREFIX-router" -c webui=true "${CDK_CTX[@]}" \

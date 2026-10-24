@@ -41,8 +41,8 @@ from botocore.awsrequest import AWSRequest
 import httpx
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
-_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "agentcore-fullstack-3lo")
-_WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "agentcore-fullstack-wl")
+_PROVIDER = os.environ["LARK_OAUTH_PROVIDER"]
+_WORKLOAD = os.environ["AGENT_WORKLOAD_NAME"]
 _SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on the workload
 _LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
 _SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()

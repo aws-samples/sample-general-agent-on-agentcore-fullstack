@@ -42,7 +42,7 @@ class StorageStack(Stack):
 
         region = Stack.of(self).region
         account = Stack.of(self).account
-        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
+        prefix = self.node.get_context("deployment_name")
 
         # --- VPC for the Code Interpreter session. S3 goes through a gateway endpoint for
         # free; the agent Runtime stays PUBLIC outside it. Two AZs because mount targets

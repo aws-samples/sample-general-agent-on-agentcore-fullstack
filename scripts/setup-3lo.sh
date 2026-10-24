@@ -181,7 +181,7 @@ if e.get("HAS_GOOGLE"):
                  "label": "Google"})
 print(json.dumps(idps))')"
 echo "  $IDP_REGISTRY"
-ctx_file=".cdk-state.json"
+ctx_file="$STATE_FILE"
 python3 - "$ctx_file" "$IDP_REGISTRY" <<'PY'
 import json, os, sys
 f, reg = sys.argv[1], sys.argv[2]

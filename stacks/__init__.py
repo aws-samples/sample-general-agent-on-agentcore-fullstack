@@ -1,5 +1,5 @@
-"""CDK stacks package. Resource names are prefixed with the `resource_prefix` context
-value (`agentcore-fullstack`), which each stack reads for itself."""
+"""CDK stacks package. Resource names are prefixed with the `deployment_name` context value
+(DEPLOYMENT_NAME in .env, passed by the deploy scripts), which each stack reads for itself."""
 
 import os
 import subprocess

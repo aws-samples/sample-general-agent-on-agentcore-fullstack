@@ -10,7 +10,7 @@ Deployment is hybrid:
   CDK:  security, agentcore base (role/ECR/S3), shim, router, gateway, observability,
         and storage when files_storage=true
   CLI:  the AgentCore Runtimes, Memory, the OAuth provider and the Web Search gateway,
-        created by deploy.sh through control-plane APIs; ids fed back via .cdk-state.json
+        created by deploy.sh through control-plane APIs; ids fed back via .cdk-state.<name>.json
 """
 
 import json
@@ -30,15 +30,20 @@ from stacks.webui_stack import WebUiStack
 
 app = cdk.App()
 
-# Per-deployment state (runtime/gateway ids) lives outside version control —
-# deploy.sh writes it, we inject it so stacks read it via try_get_context as usual.
-_state = pathlib.Path(__file__).parent / ".cdk-state.json"
+ctx = app.node.try_get_context
+
+# DEPLOYMENT_NAME from .env, passed as -c deployment_name; every resource name starts with it.
+prefix = ctx("deployment_name")
+if not prefix:
+    raise SystemExit("deployment_name context is missing — set DEPLOYMENT_NAME in .env and deploy with ./deploy.sh")
+
+# Per-deployment state (runtime/gateway ids) lives outside version control, one file per
+# deployment name — deploy.sh writes it, we inject it so stacks read it via try_get_context.
+_state = pathlib.Path(__file__).parent / f".cdk-state.{prefix}.json"
 if _state.is_file():
     for k, v in json.loads(_state.read_text()).items():
         if v:
             app.node.set_context(k, v)
-
-ctx = app.node.try_get_context
 
 env = cdk.Environment(
     account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
@@ -50,7 +55,6 @@ lark_api_domain = ctx("lark_api_domain")
 if not lark_api_domain:
     raise SystemExit("lark_api_domain context is missing — set LARK_API_DOMAIN in .env and deploy with ./deploy.sh")
 
-prefix = ctx("resource_prefix") or "agentcore-fullstack"
 
 # Context values arrive as strings when passed with -c, and the string "false" is truthy,
 # so compare rather than test.
@@ -105,7 +109,7 @@ router = RouterStack(
     app,
     f"{prefix}-router",
     # The page's origin, so it may trade an h5 code for a JWT. Travels through
-    # .cdk-state.json because CloudFront assigns the domain — the same route the file
+    # .cdk-state.<name>.json because CloudFront assigns the domain — the same route the file
     # system id takes, and it breaks the cycle between this stack and the WebUI one.
     web_allowed_origins=ctx("web_origin") or "",
     runtime_arn=agentcore.runtime_arn,
@@ -129,7 +133,7 @@ if _flag("webui"):
     webui = WebUiStack(
         app,
         f"{prefix}-webui",
-        # From .cdk-state.json, not router.api_url: a CDK reference makes the router
+        # From .cdk-state.<name>.json, not router.api_url: a CDK reference makes the router
         # unable to change an export this stack imports (UPDATE_ROLLBACK, measured), the
         # same deadlock the storage stack hit.
         router_api_url=ctx("router_api_url") or "",
