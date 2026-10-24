@@ -9,30 +9,28 @@
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+# Each suite runs on the Python and the requirements its code is deployed with, outside the
+# root project (the CDK app). The agent image is AL2023's python3.11; the Lambdas are 3.13.
+agent_py()  { uv run --no-project --python 3.11 --with-requirements agent/requirements.txt --with pytest "$@"; }
+lambda_py() { uv run --no-project --python 3.13 --with boto3 --with pytest "$@"; }
+
 echo "== agent =="
-# The LangGraph stack is pure Python, so unlike Strands it installs here and the turn
-# loop is tested through a real compiled graph rather than a copy of its source.
-uv run --with boto3 --with aiohttp --with httpx --with pytest \
-       --with langchain --with langchain-aws --with langgraph \
-       --with langchain-mcp-adapters --with langgraph-checkpoint-aws --with "pyjwt[crypto]" \
-       python -m pytest agent/test_agent.py -q
+# The LangGraph stack is pure Python, so the turn loop is tested through a real compiled
+# graph rather than a copy of its source.
+agent_py python -m pytest agent/test_agent.py -q
 
 echo "== code tools =="
 # Needs the agent's stack because it asserts against agent_core's session teardown.
-uv run --with boto3 --with aiohttp --with httpx --with pytest \
-       --with langchain --with langchain-aws --with langgraph \
-       --with langchain-mcp-adapters --with langgraph-checkpoint-aws --with "pyjwt[crypto]" \
-       python -m pytest agent/test_code_tools.py -q
+agent_py python -m pytest agent/test_code_tools.py -q
 
 echo "== a2a adapter =="
-# No a2a SDK: everything worth asserting sits outside build_app, which imports it lazily.
-uv run --with boto3 --with pytest python -m pytest agent/test_a2a.py -q
+agent_py python -m pytest agent/test_a2a.py -q
 
 echo "== router =="
-uv run --with cryptography --with boto3 --with pytest python -m pytest lambda/router/test_router.py -q
+lambda_py --with-requirements lambda/router/requirements.txt python -m pytest lambda/router/test_router.py -q
 
 echo "== shim =="
-uv run --with boto3 --with pytest python -m pytest lambda/shim/test_shim.py -q
+lambda_py python -m pytest lambda/shim/test_shim.py -q
 
 echo "== google mcp (node) =="
 # Node's own runner: this server has no dependencies, so a toolchain for one file would be
