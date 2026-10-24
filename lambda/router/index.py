@@ -146,12 +146,8 @@ def _app_identity() -> str:
     """The Lark app the bot speaks as. Shown next to the user identity because this
     sample's whole point is that the two are different: tools reach Lark as the
     *user* (their vaulted token), while replies, reactions and cards go out as the
-    *app* (its tenant token). Masked — an appId is not a secret, but there is no
-    reason to paste a full identifier into a chat."""
-    app_id = lark.get_credentials()[0]
-    if not app_id:
-        return "未配置"
-    return f"{app_id[:8]}…{app_id[-4:]}" if len(app_id) > 14 else app_id
+    *app* (its tenant token). An appId is not a secret, so it is shown whole."""
+    return lark.get_credentials()[0] or "未配置"
 
 
 # ------------------------- execution environment probe -----------------------
@@ -194,17 +190,28 @@ def _k(tokens: int) -> str:
     return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
 
 
+def _panel(title: str, *groups: list, hint: str = "") -> dict:
+    """A command's answer as data, so each channel lays it out its own way: Lark as a card,
+    the web page as the plain text carried alongside. A group is [(label, value), …]."""
+    groups = [list(g) for g in groups if g]
+    blocks = ["\n".join(f"{k}：{v}" for k, v in g) for g in groups]
+    return {"text": "\n\n".join([title, *blocks, *([hint] if hint else [])]),
+            "panel": {"title": title, "groups": groups, "hint": hint}}
+
+
+_NOT_YET = "—（发一条普通消息后可见）"
+_NO_PROBE = "—（探测未返回；下条消息仍会正常处理）"
+
+
 def _context_line(stats: dict, probe: dict | None) -> str:
     """The thread's real size, from the latest model call's billed input — the number the
-    summarisation threshold is about, so it is shown next to that threshold."""
+    summarisation threshold is about, so it is shown as a share of that threshold."""
     tokens = (stats or {}).get("contextTokens") or 0
     if not tokens:
-        return "—（发一条普通消息后可见）"
+        return _NOT_YET
     at = (((probe or {}).get("settings") or {}).get("summarizeAt")) or 0
-    parts = [f"最近一次请求 {_k(tokens)} token"]
-    if at:
-        parts.append(f"超过 {_k(at)} 时自动摘要")
-    return "，".join(parts)
+    share = f"，压缩阈值的 {tokens / at:.0%}" if at else ""
+    return f"{_k(tokens)} token（最近一次请求{share}）"
 
 
 def _cache_line(stats: dict, probe: dict | None) -> str:
@@ -212,37 +219,52 @@ def _cache_line(stats: dict, probe: dict | None) -> str:
     thread's calls, which says whether caching is paying off across the conversation."""
     settings = (probe or {}).get("settings") or {}
     if settings and settings.get("cache") == "off":
-        return "关闭"
+        return "未启用（见 /model）"
     stats = stats or {}
     if not stats.get("contextTokens"):
-        return "—（发一条普通消息后可见）"
+        return _NOT_YET
     rate = lambda hit, total: f"{hit / total:.0%}" if total else "—"
-    return (f"最近一次命中 {rate(stats.get('cachedTokens', 0), stats['contextTokens'])}，"
+    return (f"最近一次 {rate(stats.get('cachedTokens', 0), stats['contextTokens'])} · "
             f"本线程累计 {rate(stats.get('cachedTotal', 0), stats.get('inputTotal', 0))}"
             f"（{stats.get('modelCalls', 0)} 次模型调用）")
 
 
-def _model_text(data: dict | None) -> str:
+def _context_panel(stats: dict, probe: dict | None) -> dict:
+    """What the thread holds and what shapes it: size, the system prompt sent ahead of it,
+    and when it gets summarised."""
+    s = (probe or {}).get("settings") or {}
+    at, keep = s.get("summarizeAt") or 0, s.get("summarizeKeep") or 0
+    prompt = (("自定义" if s.get("systemPromptCustom") else "默认")
+              + f" · {s.get('systemPromptChars', 0)} 字符") if s else _NO_PROBE
+    return _panel(
+        "上下文",
+        [("对话", f"{stats['turns']} 轮 · {stats['toolCalls']} 次工具调用" if stats
+          else _NOT_YET),
+         ("当前大小", _context_line(stats, probe)),
+         ("系统提示词", prompt)],
+        [("自动压缩", (f"超过 {_k(at)} token 时摘要，保留最近 {keep} 条消息" if at
+                       else "关闭") if s else _NO_PROBE),
+         ("缓存命中", _cache_line(stats, probe))],
+        hint="发送 /compact 立即压缩较早的对话")
+
+
+def _model_panel(data: dict | None) -> dict:
     """The settings the serving container reports, not what the router is configured
     with — UpdateAgentRuntime replaces the environment, so the two can disagree."""
     s = (data or {}).get("settings") or {}
     if not s:
-        return "模型设置：—（探测未返回；下条消息仍会正常处理）"
+        return _panel("模型", [("状态", _NO_PROBE)])
     cache = s.get("cache") or ""
-    cache_text = ("隐式（模型自动缓存相同前缀）" if cache == "implicit"
-                  else f"显式（cachePoint，TTL {cache.split()[-1]}）" if cache.startswith("explicit")
+    cache_text = ("隐式 · 模型自动缓存相同前缀" if cache == "implicit"
+                  else f"显式 · 每次请求加 cachePoint，TTL {cache.split()[-1]}"
+                  if cache.startswith("explicit")
                   else "关闭" if cache == "off" else "—")
-    at, keep = s.get("summarizeAt") or 0, s.get("summarizeKeep") or 0
-    return "\n".join([
-        f"模型：{s.get('model', '—')}",
-        f"平台：Amazon Bedrock · {s.get('region', '—')}",
-        f"Prompt cache：{cache_text}",
-        (f"上下文压缩：超过 {_k(at)} token 时摘要，保留最近 {keep} 条消息" if at
-         else "上下文压缩：关闭"),
-        ("系统提示词：自定义（" if s.get("systemPromptCustom") else "系统提示词：默认（")
-        + f"{s.get('systemPromptChars', 0)} 字符）",
-        "当前对话的上下文大小：发送 /context 查看",
-    ])
+    return _panel(
+        "模型",
+        [("模型 ID", s.get("model", "—")),
+         ("平台", f"Amazon Bedrock · {s.get('region', '—')}"),
+         ("Prompt cache", cache_text)],
+        hint="上下文大小、系统提示词与压缩设置：发送 /context")
 
 
 # Where a tool group came from → how it is named in chat. Sources, not tools: a server
@@ -251,26 +273,29 @@ _TOOL_SOURCES = {"approval": "审批", "web_search": "网络搜索", "memory": "
                  "code": "代码执行"}
 
 
-def _tools_text(data: dict | None) -> str:
+def _tools_panel(data: dict | None) -> dict:
     if not data:
-        return "工具列表：—（探测未返回；下条消息仍会正常处理）"
+        return _panel("可用工具", [("状态", _NO_PROBE)])
     if data.get("identityError"):
-        return f"工具列表：身份校验未通过，没有可用工具（{data['identityError']}）"
+        return _panel("可用工具", [("状态", f"身份校验未通过，没有可用工具（{data['identityError']}）")])
     tools = data.get("tools") or []
     if not tools:
-        return "工具列表：当前没有可用工具"
+        return _panel("可用工具", [("状态", "当前没有可用工具")])
     ungranted = set(data.get("ungranted") or [])
     groups: dict[str, list[dict]] = {}
     for t in tools:                      # in assembly order, which is the agent's own
         groups.setdefault(t.get("source") or "other", []).append(t)
-    lines = [f"可用工具 · 共 {len(tools)} 个"]
+    rows, need_auth = [], []
     for source, members in groups.items():
         label = (_TOOL_SOURCES.get(source)
                  or (IDPS.get(source) or {}).get("label") or source)
         need = sorted({t["idp"] for t in members if t.get("idp") in ungranted})
-        note = ("（未授权，发送 " + "、".join(f"/auth {i}" for i in need) + "）") if need else ""
-        lines.append(f"{label}{note}：" + "、".join(t["name"] for t in members))
-    return "\n".join(lines)
+        need_auth += need
+        rows.append((label + ("（未授权）" if need else ""),
+                     "、".join(t["name"] for t in members)))
+    hint = ("授权后才能调用：发送 " + "、".join(f"/auth {i}" for i in dict.fromkeys(need_auth))
+            if need_auth else "")
+    return _panel(f"可用工具 · 共 {len(tools)} 个", rows, hint=hint)
 
 
 def _compact_text(data: dict | None) -> str:
@@ -597,8 +622,8 @@ _HELP = "\n".join([
     "  /auth        查看各 IdP 的授权状态",
     "  /auth <idp>  对该 IdP 授权或重新授权",
     "  /status      当前身份、会话与服务你的 microVM",
-    "  /context     对话轮数、上下文大小与 prompt cache 命中率",
-    "  /model       当前模型与上下文设置",
+    "  /context     对话轮数、上下文大小、系统提示词、压缩与缓存命中",
+    "  /model       当前模型、平台与 prompt cache 方式",
     "  /tools       当前可用的工具，按来源分组",
     "  /new         开启新的对话（切换运行实例）",
     "  /compact     把较早的对话压缩成摘要（保留最近几条）",
@@ -612,7 +637,7 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
     """Run a chat command. `None` means this wasn't one, so it's a question for the agent.
 
     Returns `{"text": …}`, plus `{"link": {"text", "url"}}` when the answer is a URL the
-    channel should make clickable. Channel-agnostic on purpose: the web page has the same
+    channel should make clickable, or `{"panel": …}` when it is a set of fields to lay out. Channel-agnostic on purpose: the web page has the same
     diagnostics as the Lark chat, and neither surface owns the logic."""
     cmd = message.lower()
     if cmd in ("/help", "/?"):
@@ -678,8 +703,6 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
         return {"text": f"请授权访问你的 {label} 账号：",
                 "link": {"text": "点击授权", "url": auth_url}}
 
-    # Read-only diagnostics over three independent dimensions: the session id that routes
-    # you, the container currently serving it, and the thread holding your history.
     # Who is serving you and where: identity, the session id that routes you, the
     # container currently serving it, and the thread holding your history. What that
     # thread holds is /context's; the rest each have a command, pointed at below.
@@ -691,21 +714,17 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
         last = info.get("lastActivity", 0)
         last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
                     .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
-        return {"text": "\n".join([
-            f"应用身份：{_app_identity()}",
-            f"用户身份：{actor_id}",
-            f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
-            f"当前 microVM：{_microvm_line(rt_sid, probe)}",
-            f"记忆线程：{mem_sid}",
-            f"最近活跃：{last_str}",
-            "上下文：发送 /context 查看",
-            "模型：发送 /model 查看",
-            "工具：发送 /tools 查看",
-            "授权状态：发送 /auth 查看",
-        ])}
+        return _panel(
+            "运行状态",
+            [("应用身份", _app_identity()), ("用户身份", actor_id)],
+            [("会话路由键", rt_sid or "尚未建立（发一条普通消息后创建）"),
+             ("当前 microVM", _microvm_line(rt_sid, probe)),
+             ("记忆线程", mem_sid),
+             ("最近活跃", last_str)],
+            hint="上下文 /context · 模型 /model · 工具 /tools · 授权 /auth")
 
-    # What the thread holds and what it costs: turns, the context size the last request
-    # was billed for, and how much of the input the prompt cache served.
+    # What the thread holds and what shapes it: turns, the size the last request was billed
+    # for, the system prompt, when it is summarised, and how much the prompt cache served.
     if cmd == "/context":
         info = identity.session_info(user_id)
         rt_sid = info.get("sessionId", "")
@@ -715,19 +734,12 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
         stats = thread_stats(rt_sid, user_id, actor_id, mem_sid) if rt_sid else {}
         probe = probe_agent(rt_sid, user_id, actor_id) if rt_sid else None
         logger.info("context for %s: %s", actor_id, stats or "unknown")
-        return {"text": "\n".join([
-            (f"该线程对话：{stats['turns']} 轮"
-             f"（含 {stats['toolCalls']} 次工具调用）" if stats
-             else "该线程对话：—（发一条普通消息后可见）"),
-            f"上下文大小：{_context_line(stats, probe)}",
-            f"Prompt cache：{_cache_line(stats, probe)}",
-            "压缩较早的对话：发送 /compact",
-        ])}
+        return _context_panel(stats, probe)
 
     if cmd == "/model":
         info = identity.session_info(user_id)
         rt_sid = info.get("sessionId", "") or identity.get_or_create_session(user_id)
-        return {"text": _model_text(probe_agent(rt_sid, user_id, actor_id))}
+        return _model_panel(probe_agent(rt_sid, user_id, actor_id))
 
     if cmd == "/compact":
         rt_sid = identity.get_or_create_session(user_id)
@@ -751,7 +763,7 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
         except Exception:  # noqa: BLE001 — a diagnostic must answer, not raise
             logger.warning("tools listing failed for %s", actor_id, exc_info=True)
             data = None
-        return {"text": _tools_text(data)}
+        return _tools_panel(data)
 
     return None
 
@@ -846,6 +858,8 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         link = reply.get("link")
         if link:
             lark.send_link_message(chat_id, reply["text"], link["text"], link["url"])
+        elif reply.get("panel"):
+            lark.send_panel(chat_id, reply["panel"], reply["text"])
         else:
             lark.send_message(chat_id, reply["text"])
         return

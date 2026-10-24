@@ -342,43 +342,57 @@ def test_model_reports_what_the_container_says_not_the_routers_config():
     """UpdateAgentRuntime replaces the environment, so the router's own MODEL_ID can name
     a model nobody is calling. Only the serving container's answer is shown."""
     import index
-    text = index._model_text({"settings": {
+    text = index._model_panel({"settings": {
         "model": "global.anthropic.claude-sonnet-5", "region": "ap-northeast-1",
         "cache": "explicit 1h", "summarizeAt": 120000, "summarizeKeep": 20,
-        "systemPromptCustom": False, "systemPromptChars": 180}})
+        "systemPromptCustom": False, "systemPromptChars": 180}})["text"]
     assert "global.anthropic.claude-sonnet-5" in text
     assert "Amazon Bedrock · ap-northeast-1" in text
-    assert "显式（cachePoint，TTL 1h）" in text and "120.0k" in text and "保留最近 20 条" in text
-    assert "默认（180 字符）" in text
-    assert "关闭" in index._model_text({"settings": {"model": "m", "cache": "off",
-                                                    "summarizeAt": 0}})
-    assert "隐式" in index._model_text({"settings": {"model": "m", "cache": "implicit",
-                                                    "summarizeAt": 0}})
+    assert "TTL 1h" in text
+    # The prompt and the summarisation threshold shape the context, not the model.
+    assert "系统提示词：" not in text and "保留最近" not in text
+    assert "关闭" in index._model_panel({"settings": {"model": "m", "cache": "off"}})["text"]
+    assert "隐式" in index._model_panel({"settings": {"model": "m", "cache": "implicit"}})["text"]
     # An older image reports no settings, and a failed probe reports nothing at all.
-    assert "探测未返回" in index._model_text({"model": "m"})
-    assert "探测未返回" in index._model_text(None)
+    assert "探测未返回" in index._model_panel({"model": "m"})["text"]
+    assert "探测未返回" in index._model_panel(None)["text"]
 
 
-def test_the_context_line_shows_the_billed_size_next_to_the_threshold():
+def test_context_holds_the_size_the_prompt_and_the_compaction_policy():
     import index
-    line = index._context_line({"contextTokens": 9147, "cachedTokens": 5049},
-                               {"settings": {"summarizeAt": 120000}})
-    assert line == "最近一次请求 9.1k token，超过 120.0k 时自动摘要"
-    assert "发一条普通消息" in index._context_line({}, None)
-
-
-def test_the_cache_line_gives_the_latest_and_the_whole_threads_hit_rate():
-    """Figures from a real thread: the latest call almost all cached, the thread as a whole
-    less so — which is what says whether caching pays off across the conversation."""
-    import index
-    stats = {"contextTokens": 9147, "cachedTokens": 5049,
+    stats = {"turns": 4, "toolCalls": 6, "contextTokens": 9147, "cachedTokens": 5049,
              "inputTotal": 19166, "cachedTotal": 14845, "modelCalls": 3}
-    line = index._cache_line(stats, {"settings": {"cache": "explicit 1h"}})
-    assert line == "最近一次命中 55%，本线程累计 77%（3 次模型调用）"
-    assert index._cache_line(stats, {"settings": {"cache": "off"}}) == "关闭"
-    # An implicit-caching model still reports hits, so the rate is shown, not "off".
-    assert "最近一次命中" in index._cache_line(stats, {"settings": {"cache": "implicit"}})
-    assert "发一条普通消息" in index._cache_line({}, None)
+    probe = {"settings": {"cache": "implicit", "summarizeAt": 120000, "summarizeKeep": 20,
+                          "systemPromptCustom": False, "systemPromptChars": 165}}
+    rows = dict(r for g in index._context_panel(stats, probe)["panel"]["groups"] for r in g)
+    assert rows["对话"] == "4 轮 · 6 次工具调用"
+    assert rows["当前大小"] == "9.1k token（最近一次请求，压缩阈值的 8%）"
+    assert rows["系统提示词"] == "默认 · 165 字符"
+    assert rows["自动压缩"] == "超过 120.0k token 时摘要，保留最近 20 条消息"
+    # Figures from a real thread: the latest call half cached, the thread as a whole more.
+    assert rows["缓存命中"] == "最近一次 55% · 本线程累计 77%（3 次模型调用）"
+    off = {"settings": {**probe["settings"], "cache": "off", "summarizeAt": 0}}
+    rows = dict(r for g in index._context_panel(stats, off)["panel"]["groups"] for r in g)
+    assert rows["自动压缩"] == "关闭" and rows["缓存命中"].startswith("未启用")
+    # Nothing has run yet, or the probe did not answer: says so rather than inventing zeros.
+    text = index._context_panel({}, None)["text"]
+    assert "发一条普通消息" in text and "探测未返回" in text
+
+
+def test_a_panel_carries_its_fields_and_the_text_the_web_page_shows():
+    import index
+    r = index._panel("T", [("a", "1")], [], [("b", "2")], hint="h")
+    assert r["panel"] == {"title": "T", "groups": [[("a", "1")], [("b", "2")]], "hint": "h"}
+    assert r["text"] == "T\n\na：1\n\nb：2\n\nh"
+
+
+def test_a_refused_card_still_answers_as_text():
+    import lark
+    with mock.patch.object(lark, "get_tenant_token", return_value="t"), \
+         mock.patch.object(lark.urllib.request, "urlopen", side_effect=OSError("boom")), \
+         mock.patch.object(lark, "send_message", return_value=True) as text:
+        assert lark.send_panel("oc_1", {"title": "T", "groups": [[("a", "1")]]}, "T a")
+    assert text.call_args.args[:2] == ("oc_1", "T a")
 
 
 def test_tools_are_grouped_by_where_they_came_from_with_the_grant_they_need():
@@ -387,18 +401,17 @@ def test_tools_are_grouped_by_where_they_came_from_with_the_grant_they_need():
     import index
     with mock.patch.dict(index.IDPS, {"lark": {"label": "Lark"},
                                       "google": {"label": "Google"}}, clear=True):
-        text = index._tools_text({"tools": [
+        r = index._tools_panel({"tools": [
             {"name": "lark_whoami", "source": "lark", "idp": "lark"},
             {"name": "approval_list", "source": "approval", "idp": "lark"},
             {"name": "google_whoami", "source": "google", "idp": "google"},
             {"name": "run_code", "source": "code", "idp": ""},
-        ], "ungranted": ["google"]})
-    lines = text.splitlines()
-    assert lines[0] == "可用工具 · 共 4 个"
-    assert "Lark：lark_whoami" in lines
-    assert "审批：approval_list" in lines
-    assert "Google（未授权，发送 /auth google）：google_whoami" in lines
-    assert "代码执行：run_code" in lines
+        ], "ungranted": ["google"]})["panel"]
+    assert r["title"] == "可用工具 · 共 4 个"
+    rows = r["groups"][0]
+    assert ("Lark", "lark_whoami") in rows and ("审批", "approval_list") in rows
+    assert ("Google（未授权）", "google_whoami") in rows and ("代码执行", "run_code") in rows
+    assert "/auth google" in r["hint"]
 
 
 def test_compact_says_what_happened_in_every_case():
@@ -411,8 +424,8 @@ def test_compact_says_what_happened_in_every_case():
 
 def test_tools_say_why_there_are_none():
     import index
-    assert "身份校验未通过" in index._tools_text({"tools": [], "identityError": "x"})
-    assert "探测未返回" in index._tools_text(None)
+    assert "身份校验未通过" in index._tools_panel({"tools": [], "identityError": "x"})["text"]
+    assert "探测未返回" in index._tools_panel(None)["text"]
 
 
 
@@ -447,18 +460,14 @@ def test_add_reaction_returns_id_and_never_raises():
         assert lark.add_reaction("") == ""
 
 
-def test_status_shows_both_identities_and_masks_the_app_id():
+def test_status_shows_both_identities():
     """/status must name both identities — the whole point of this sample is that
-    tools act as the *user* while replies go out as the *app*. The appId is not a
-    secret but is masked anyway: no reason to paste a full identifier into a chat."""
+    tools act as the *user* while replies go out as the *app*."""
     import index
     with mock.patch.object(index.lark, "get_credentials",
                            return_value=("cli_a1b2c3d4e5f6g7h8", "s", "v", "k")):
-        line = index._app_identity()
-    assert line == "cli_a1b2…g7h8"
-    assert "c3d4e5f6" not in line          # middle is not exposed
-
-    # Unconfigured must not blow up or print an empty parenthesis.
+        assert index._app_identity() == "cli_a1b2c3d4e5f6g7h8"
+    # Unconfigured must not blow up or print an empty value.
     with mock.patch.object(index.lark, "get_credentials", return_value=("", "", "", "")):
         assert index._app_identity() == "未配置"
 
@@ -912,7 +921,7 @@ def test_context_does_not_manufacture_the_session_it_reports_as_absent():
     src = inspect.getsource(index.run_command)
     block = src[src.index('cmd == "/context"'):src.index('cmd == "/model"')]
     assert "get_or_create_session" not in block
-    assert "（发一条普通消息后可见）" in block
+    assert "if rt_sid else" in block
 
 
 def test_status_shows_who_serves_you_and_points_at_the_rest():

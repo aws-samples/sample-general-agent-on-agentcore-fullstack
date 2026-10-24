@@ -306,6 +306,44 @@ def send_link_message(receive_id: str, text: str, link_text: str, url: str,
         return False
 
 
+def send_panel(receive_id: str, panel: dict, fallback: str,
+               receive_id_type: str = "") -> bool:
+    """Send a command's answer as a card: a grey header, label/value rows in groups split
+    by a rule, and a small grey hint. Falls back to `fallback` as text if Lark refuses it."""
+    elements = []
+    for i, rows in enumerate(panel.get("groups") or []):
+        if i:
+            elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown",
+                         "content": "\n".join(f"**{k}**　{v}" for k, v in rows)})
+    if panel.get("hint"):
+        elements.append({"tag": "markdown", "text_size": "notation",
+                         "content": f"<font color='grey'>{panel['hint']}</font>"})
+    card = {"schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": panel.get("title", "")},
+                       "template": "grey"},
+            "body": {"elements": elements}}
+    token = get_tenant_token()
+    if token:
+        rid_type = _receive_id_type(receive_id, receive_id_type)
+        api = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={rid_type}"
+        body = json.dumps({"receive_id": receive_id, "msg_type": "interactive",
+                           "content": json.dumps(card)}).encode()
+        try:
+            req = urllib.request.Request(api, data=body, method="POST", headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {token}",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
+                result = json.loads(resp.read().decode())
+            if result.get("code") == 0:
+                return True
+            log.error("send_panel error: %s", result)
+        except Exception as e:  # noqa: BLE001
+            log.error("send_panel failed: %s", e)
+    return send_message(receive_id, fallback, receive_id_type)
+
+
 def download_image(image_key: str) -> tuple[bytes | None, str | None]:
     """Download an image resource by key. Returns (bytes, content_type) or (None, None)."""
     token = get_tenant_token()
