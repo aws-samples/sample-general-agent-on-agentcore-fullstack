@@ -304,6 +304,32 @@ def _summary_model():
         timeout=_SUMMARY_TIMEOUT)
 
 
+# The card of the turn running on a thread, for what happens inside the graph that the
+# token stream cannot show — a summary is generated without streaming a word. Per thread,
+# which holds because a thread runs one turn at a time.
+_turn_cards: dict[str, object] = {}
+
+
+def _turn_status(kind: str, started: bool) -> None:
+    """Tell the running turn's card what the graph is doing. Best-effort and silent outside
+    a turn: /compact summarises with no run config and no card.
+
+    Everything is inside the try, attribute lookups included: this runs inside the
+    summariser, and an exception escaping here would be taken for a failed summary and
+    skip the compaction — a status line costing the thing it reports on."""
+    try:
+        from langgraph.config import get_config
+        thread_id = ((get_config() or {}).get("configurable") or {}).get("thread_id", "")
+    except Exception:  # noqa: BLE001 — outside a graph run, as /compact is: nothing to tell
+        return
+    try:
+        card = _turn_cards.get(thread_id)
+        if card is not None and kind == "compacting":
+            card.compacting(started)
+    except Exception:  # noqa: BLE001 — never let the status line cost the summary
+        log.warning("could not report %s to the card", kind, exc_info=True)
+
+
 def _summarization(model, trigger=None, keep=None):
     """SummarizationMiddleware that never discards history it failed to summarise.
 
@@ -327,6 +353,22 @@ def _summarization(model, trigger=None, keep=None):
         return None
 
     class SummarizationMiddleware(_Base):
+        # Only these two run when a summary is really being written, so the card says so
+        # for exactly that stretch and not for every threshold check.
+        def _create_summary(self, messages):  # noqa: ANN001 — the framework's signature
+            _turn_status("compacting", True)
+            try:
+                return super()._create_summary(messages)
+            finally:
+                _turn_status("compacting", False)
+
+        async def _acreate_summary(self, messages):  # noqa: ANN001 — same
+            _turn_status("compacting", True)
+            try:
+                return await super()._acreate_summary(messages)
+            finally:
+                _turn_status("compacting", False)
+
         def before_model(self, state, runtime):  # noqa: ANN001 — the framework's signature
             try:
                 return _kept(super().before_model(state, runtime))
@@ -1319,54 +1361,62 @@ def _stream_to_chat(session: dict, message, chat_id: str,
     session["tool_texts"] = []
     card = lark_notify.StreamingCard(chat_id)
     streaming = card.open()
+    thread_id = (session.get("config") or {}).get("configurable", {}).get("thread_id", "")
+    if streaming and thread_id:
+        _turn_cards[thread_id] = card
+    try:
 
-    # A tool whose system has no grant is certain to be refused, and letting the turn run
-    # on means the model narrates that refusal at length before the consent card arrives.
-    # Stop at the tool call instead — the caller sees `walled_tool` and posts the card.
-    def _abort_on_ungranted_tool(tool_name: str) -> bool:
-        idp = _walled_idp(session, tool_name)
-        if not idp:
-            return False
-        session["walled_tool"] = tool_name
-        log.info("aborting turn: %s needs %s consent", tool_name, idp)
-        return True
-
-    def _on_tool_use(tool_name: str) -> bool:
-        if _abort_on_ungranted_tool(tool_name):
+        # A tool whose system has no grant is certain to be refused, and letting the turn run
+        # on means the model narrates that refusal at length before the consent card arrives.
+        # Stop at the tool call instead — the caller sees `walled_tool` and posts the card.
+        def _abort_on_ungranted_tool(tool_name: str) -> bool:
+            idp = _walled_idp(session, tool_name)
+            if not idp:
+                return False
+            session["walled_tool"] = tool_name
+            log.info("aborting turn: %s needs %s consent", tool_name, idp)
             return True
-        card.tool_started()
-        return False
 
-    def _on_tool_result(name: str, text: str) -> None:
-        session["tool_texts"].append((name, text))
-        card.tool_finished()
+        def _on_tool_use(tool_name: str) -> bool:
+            if _abort_on_ungranted_tool(tool_name):
+                return True
+            card.tool_started()
+            return False
 
-    acc = []
-    for delta in _iter_deltas(session["graph"], message,
-                              _run_config(session, delivery.LarkDelivery(chat_id)),
-                              on_tool_use=_on_tool_use, on_tool_result=_on_tool_result,
-                              message_id=message_id):
-        acc.append(delta)
-        if streaming and not card.update("".join(acc)):
-            streaming = False  # a failed write drops us to the fallback below
-    text = "".join(acc)
+        def _on_tool_result(name: str, text: str) -> None:
+            session["tool_texts"].append((name, text))
+            card.tool_finished()
 
-    # Aborted for consent: whatever the model had started saying is a half-sentence
-    # about a failure the user is about to be asked to fix, so replace it rather than
-    # leave it on the card.
-    if session.get("walled_tool"):
-        idp = _walled_idp(session, session["walled_tool"]) or "lark"
-        text = f"🔐 这一步需要访问你的 {idp.capitalize()} 账号"
+        acc = []
+        for delta in _iter_deltas(session["graph"], message,
+                                  _run_config(session, delivery.LarkDelivery(chat_id)),
+                                  on_tool_use=_on_tool_use, on_tool_result=_on_tool_result,
+                                  message_id=message_id):
+            acc.append(delta)
+            if streaming and not card.update("".join(acc)):
+                streaming = False  # a failed write drops us to the fallback below
+        text = "".join(acc)
 
-    if streaming:
-        if not card.close(text):
-            streaming = False
-    if not streaming:
-        # Either CardKit was never available or it failed mid-stream. Post the whole
-        # answer as plain text so the user still gets it.
-        if not lark_notify.send_text(chat_id, text):
-            log.error("could not deliver reply to %s: %s", chat_id, text[:200])
-    return text
+        # Aborted for consent: whatever the model had started saying is a half-sentence
+        # about a failure the user is about to be asked to fix, so replace it rather than
+        # leave it on the card.
+        if session.get("walled_tool"):
+            idp = _walled_idp(session, session["walled_tool"]) or "lark"
+            text = f"🔐 这一步需要访问你的 {idp.capitalize()} 账号"
+
+        if streaming:
+            if not card.close(text):
+                streaming = False
+        if not streaming:
+            # Either CardKit was never available or it failed mid-stream. Post the whole
+            # answer as plain text so the user still gets it.
+            if not lark_notify.send_text(chat_id, text):
+                log.error("could not deliver reply to %s: %s", chat_id, text[:200])
+        return text
+    finally:
+        # Only this turn's card: a later turn may already have registered its own.
+        if _turn_cards.get(thread_id) is card:
+            _turn_cards.pop(thread_id, None)
 
 
 def _thread_config(actor_id: str, mem_sid: str) -> dict:

@@ -549,6 +549,9 @@ class FakeCard:
     def tool_finished(self):
         self.tool_events.append("finish")
 
+    def compacting(self, started):
+        self.tool_events.append("compact" if started else "compacted")
+
 
 
 # ------------------- vaulted token ownership (consent hijack) ------------------
@@ -1670,6 +1673,78 @@ def test_the_claim_holder_repairs_its_own_thread():
         assert agent_core._run(agent_core._arepair_interrupted_turn(graph, cfg, own_claim=True)) == 1
     finally:
         agent_core.release("t-rep")
+
+
+def test_the_card_says_when_the_thread_is_being_summarised():
+    """A summary streams nothing for tens of seconds, which read as "thinking" — and looked
+    stuck. The phase has its own line, its heartbeat, and its own step in the panel."""
+    ln, card, _ = _recording_card()
+    card.compacting(True)
+    assert "整理较早的对话" in card._status_text()
+    card.compacting(False)
+    assert card._status_text().startswith("🤔")
+    # The phase lasted long enough to be a step: rewind its start so it counts.
+    card._phase, card._phase_since = "compact", card._phase_since - 2
+    card.compacting(False)
+    assert any(step.startswith("整理上下文") for step in card.summary()[1])
+
+
+def test_a_summary_inside_a_turn_tells_that_turns_card_start_and_end():
+    """Through a compiled graph with the summariser forced to fire: the card hears exactly
+    when a summary is being written, and nothing when the threshold check passes."""
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langgraph.checkpoint.memory import InMemorySaver
+    middleware = agent_core._summarization(FakeListChatModel(responses=["a summary"]),
+                                           trigger=("messages", 3), keep=("messages", 1))
+    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]), tools=[],
+                                    checkpointer=InMemorySaver(), middleware=[middleware])
+    cfg = {"configurable": {"thread_id": "t-sum"}}
+    card = mock.Mock()
+    agent_core._turn_cards["t-sum"] = card
+
+    async def turn(text):
+        async for _ in graph.astream({"messages": [HumanMessage(text)]}, config=cfg,
+                                     stream_mode="messages"):
+            pass
+    try:
+        agent_core._run(turn("one"))                 # below the trigger: no summary
+        assert card.compacting.call_args_list == []
+        agent_core._run(turn("two"))                 # past it: one summary
+        assert [c.args for c in card.compacting.call_args_list] == [(True,), (False,)]
+    finally:
+        agent_core._turn_cards.pop("t-sum", None)
+
+
+def test_a_broken_card_cannot_cost_the_summary():
+    """The status signal runs inside the summariser; anything it raises would be read as a
+    failed summary and skip the compaction."""
+    agent_core._turn_cards["t-broken"] = object()          # no compacting() at all
+    try:
+        with mock.patch("langgraph.config.get_config",
+                        return_value={"configurable": {"thread_id": "t-broken"}}):
+            agent_core._turn_status("compacting", True)     # must not raise
+    finally:
+        agent_core._turn_cards.pop("t-broken", None)
+
+
+def test_compacting_outside_a_turn_is_quiet():
+    """/compact summarises outside any graph run; that is expected, not worth a traceback."""
+    with mock.patch.object(agent_core.log, "warning") as warned:
+        agent_core._turn_status("compacting", True)
+    assert not warned.called
+
+
+def test_a_turn_unregisters_its_card_even_when_it_fails():
+    card = mock.Mock(open=mock.Mock(return_value=True))
+    session = {"graph": object(), "config": {"configurable": {"thread_id": "t-fail-card"}},
+               "tool_texts": []}
+    with mock.patch.object(agent_core.lark_notify, "StreamingCard", return_value=card), \
+         mock.patch.object(agent_core, "_iter_deltas", side_effect=RuntimeError("boom")):
+        try:
+            agent_core._stream_to_chat(session, "hi", "oc_1")
+        except RuntimeError:
+            pass
+    assert "t-fail-card" not in agent_core._turn_cards
 
 
 def test_the_sync_path_judges_consent_on_this_turns_tool_results_only():

@@ -288,7 +288,8 @@ _STATUS_ID = "status"
 _HEARTBEAT_SECONDS = 3.0
 # Below this a step is noise — the model re-reading a tool result before it writes.
 _MIN_STEP_SECONDS = 0.5
-_STEP_LABEL = {"think": "思考", "tool": "调用工具", "write": "撰写回答"}
+_STEP_LABEL = {"think": "思考", "tool": "调用工具", "write": "撰写回答",
+               "compact": "整理上下文"}
 
 
 def _grey(text: str) -> str:
@@ -394,6 +395,8 @@ class StreamingCard:
             return f"🛠️ 正在调用工具(第 {self._tools_done + 1} 次)· {self._elapsed()} 秒"
         if self._phase == "write":
             return "✍️ 正在撰写回答"
+        if self._phase == "compact":
+            return f"🗜️ 正在整理较早的对话 · {self._elapsed()} 秒"
         return f"🤔 思考中 · {self._elapsed()} 秒"
 
     def tool_started(self) -> None:
@@ -412,6 +415,15 @@ class StreamingCard:
         with self._lock:
             self._tools_done += 1
             self._enter("think")
+        self._wake.set()
+
+    def compacting(self, started: bool) -> None:
+        """The thread is being summarised before the model is called — a long, uncached
+        call that streams nothing, so without this the card reads "thinking" for it."""
+        if not self.ok:
+            return
+        with self._lock:
+            self._enter("compact" if started else "think")
         self._wake.set()
 
     def summary(self) -> tuple[str, list[str]]:
@@ -433,7 +445,7 @@ class StreamingCard:
             self._wake.clear()
             with self._lock:
                 text, self._pending = self._pending, None
-                waiting = self._phase in ("think", "tool")
+                waiting = self._phase in ("think", "tool", "compact")
                 stale = time.monotonic() - self._status_written_at >= _HEARTBEAT_SECONDS
                 status = (self._status_text()
                           if self._status_due or (waiting and stale) else None)
