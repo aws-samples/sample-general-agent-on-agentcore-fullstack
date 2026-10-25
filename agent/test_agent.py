@@ -16,6 +16,7 @@ credentials; nothing here calls Bedrock.
 import base64
 import hashlib
 import json
+import time
 import os
 import re
 import sys
@@ -37,50 +38,18 @@ import agent_core
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 
-# ------------------------------- identity -----------------------------------
+# ------------------------------- web search ----------------------------------
 
-def test_derive_password_deterministic_and_complex():
-    import identity
-    with mock.patch.object(identity, "_get_salt", return_value="test-salt"):
-        p1 = identity._derive_password("lark:ou_abc")
-        p2 = identity._derive_password("lark:ou_abc")
-        p3 = identity._derive_password("lark:ou_xyz")
-    assert p1 == p2                       # deterministic
-    assert p1 != p3                       # per-user
-    assert p1.endswith("Aa1!")            # complexity suffix
-    assert len(p1) == 36
-
-
-def test_jwt_exp_parses_unverified():
-    import identity
-    payload = base64.urlsafe_b64encode(json.dumps({"exp": 1234567890}).encode()).decode().rstrip("=")
-    token = f"header.{payload}.sig"
-    assert identity._jwt_exp(token) == 1234567890.0
-
-
-def test_jwt_exp_bad_token_returns_zero():
-    import identity
-    assert identity._jwt_exp("not-a-jwt") == 0.0
-
-
-def test_ensure_user_email_sanitizes_colon():
-    """open_id-based username 'lark:ou_x' must not produce an invalid email."""
-    import identity
-    captured = {}
-
-    def fake_create(**kw):
-        captured["email"] = next(a["Value"] for a in kw["UserAttributes"] if a["Name"] == "email")
-
-    with mock.patch.object(identity, "_cognito") as c:
-        from botocore.exceptions import ClientError
-        c.admin_get_user.side_effect = ClientError(
-            {"Error": {"Code": "UserNotFoundException"}}, "AdminGetUser")
-        c.admin_create_user.side_effect = fake_create
-        c.admin_set_user_password.return_value = {}
-        with mock.patch.object(identity, "_get_salt", return_value="s"):
-            identity._ensure_user("lark:ou_abc", "")
-    assert ":" not in captured["email"]           # colon replaced
-    assert captured["email"] == "lark-ou_abc@lark.local"
+def test_web_search_is_signed_by_the_agent_role_not_a_users_token():
+    """Search reads no user data, and minting a per-user token for it would need the agent
+    to hold Cognito admin rights — and create a Cognito user for every web actor."""
+    import websearch
+    with mock.patch.object(websearch, "_GATEWAY_URL",
+                           "https://gw-1.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"):
+        conn = websearch.connection_for("web:abc")
+    assert "Authorization" not in conn["headers"]
+    assert conn["auth"]._signer._region_name == "us-east-1"
+    assert conn["auth"]._signer._service_name == "bedrock-agentcore"
 
 
 # ------------------------------- agent_core session id ----------------------
@@ -322,7 +291,8 @@ def test_steering_is_per_thread():
     agent_core.steer("t-a", "for A")
     mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
     assert mw.before_model({"messages": []}, _runtime("t-b")) is None
-    assert agent_core._pending_steer == {"t-a": [("for A", "", False)]}
+    assert [q[:3] for q in agent_core._pending_steer["t-a"]] == [("for A", "", False)]
+    assert list(agent_core._pending_steer) == ["t-a"]
 
 
 def _load_busy_helpers():
@@ -370,14 +340,11 @@ def test_track_is_usable_from_a_thread():
 # without the tool rather than failing to build a session.
 
 def test_websearch_gateway_contract():
-    """websearch imports mcp (not installable here), so assert the two things that
-    silently break the Gateway call: the protocol-version header, without which it
-    negotiates 2025-03-26 and rejects with -32022, and an access token rather than
-    an ID token, since the Gateway checks the client_id claim."""
+    """The protocol-version header: without it the Gateway negotiates 2025-03-26 and
+    rejects with -32022."""
     src = open(os.path.join(os.path.dirname(__file__), "websearch.py"), encoding="utf-8").read()
     assert "MCP-Protocol-Version" in src
     assert "2025-11-25" in src
-    assert "get_user_jwt" in src        # identity.py returns the ACCESS token
     # available() must be a pure config check, so an unset gateway just means no tool
     assert 'os.environ.get("WEBSEARCH_GATEWAY_URL", "")' in src
 
@@ -445,6 +412,37 @@ def test_unauthorized_session_passes_an_empty_token_and_still_gets_tools():
     assert s["tool_idp"] == {_dummy_tool.name: "lark"}
     assert opened == [{"tok": ""}], "the server must still be connected, with no token"
     assert s["graph"] is not None, "the model must see the Lark tools regardless"
+
+
+def test_a_web_users_lark_is_granted_on_demand_like_google():
+    """A web user has no Lark identity to match, so the Lark-user path — which mints a link at
+    build and refuses a grant whose open_id differs (wrong_owner) — would lock them out for
+    good. For them Lark is one more system: read without minting, its tools listed, and a
+    link minted only when they ask to authorise."""
+    lark_user_path, opened = [], []
+
+    async def fake_open(stack, connection):
+        opened.append(connection.get("url"))
+        return [_dummy_tool]
+
+    with mock.patch.object(agent_core.lark_3lo, "get_user_lark_token",
+                           side_effect=lambda *a, **k: lark_user_path.append(a)), \
+         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value=""), \
+         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+                           side_effect=lambda tok, url="": {"url": url or "lark-mcp"}), \
+         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
+         mock.patch.object(agent_core.websearch, "available", return_value=False):
+        s = agent_core._build_session("web:sub-carol", "",
+                                      agent_core._session_id_for("web:sub-carol"))
+        assert lark_user_path == []
+        assert "lark-mcp" in opened and s["consent"]["lark"] == ""
+        assert not s["auth_url"] and not s["identity_error"]
+        assert agent_core.auth_status("web:sub-carol")["lark"] is False
+        with mock.patch.object(agent_core.lark_3lo, "get_user_token_for",
+                               return_value=("auth_url", "https://lark-consent")) as generic:
+            r = agent_core.reauth("web:sub-carol", "lark")
+    assert r["auth_url"] == "https://lark-consent" and generic.call_count == 1
+    assert lark_user_path == []
 
 
 # ----------------------------- streaming to a card --------------------------
@@ -1643,6 +1641,32 @@ def test_the_summariser_does_not_pay_for_prompt_caching():
     assert summariser.model.cache_ttl == ""
 
 
+def test_a_message_steered_in_or_answered_later_keeps_the_time_it_arrived():
+    """A message steered in mid-turn, or answered as a continuation after the turn, was said
+    when it arrived — not when the turn began, and not when its answer started."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    agent_core._pending_steer.clear()
+    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
+        mw = agent_core._middleware()
+    tool = _make_tool("lookup")
+    graph = agent_core.create_agent(
+        model=_ScriptedModel(turns=[{"text": ["looking"], "tool_calls": ["lookup"]},
+                                    {"text": ["done"]}, {"text": ["later"]}]),
+        tools=[tool], middleware=mw, checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "t-steer-clock", "received_ms": 1000}}
+    agent_core.steer("t-steer-clock", "also this", "h-steer")
+    arrived = agent_core._pending_steer["t-steer-clock"][0][3]
+
+    async def run(inputs):
+        async for _ in graph.astream({"messages": inputs}, cfg, stream_mode="messages"):
+            pass
+    agent_core._run(run([HumanMessage("q", id="h-q")]))
+    agent_core._run(run(agent_core._turn_input([("and later", "h-late", False, 5000)])))
+    by_id = {m.id: m.additional_kwargs.get("ts")
+             for m in agent_core._run(graph.aget_state(cfg)).values["messages"]}
+    assert by_id["h-q"] == 1000 and by_id["h-steer"] == arrived and by_id["h-late"] == 5000
+
+
 def test_reauthorising_a_system_already_granted_starts_a_new_consent():
     """How a user switches accounts: /auth google answered "Already authorized." while a grant
     was vaulted, so there was no way to consent as anybody else."""
@@ -1665,7 +1689,44 @@ def test_summarisation_can_be_disabled_outright():
     being lost, the other is what lets the model see a screenshot at all."""
     with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
         assert [type(m).__name__ for m in agent_core._middleware()] == [
-            "ImageMiddleware", "SteeringMiddleware"]
+            "ImageMiddleware", "SteeringMiddleware", "ClockMiddleware"]
+
+
+def test_each_message_records_when_it_was_said():
+    """A reloaded page shows the times Lark chat shows, so they live on the thread itself:
+    the user's message and the reply each carry one, and the transcript hands them out."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
+        mw = agent_core._middleware()
+    graph = agent_core.create_agent(
+        model=_ScriptedModel(turns=[{"text": ["one"]}, {"text": ["two"]}]), tools=[_dummy_tool],
+        middleware=mw, checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "t-clock"}}
+    before = int(time.time() * 1000)
+    # The user's message carries when the turn arrived, not when the model was first called.
+    arrived = {"configurable": {**cfg["configurable"], "received_ms": before - 5000}}
+    async def turn(text, mid):
+        async for _ in graph.astream({"messages": [HumanMessage(text, id=mid)]}, cfg,
+                                     stream_mode="messages"):
+            pass
+    async def first(text, mid):
+        async for _ in graph.astream({"messages": [HumanMessage(text, id=mid)]}, arrived,
+                                     stream_mode="messages"):
+            pass
+    agent_core._run(first("q1", "h1"))
+    agent_core._run(turn("q2", "h2"))
+    after = int(time.time() * 1000)
+    msgs = agent_core._run(graph.aget_state(cfg)).values["messages"]
+    assert [type(m).__name__ for m in msgs] == ["HumanMessage", "AIMessage"] * 2
+    stamps = [m.additional_kwargs.get("ts") for m in msgs]
+    assert stamps[0] == before - 5000
+    assert all(before <= t <= after for t in stamps[1:]) and stamps == sorted(stamps), stamps
+    # Stamped in place: still one copy of each.
+    assert [agent_core._text_of(m) for m in msgs] == ["q1", "one", "q2", "two"]
+    with mock.patch.object(agent_core, "_checkpointer", return_value=graph.checkpointer), \
+         mock.patch.object(agent_core, "_thread_config", return_value=cfg):
+        out = agent_core.transcript("web:s-1")["messages"]
+    assert [m.get("ts") for m in out] == stamps
 
 
 def _runtime(thread_id):
@@ -1740,7 +1801,7 @@ def test_an_attachment_steered_into_a_running_turn_is_not_dropped():
                                         image_handles=[{"kind": "file", "key": "f_1",
                                                         "name": "q3.pdf", "message_id": "om_9"}])
         assert out["steered"] is True
-        (text, mid, _fresh), = agent_core._pending_steer["t-busy"]
+        (text, mid, _fresh, _arrived), = agent_core._pending_steer["t-busy"]
         assert "also this" in text and "save_attachment(1)" in text and "q3.pdf" in text
         assert agent_core.images.handles_for("t-busy")[0]["key"] == "f_1"
     finally:
@@ -1822,7 +1883,7 @@ def test_a_message_steered_after_the_last_model_call_is_answered_not_dropped():
     _fresh_claims()
     seen = []
 
-    def stream(session, inputs, chat_id, message_id=None):
+    def stream(session, inputs, chat_id, message_id=None, received_ms=None):
         seen.append(inputs)
         if len(seen) == 1:       # arrives while the first answer is streaming
             with mock.patch.object(agent_core.images, "blocks_for", return_value=[]):
@@ -1838,7 +1899,7 @@ def test_a_message_steered_after_the_last_model_call_is_answered_not_dropped():
          mock.patch.object(agent_core.threading, "Thread", _InlineThread):
         agent_core.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-late")
     assert len(seen) == 2
-    (text, _mid, _fresh), = seen[1]
+    (text, _mid, _fresh, _arrived), = seen[1]
     assert "also this" in text and "save_attachment(1)" in text
     assert agent_core.thread_owner("t-late") is None
     assert agent_core.images.handles_for("t-late") == []
@@ -1977,7 +2038,7 @@ def test_a_continuation_that_cannot_get_a_session_says_how_many_it_dropped():
             return _session_for([])
         raise RuntimeError("mcp connect timeout")      # the continuation's rebuild
 
-    def stream(session, inputs, chat_id, message_id=None):
+    def stream(session, inputs, chat_id, message_id=None, received_ms=None):
         if calls["n"] == 1:
             agent_core.steer("t-cont", "after consent", "m-r", fresh=True)
         return "ok"
@@ -2002,7 +2063,7 @@ def test_a_consent_replay_waits_for_the_continuation_on_a_rebuilt_session():
     mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
     out = mw.before_model({"messages": []}, _runtime("t-r"))
     assert [m.content for m in out["messages"]] == ["aside"]
-    assert agent_core._pending_steer["t-r"] == [("replayed after consent", "m2", True)]
+    assert [q[:3] for q in agent_core._pending_steer["t-r"]] == [("replayed after consent", "m2", True)]
     _fresh_claims()
 
 
@@ -2195,7 +2256,7 @@ def _summarising_session(summary_model, answer="the answer"):
     """A real graph with the production summariser and steering, over a seeded thread."""
     from langgraph.checkpoint.memory import InMemorySaver
     with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        base = agent_core._middleware()                 # images + steering
+        base = agent_core._middleware()                 # images, steering, clock
     with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 1000), \
          mock.patch.object(agent_core, "_SUMMARIZE_KEEP", 2):
         summariser = agent_core._summarization(summary_model)
@@ -2292,11 +2353,109 @@ def test_agui_requests_are_told_apart_from_the_router_protocol():
     assert agui.is_agui_request({}) is False
 
 
-def test_agui_takes_its_thread_from_the_session_not_the_page():
+def test_the_pages_run_input_is_accepted_with_the_sessions_thread():
+    """The shape webui/index.html sends, through the real RunAgentInput: a field it carries
+    and we also set must be replaced, not passed twice (TypeError on every web turn)."""
+    import agui
+    from ag_ui.core.types import RunAgentInput
+    page = {"actorId": "web:s-1", "memorySessionId": "sess-x", "runId": "r-1",
+            "threadId": "resolved-by-agent", "messages": [{"id": "m-1", "role": "user",
+                                                           "content": "hi"}],
+            "tools": [], "context": [], "state": {}, "forwardedProps": {}}
+    run = RunAgentInput(**agui._run_input_fields(page, "sess-x"))
+    assert run.thread_id == "sess-x" and run.run_id == "r-1"
+
+
+def test_a_web_turn_may_take_as_many_steps_as_a_lark_turn():
+    """The AG-UI adapter fills an unset recursion limit with langchain_core's 25, where a Lark
+    turn keeps LangGraph's own default; a dozen tool calls must not end a web turn."""
+    import agui, asyncio
+    from typing import Annotated, TypedDict
+    from ag_ui.core.types import RunAgentInput
+    from ag_ui_langgraph import LangGraphAgent
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import StateGraph, add_messages
+
+    class State(TypedDict):
+        messages: Annotated[list, add_messages]
+        n: int
+
+    g = StateGraph(State)
+    g.add_node("step", lambda s: {"n": s.get("n", 0) + 1})
+    g.add_edge("__start__", "step")
+    g.add_conditional_edges("step", lambda s: "step" if s["n"] < 30 else "__end__")
+    graph = g.compile(checkpointer=InMemorySaver())
+    session = {"config": {"configurable": {"thread_id": "sess-x", "actor_id": "web:s-1"}}}
+    run = RunAgentInput(**agui._run_input_fields(
+        {"runId": "r-1", "messages": [{"id": "m-1", "role": "user", "content": "hi"}],
+         "tools": [], "context": [], "state": {}, "forwardedProps": {}}, "sess-x"))
+    adapter = LangGraphAgent(name="t", graph=graph, config=agent_core._run_config(
+        session, agent_core.delivery.NoDelivery("test")))
+
+    async def events():
+        return [e async for e in adapter.run(run)]
+    kinds = [getattr(e, "type", None) for e in asyncio.run(events())]
+    assert "RUN_ERROR" not in [str(k).split(".")[-1] for k in kinds], kinds
+
+
+def test_a_web_turn_stops_at_a_tool_that_needs_a_grant():
+    """As a Lark turn does: the model must not go on to narrate a refusal that is certain,
+    and the page gets the consent prompt and a finished run."""
+    import agui, asyncio
+    from types import SimpleNamespace as E
+    reached = []
+
+    class Run:
+        def __init__(self, **kw): pass
+
+        async def run(self, _input):
+            yield E(type="RUN_STARTED")
+            yield E(type="TEXT_MESSAGE_CONTENT", delta="我来查看你的文档。")
+            yield E(type="TOOL_CALL_START", tool_call_id="t1", tool_call_name="lark_docs")
+            reached.append("past the wall")
+            yield E(type="TEXT_MESSAGE_CONTENT", delta="还是不行……")
+
+    class Resp:
+        def __init__(self, **kw): self.out = b""
+        async def prepare(self, _r): pass
+        async def write(self, b): self.out += b
+        async def write_eof(self): pass
+
+    session = {"mem_sid": "sess-x", "graph": None, "config": {"configurable": {}},
+               "tool_idp": {"lark_docs": "lark"}, "consent": {"lark": ""}}
+    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+         mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
+         mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
+         mock.patch.object(agui.web, "StreamResponse", Resp):
+        resp = asyncio.run(agui.handle(None, {"actorId": "web:s-1", "runId": "r-1",
+                                              "messages": []}, ""))
+    frames = [f[len("data: "):] for f in resp.out.decode().split("\n\n") if f]
+    assert frames[:2] == ["RUN_STARTED", "TEXT_MESSAGE_CONTENT"]
+    assert json.loads(frames[2]) == {"type": "CUSTOM", "name": "consent", "value": {"idp": "lark"}}
+    assert json.loads(frames[3])["type"] == "RUN_FINISHED" and len(frames) == 4
+    assert reached == [] and agent_core.try_claim("sess-x", "web") is None
+    agent_core.release("sess-x")
+
+
+def test_a_refused_tool_on_the_page_ends_the_run_with_a_consent_prompt():
+    """The page gets the system to authorise, not a link: it mints one through /auth when the
+    user clicks, with the token it will complete with."""
+    import agui
+    session = {"tool_texts": [("google_whoami", "no user token (authorize first)")],
+               "tool_idp": {"google_whoami": "google"}, "consent": {"google": ""}}
+    event = json.loads(agui._consent(session).decode()[len("data: "):])
+    assert event == {"type": "CUSTOM", "name": "consent", "value": {"idp": "google"}}
+    assert agui._consent({"tool_texts": [], "tool_idp": {}, "consent": {}}) == b""
+
+
+def test_agui_takes_its_thread_from_the_session_not_the_pages_thread_id():
+    """AG-UI's own threadId is the page's to choose, so it is replaced by the session's —
+    which is built on the page's memorySessionId only after server.py checked it belongs to
+    the verified actor."""
     import agui, inspect
     src = inspect.getsource(agui.handle)
-    assert 'thread_id = session["mem_sid"]' in src and '"threadId": thread_id' in src
-    assert 'payload.get("threadId")' not in src
+    assert 'thread_id = session["mem_sid"]' in src and "_run_input_fields(payload, thread_id)" in src
+    assert agui._run_input_fields({"threadId": "theirs"}, "ours")["threadId"] == "ours"
 
 
 # --------------------------- who is calling ----------------------------------
@@ -2317,10 +2476,12 @@ def _signer():
 
     def mint(signing_key=key, **over):
         claims = {"iss": _POOL_ISSUER, "token_use": "access", "client_id": "client-1",
-                  "username": "lark:ou_alice", "exp": int(_t.time()) + 600, **over}
+                  "username": "lark:ou_alice", "sub": "sub-alice",
+                  "exp": int(_t.time()) + 600, **over}
         return "Bearer " + pyjwt.encode(claims, signing_key, algorithm="RS256")
     with mock.patch.object(caller, "_ISSUER", _POOL_ISSUER), \
          mock.patch.object(caller, "_CLIENT", "client-1"), \
+         mock.patch.object(caller, "_WEB_CLIENT", "web-client"), \
          mock.patch.object(caller, "_keys", return_value=keys):
         yield mint
 
@@ -2342,6 +2503,19 @@ def test_the_actor_is_the_username_of_a_verified_access_token(_signer):
     # A container clock a little behind Cognito's must not lock out a token minted just now.
     assert caller.actor([_signer(iat=int(_t.time()) + 30)]) == "lark:ou_alice"
     assert caller.actor(["bearer" + _signer()[len("Bearer"):]]) == "lark:ou_alice"
+
+
+def test_the_issuing_client_decides_the_actors_namespace(_signer):
+    """Cognito signs client_id, so a caller cannot choose it. A web user is `web:{sub}`, and
+    the router's client yields only `lark:` actors, so a stray user of it is nobody."""
+    import caller
+    web = dict(client_id="web-client", sub="sub-carol")
+    assert caller.actor([_signer(**web, username="carol@example.com")]) == "web:sub-carol"
+    # A Lark user's own account signed in at the hosted login carries their sub: refused.
+    assert caller.actor([_signer(**web, username="lark:ou_victim")]) == ""
+    assert caller.actor([_signer(username="service:websearch")]) == ""
+    with mock.patch.object(caller, "_WEB_CLIENT", ""):          # no web login deployed
+        assert caller.actor([_signer(**web)]) == ""
 
 
 def _bind(headers, payload):

@@ -1,8 +1,8 @@
 """AgentCore stack — execution role + container image for the simple agent.
 
 Scope is deliberately small (this is a from-scratch simple agent, not OpenClaw):
-  - Execution role: Bedrock invoke, Cognito admin-auth (mint per-user JWT for
-    MCP calls), Secrets read, CloudWatch logs, ECR pull.
+  - Execution role: Bedrock invoke, Secrets read, CloudWatch logs, ECR pull. It holds no
+    Cognito rights: it never mints a user's token (agent/caller.py, agent/websearch.py).
   - Container image: with AGENT_BUILD=local, built from ./agent via DockerImageAsset
     (ARM64) and pushed to the CDK assets ECR repo; by default it is built in CodeBuild
     by scripts/provision.sh and this stack holds no image at all.
@@ -77,29 +77,14 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # Cognito admin auth — mint a per-user JWT (username = lark:{open_id})
-        # to attach as Bearer on outbound MCP/Gateway calls.
-        self.execution_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "cognito-idp:AdminCreateUser",
-                    "cognito-idp:AdminSetUserPassword",
-                    "cognito-idp:AdminInitiateAuth",
-                    "cognito-idp:AdminGetUser",
-                ],
-                resources=[
-                    f"arn:aws:cognito-idp:{region}:{account}:userpool/{cognito_user_pool_id}",
-                ],
-            )
-        )
-
-        # Secrets read — Cognito password salt + Lark creds, plus the OAuth provider secret AgentCore Identity vaults per credential provider.
+        # Secrets read — the Lark app's credentials, plus the OAuth provider secret AgentCore Identity vaults per credential provider.
+        # Not the Cognito password salt: it yields every Lark user's password, which a hosted login would accept.
         # GetResourceOauth2Token reads that managed secret AS the caller, so the execution role needs GetSecretValue on it (name: bedrock-agentcore-identity!default/oauth2/*).
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
                 resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:{prefix}/*",
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:{prefix}/channels/lark-*",
                     f"arn:aws:secretsmanager:{region}:{account}:secret:bedrock-agentcore-identity!default/oauth2/*",
                 ],
             )

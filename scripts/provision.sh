@@ -207,7 +207,7 @@ phase2_runtime() {
   ensure_agent_image
   log "Runtime — create/update the agent Runtime from $AGENT_IMAGE"
 
-  local role image model memory shim mcp_arn mcp_url pool client pwsecret ws_url
+  local role image model memory shim mcp_arn mcp_url pool client ws_url
   local approval_url approval_arn issuer ckpt_table ckpt_bucket google_url google_arn
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
   image="$AGENT_IMAGE"
@@ -216,7 +216,6 @@ phase2_runtime() {
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
-  pwsecret="$PREFIX/cognito-password-secret"
   ws_url="$(ctx_get websearch_gateway_url)"
   model="$MODEL_ID"
   memory="$(ctx_get memory_id)"
@@ -269,7 +268,7 @@ phase2_runtime() {
   local rname="${PREFIX//-/_}_agent" params rid
   params="$(RNAME="$rname" IMAGE="$image" ROLE="$role" ISSUER="$issuer" CLIENT="$client" \
     MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
-    SHIM="$shim" POOL="$pool" PWSECRET="$pwsecret" WS_URL="$ws_url" \
+    SHIM="$shim" POOL="$pool" WS_URL="$ws_url" \
     APPROVAL_URL="$approval_url" FS_ARN="$fs_arn" CI_ID="$ci_id" PREFIX="$PREFIX" \
     CODE_NET="$([ -n "$ci_id" ] && [ "$NAT_GATEWAY" = "true" ] && echo true || true)" \
     GOOGLE_URL="$google_url" \
@@ -307,7 +306,6 @@ env = {
     "LARK_API_DOMAIN": e["LARK_DOMAIN"],
     "COGNITO_USER_POOL_ID": e["POOL"],
     "COGNITO_CLIENT_ID": e["CLIENT"],
-    "COGNITO_PASSWORD_SECRET_ID": e["PWSECRET"],
     "WEBSEARCH_GATEWAY_URL": e["WS_URL"],
     "APPROVAL_MCP_URL": e["APPROVAL_URL"],
     # Both empty unless the google server is deployed; the agent then has no Google tools.
@@ -578,19 +576,15 @@ phase3_gateway() {
   local ws_region="us-east-1"
   log "Gateway — Web Search connector in $ws_region"
 
-  local issuer client grole gid
-  issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
-  client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
+  local grole gid
   grole="$(cfn_out "$PREFIX-gateway" GatewayRoleArn)"
-  [ -n "$issuer" ] && [ "$issuer" != "None" ] || { echo "security stack outputs missing — run --base first"; exit 1; }
+  [ -n "$grole" ] && [ "$grole" != "None" ] || { echo "gateway stack outputs missing — run --base first"; exit 1; }
 
+  # Inbound is IAM: the agent signs with its own role. Search reads no user data, so a
+  # per-user token bought nothing and cost the agent Cognito admin rights (agent/websearch.py).
   # IAM roles are global, so the role from the main region is reused as-is.
-  gid="$(aws bedrock-agentcore-control list-gateways --region "$ws_region" \
-    --query "items[?name=='${PREFIX}-websearch-gw'].gatewayId" --output text 2>/dev/null || true)"
-  if [ -z "$gid" ] || [ "$gid" = "None" ]; then
-    echo "  creating gateway"
-    gid="$(acp create_gateway "$(ACP_NAME="${PREFIX}-websearch-gw" ACP_ROLE="$grole" \
-        ACP_ISSUER="$issuer" ACP_CLIENT="$client" uv run python -c '
+  local gw_params
+  gw_params="$(ACP_NAME="${PREFIX}-websearch-gw" ACP_ROLE="$grole" uv run python -c '
 import json, os
 e = os.environ
 print(json.dumps({
@@ -602,18 +596,45 @@ print(json.dumps({
         # cold-starts a fresh downstream microVM (measured; see docs).
         "sessionConfiguration": {"sessionTimeoutInSeconds": 3600}}},
     "roleArn": e["ACP_ROLE"],
-    "authorizerType": "CUSTOM_JWT",
-    "authorizerConfiguration": {"customJWTAuthorizer": {
-        "discoveryUrl": e["ACP_ISSUER"] + "/.well-known/openid-configuration",
-        "allowedClients": [e["ACP_CLIENT"]]}},
-}))')" "$ws_region" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["gatewayId"])')"
-    # A gateway is briefly CREATING; targets can't be added until it settles.
-    for _ in $(seq 1 30); do
-      [ "$(aws bedrock-agentcore-control get-gateway --region "$ws_region" \
-           --gateway-identifier "$gid" --query status --output text 2>/dev/null)" = "READY" ] && break
+    "authorizerType": "AWS_IAM",
+}))')"
+  gid="$(aws bedrock-agentcore-control list-gateways --region "$ws_region" \
+    --query "items[?name=='${PREFIX}-websearch-gw'].gatewayId" --output text 2>/dev/null || true)"
+  # A gateway created when inbound was CUSTOM_JWT. Its authorizer type cannot be updated
+  # (measured: ValidationException), so it is replaced. It holds no state — a target and
+  # a URL, and the runtime step after this one picks up the new URL.
+  if [ -n "$gid" ] && [ "$gid" != "None" ] && [ "$(aws bedrock-agentcore-control get-gateway \
+       --region "$ws_region" --gateway-identifier "$gid" --query authorizerType --output text)" != "AWS_IAM" ]; then
+    echo "  replacing gateway $gid: its inbound auth predates AWS_IAM"
+    local old_tid
+    for old_tid in $(aws bedrock-agentcore-control list-gateway-targets --region "$ws_region" \
+                       --gateway-identifier "$gid" --query 'items[].targetId' --output text); do
+      aws bedrock-agentcore-control delete-gateway-target --region "$ws_region" \
+        --gateway-identifier "$gid" --target-id "$old_tid" >/dev/null
+    done
+    for _ in $(seq 1 40); do
+      [ -z "$(aws bedrock-agentcore-control list-gateway-targets --region "$ws_region" \
+              --gateway-identifier "$gid" --query 'items[].targetId' --output text)" ] && break
       sleep 3
     done
+    aws bedrock-agentcore-control delete-gateway --region "$ws_region" --gateway-identifier "$gid" >/dev/null
+    for _ in $(seq 1 40); do
+      aws bedrock-agentcore-control get-gateway --region "$ws_region" --gateway-identifier "$gid" \
+        >/dev/null 2>&1 || break
+      sleep 3
+    done
+    gid=""
   fi
+  if [ -z "$gid" ] || [ "$gid" = "None" ]; then
+    echo "  creating gateway"
+    gid="$(acp create_gateway "$gw_params" "$ws_region" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["gatewayId"])')"
+  fi
+  # A gateway is briefly CREATING/UPDATING; targets can't be added until it settles.
+  for _ in $(seq 1 30); do
+    [ "$(aws bedrock-agentcore-control get-gateway --region "$ws_region" \
+         --gateway-identifier "$gid" --query status --output text 2>/dev/null)" = "READY" ] && break
+    sleep 3
+  done
   echo "  gateway: $gid"
 
   # The tool name must be WebSearch and parameterValues must be present even when

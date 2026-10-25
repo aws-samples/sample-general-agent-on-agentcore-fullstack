@@ -41,15 +41,27 @@ from botocore.awsrequest import AWSRequest
 import httpx
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
-_PROVIDER = os.environ["LARK_OAUTH_PROVIDER"]
-_WORKLOAD = os.environ["AGENT_WORKLOAD_NAME"]
+# Empty when the deployment has no Lark: then nothing here is called for Lark (configured()).
+_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "")
+_WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "")
 _SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on the workload
 _LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
 _SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 _CUSTOM_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"
-_API_DOMAIN = os.environ["LARK_API_DOMAIN"].rstrip("/")  # injected at deploy, from .env
+_API_DOMAIN = os.environ.get("LARK_API_DOMAIN", "https://open.larksuite.com").rstrip("/")
 
 log = logging.getLogger("agent.lark_3lo")
+
+
+def configured() -> bool:
+    """Whether this deployment has Lark at all."""
+    return bool(_PROVIDER)
+
+
+def lark_provider() -> tuple[str, list]:
+    """Lark's provider and scopes, for a caller that treats Lark as one more system — a web
+    user's Lark grant is fetched the way a Google grant is (`get_user_token_for`)."""
+    return _PROVIDER, _SCOPES
 
 _agentcore = boto3.client("bedrock-agentcore", region_name=_REGION)
 

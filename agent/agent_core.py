@@ -204,7 +204,7 @@ def _summary_is_usable(update) -> bool:
 # immediately, so appending a HumanMessage between them would recreate exactly the failure
 # this fixes. `before_model` is the one safe boundary: any tool results from the previous
 # step are written, and the next model call has not happened yet.
-_pending_steer: dict[str, list[tuple[str, str, bool]]] = {}
+_pending_steer: dict[str, list[tuple[str, str, bool, int]]] = {}
 # The Lark message last steered into each thread, for the card that answers it to reply to.
 _steer_reply_to: dict[str, str] = {}
 
@@ -217,10 +217,11 @@ def steer(thread_id: str, message: str, message_id: str = "", fresh: bool = Fals
     turn — that turn's session predates the grant and would wall again — only answered as a
     continuation, on a rebuilt session."""
     with _in_flight_lock:
-        _pending_steer.setdefault(thread_id, []).append((message, message_id, fresh))
+        _pending_steer.setdefault(thread_id, []).append(
+            (message, message_id, fresh, int(time.time() * 1000)))
 
 
-def _take_steer(thread_id: str) -> list[tuple[str, str, bool]]:
+def _take_steer(thread_id: str) -> list[tuple]:
     with _in_flight_lock:
         _steer_reply_to.pop(thread_id, None)    # answered as a continuation, on its own card
         return _pending_steer.pop(thread_id, [])
@@ -276,6 +277,53 @@ class _ImageMiddleware:
         return await handler(self._attach(request))
 
 
+class _ClockMiddleware:
+    """Records when each message of the thread was said, for a page restoring the history.
+
+    In `additional_kwargs`, which Converse never sends to the model. Stamped around the model
+    call rather than in a hook of its own: a hook is a graph node, and every node is one more
+    checkpoint write per model call."""
+
+    name = "clock"
+
+    @staticmethod
+    def _stamped(request, started_ms: int, response):  # noqa: ANN001, ANN205 — framework types
+        from langchain.agents.middleware.types import ExtendedModelResponse, ModelResponse
+        from langgraph.types import Command
+        result = response.result if isinstance(response, ModelResponse) else [response]
+        for m in result:
+            if isinstance(m, AIMessage):
+                m.additional_kwargs.setdefault("ts", started_ms)
+        # What the user said since the last reply, from the state: request.messages may hold
+        # the image middleware's copies, which carry the pixels the thread must not keep.
+        # Messages built here carry their arrival already (_said); what is left is a turn's
+        # own message as a surface handed it in — AG-UI's — which arrived with the turn.
+        at = _received_ms() or started_ms
+        said = []
+        for m in reversed((getattr(request, "state", None) or {}).get("messages") or []):
+            if isinstance(m, AIMessage):
+                break
+            if isinstance(m, HumanMessage) and m.id and "ts" not in m.additional_kwargs \
+                    and not _is_summary(m):
+                said.append(m.model_copy(update={
+                    "additional_kwargs": {**m.additional_kwargs, "ts": at}}))
+        if not said:
+            return response
+        # Same ids, so the reducer replaces them in place.
+        return ExtendedModelResponse(
+            model_response=response if isinstance(response, ModelResponse)
+            else ModelResponse(result=result),
+            command=Command(update={"messages": said[::-1]}))
+
+    def wrap_model_call(self, request, handler):  # noqa: ANN001 — the framework's signature
+        started = int(time.time() * 1000)
+        return self._stamped(request, started, handler(request))
+
+    async def awrap_model_call(self, request, handler):  # noqa: ANN001 — same
+        started = int(time.time() * 1000)
+        return self._stamped(request, started, await handler(request))
+
+
 class _SteeringMiddleware:
     """Injects messages that arrived mid-turn, at the only boundary where it is legal."""
 
@@ -306,7 +354,7 @@ class _SteeringMiddleware:
                 card.steered(reply_to)
         except Exception:  # noqa: BLE001 — the card is decoration, the message is not
             log.warning("could not hand the card over", exc_info=True)
-        return {"messages": [HumanMessage(text, id=mid or None) for text, mid, _ in now]}
+        return {"messages": [_said(q) for q in now]}
 
 
 def _middleware() -> list:
@@ -319,9 +367,10 @@ def _middleware() -> list:
     # anything after this — summarisation especially — works on the placeholders.
     pictures = type("ImageMiddleware", (AgentMiddleware,),
                     dict(_ImageMiddleware.__dict__))()
+    clock = type("ClockMiddleware", (AgentMiddleware,), dict(_ClockMiddleware.__dict__))()
     if not _SUMMARIZE_AT_TOKENS:
-        return [pictures, steering]
-    return [pictures, steering, _summarization(_summary_model())]
+        return [pictures, steering, clock]
+    return [pictures, steering, clock, _summarization(_summary_model())]
 
 
 def _summary_model():
@@ -813,12 +862,30 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         if idp:
             tool_idp.update((t.name, idp) for t in opened)
         return _tag(opened, source or idp)
-    try:
-        kind, value = await asyncio.to_thread(
-            lark_3lo.get_user_lark_token, actor_id, False, workload_token)
-    except Exception as e:  # noqa: BLE001 — never crash the turn on identity hiccups
-        log.exception("3LO token lookup failed for %s", actor_id)  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
-        kind, value = "error", str(e)
+    # A Lark user's Lark grant must be their own Lark account, which only the Lark path can
+    # check (it asks Lark whose token it is). A web user has no Lark identity to match: for
+    # them Lark is one more system, granted on demand like Google, by whichever account they
+    # consent with — and, like Google's, read without minting a link at build.
+    lark_user = actor_id.startswith("lark:") and lark_3lo.configured()
+    lark_web = not actor_id.startswith("lark:") and lark_3lo.configured()
+    kind, value = "none", ""
+    if lark_web:
+        try:
+            provider, scopes = lark_3lo.lark_provider()
+            value = await asyncio.to_thread(
+                lark_3lo.peek_user_token_for, actor_id, provider, scopes, workload_token)
+        except Exception:  # noqa: BLE001 — chat without Lark tools beats no reply
+            log.exception("Lark grant lookup failed for %s", actor_id)
+        kind = "token" if value else "none"
+        if not value:
+            consent["lark"] = ""     # minted when the user asks to authorise
+    if lark_user:
+        try:
+            kind, value = await asyncio.to_thread(
+                lark_3lo.get_user_lark_token, actor_id, False, workload_token)
+        except Exception as e:  # noqa: BLE001 — never crash the turn on identity hiccups
+            log.exception("3LO token lookup failed for %s", actor_id)  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
+            kind, value = "error", str(e)
 
     if kind == "auth_url":
         auth_url = value  # remembered for the tool-call path, not returned upfront
@@ -828,7 +895,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         # A claimed actor that does not own the vaulted token. Refused rather than offered a
         # consent link: minting one would burn the real owner's grant.
         identity_error = "这个身份与授权的账号不一致，无法代表其操作。"
-    elif kind != "token":
+    elif kind not in ("token", "none"):
         # Surface identity failures instead of running tool-less: an agent that merely
         # says "I have no tools" reads as model behaviour and hides the real cause (a
         # missing IAM permission, most likely).
@@ -836,7 +903,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
 
     token = value if kind == "token" else ""
 
-    if identity_error is None:
+    if (lark_user or lark_web) and identity_error is None:
         try:
             tools += await _open(lark_3lo.mcp_connection_for(token), "lark")
         except Exception:  # noqa: BLE001 — chat without Lark tools beats no reply
@@ -1056,6 +1123,7 @@ def chat_result(actor_id: str, message: str, email: str = "",
     When the user hasn't authorized Lark yet, needs_auth is True and auth_url is the
     raw consent URL, so the caller (router) can drive the wait-for-consent loop instead
     of asking the user to re-send."""
+    received_ms = int(time.time() * 1000)   # the user's message is stamped with this
     remember_thread(actor_id, mem_sid)
     thread_id = mem_sid or thread_for(actor_id)
     # A turn is already running on this thread. This surface answers synchronously and the
@@ -1079,7 +1147,7 @@ def chat_result(actor_id: str, message: str, email: str = "",
         with telemetry.timed("turn", surface="sync"):
             state = _run(s["graph"].ainvoke(
                 {"messages": [HumanMessage(message, id=turn_id)]},
-                config=_run_config(s, delivery.NoDelivery("this channel"))))
+                config=_run_config(s, delivery.NoDelivery("this channel"), received_ms)))
     finally:
         release(thread_id)
     # This turn's tool results only. The state is the whole thread, so scanning all of it
@@ -1127,6 +1195,7 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     token, so the turn runs and consent is only raised if the model actually calls
     one. By then the router has returned, so the prompt is pushed to the chat like any
     other answer and the user re-sends after approving."""
+    received_ms = int(time.time() * 1000)   # the user's message is stamped with this
     remember_thread(actor_id, mem_sid)
     thread_id = mem_sid or thread_for(actor_id)
     handles = list(image_handles or [])
@@ -1173,7 +1242,7 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
         def _answer(s: dict, inputs: list) -> None:
             try:
                 with telemetry.timed("turn", surface="lark"):
-                    _stream_to_chat(s, inputs, chat_id)
+                    _stream_to_chat(s, inputs, chat_id, received_ms=received_ms)
                 idp = _hit_auth_wall(s)
                 if idp:
                     telemetry.count("auth_wall", surface="lark", idp=idp)
@@ -1200,7 +1269,7 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
                          f"Sorry, that didn't work out ({type(e).__name__}).")
 
         def _run_turn() -> None:
-            session, inputs = s, [(message, turn_message_id, False)]
+            session, inputs = s, [(message, turn_message_id, False, received_ms)]
             released = False
             try:
                 while inputs:
@@ -1275,7 +1344,7 @@ _STREAM_END = object()
 _EVENT = object()
 
 
-def _run_config(session: dict, channel: delivery.Delivery) -> dict:
+def _run_config(session: dict, channel: delivery.Delivery, received_ms: int | None = None) -> dict:
     """The session's config plus where this run may deliver a file.
 
     A fresh dict every run: the session is cached per actor and thread and is served to
@@ -1284,16 +1353,39 @@ def _run_config(session: dict, channel: delivery.Delivery) -> dict:
     config is already fixed, so they live in images' per-thread turn registry instead.
     """
     configurable = session["config"]["configurable"]
-    return {**session["config"],
-            "configurable": {**configurable, "delivery": channel}}
+    return {**session["config"], "recursion_limit": _STEP_LIMIT,
+            "configurable": {**configurable, "delivery": channel,
+                             "received_ms": received_ms or int(time.time() * 1000)}}
+
+
+def _received_ms() -> int | None:
+    """When the running turn arrived, from its run config; None outside a run."""
+    try:
+        from langgraph.config import get_config
+        return ((get_config() or {}).get("configurable") or {}).get("received_ms")
+    except Exception:  # noqa: BLE001 — outside a graph run there is no turn
+        return None
+
+
+# Explicit, because the AG-UI adapter fills an unset limit with langchain_core's 25 — about a
+# dozen tool calls — while LangGraph's own default, which a Lark turn gets, is 10007.
+_STEP_LIMIT = int(os.environ.get("TURN_STEP_LIMIT", "10007"))
 
 
 def _turn_input(message, message_id: str | None = None) -> list:
-    """The HumanMessages a turn starts from: one string, or (text, id) pairs — several when
-    a continuation answers what was steered in after the last model call."""
+    """The HumanMessages a turn starts from: one string, or (text, id, fresh, ms) entries —
+    several when a continuation answers what was steered in after the last model call."""
     if isinstance(message, str):
         return [HumanMessage(message, id=message_id)]
-    return [HumanMessage(item[0], id=item[1] or None) for item in message]
+    return [_said(item) for item in message]
+
+
+def _said(item: tuple) -> HumanMessage:
+    """A queued (text, id, fresh[, arrived ms]) entry as the message it becomes, carrying
+    when it arrived: a continuation answers it later than that."""
+    ts = item[3] if len(item) > 3 else None
+    return HumanMessage(item[0], id=item[1] or None,
+                        additional_kwargs={"ts": ts} if ts else {})
 
 
 class _InStreamOrder:
@@ -1388,14 +1480,15 @@ async def arun_in_thread(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
 
 
-async def aget_session(actor_id: str, workload_token: str = "") -> dict:
+async def aget_session(actor_id: str, workload_token: str = "", thread: str = "") -> dict:
     """The cached session for this actor, fetched without blocking the caller's loop.
-    Session building opens MCP connections, which is seconds of I/O."""
+    Session building opens MCP connections, which is seconds of I/O. `thread` is one the
+    caller named and server.py checked belongs to the actor; else the one last named."""
     return await arun_in_thread(_get_session, actor_id, "",
-                               thread_for(actor_id), False, workload_token)
+                               thread or thread_for(actor_id), False, workload_token)
 
 
-def stream_on_agent_loop(agen_factory, on_done=None):
+def stream_on_agent_loop(agen_factory, on_done=None, until=None):
     """Start an async generator on _LOOP now, and return an async iterator over its items
     for another loop to consume.
 
@@ -1404,12 +1497,17 @@ def stream_on_agent_loop(agen_factory, on_done=None):
     hand-off is a thread-safe queue. Started eagerly, and `on_done` runs on _LOOP when the
     producer finishes, not when the consumer stops: a web page that is closed mid-answer
     stops reading, but the graph runs on and keeps writing the checkpoint, so anything
-    marking the turn as running has to last until the producer is done."""
+    marking the turn as running has to last until the producer is done. An item `until`
+    accepts ends the run there: it is not passed on, and the generator is closed."""
     q: queue.Queue = queue.Queue()
 
     async def _pump() -> None:
         try:
-            async for item in agen_factory():
+            agen = agen_factory()
+            async for item in agen:
+                if until is not None and until(item):
+                    await agen.aclose()
+                    break
                 q.put(item)
         except Exception as e:  # noqa: BLE001 — re-raised in the consumer
             q.put(e)
@@ -1437,7 +1535,7 @@ def stream_on_agent_loop(agen_factory, on_done=None):
 
 
 def _stream_to_chat(session: dict, message, chat_id: str,
-                    message_id: str | None = None) -> str:
+                    message_id: str | None = None, received_ms: int | None = None) -> str:
     """Run the turn, typing the answer into a streaming card as it is produced, and
     return the full text. If the card can't be created or an update fails (e.g. the
     cardkit:card:write scope isn't granted), fall back to posting the final text — the
@@ -1508,7 +1606,8 @@ def _stream_to_chat(session: dict, message, chat_id: str,
             session["tool_texts"].append((name, text))
 
         for delta in _iter_deltas(session["graph"], message,
-                                  _run_config(session, delivery.LarkDelivery(chat_id)),
+                                  _run_config(session, delivery.LarkDelivery(chat_id),
+                                              received_ms),
                                   on_tool_use=_abort_on_ungranted_tool,
                                   on_tool_result=_on_tool_result, message_id=message_id,
                                   on_tool_started=lambda: cards[-1].tool_started(),
@@ -1615,18 +1714,24 @@ def transcript(actor_id: str, mem_sid: str = "") -> dict:
             # Written by summarisation, not by the user; the page shows it as a note.
             out.append({"role": "summary", "content": _text_of(m)})
         elif isinstance(m, HumanMessage):
-            out.append({"role": "user", "content": _text_of(m)})
+            out.append({"role": "user", "content": _text_of(m), **_said_at(m)})
         elif isinstance(m, AIMessage):
             for call in getattr(m, "tool_calls", None) or []:
-                out.append({"role": "toolCall", "id": call.get("id") or "",
+                out.append({"role": "toolCall", **_said_at(m), "id": call.get("id") or "",
                             "name": call.get("name") or "tool",
                             "args": json.dumps(call.get("args") or {}, ensure_ascii=False)})
             if _text_of(m):
-                out.append({"role": "assistant", "content": _text_of(m)})
+                out.append({"role": "assistant", "content": _text_of(m), **_said_at(m)})
         elif isinstance(m, ToolMessage):
             out.append({"role": "toolResult", "id": getattr(m, "tool_call_id", "") or "",
                         "content": _text_of(m)[:_TRANSCRIPT_TOOL_CHARS]})
     return {"messages": out, "truncated": len(history) > len(tail)}
+
+
+def _said_at(message) -> dict:
+    """{"ts": epoch ms} as _ClockMiddleware stamped it; {} for messages older than it."""
+    ts = (getattr(message, "additional_kwargs", None) or {}).get("ts")
+    return {"ts": ts} if isinstance(ts, int) else {}
 
 
 def _text_of(message) -> str:
@@ -1669,8 +1774,20 @@ def auth_status(actor_id: str, workload_token: str = "") -> dict:
     Only the agent can answer this. A consent is vaulted against the workload identity the
     Runtime derives from the inbound JWT, and re-deriving one from a fresh JWT for the same
     user reads a different namespace — see docs/agentcore-behavior.md."""
-    kind, _ = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
-    status = {"lark": kind == "token"}
+    status = {}
+    # Lark only for a Lark user of a deployment that has it; a failed lookup is "not
+    # authorised", and must not keep the other systems from being reported.
+    if actor_id.startswith("lark:") and lark_3lo.configured():
+        try:
+            kind, _ = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
+        except Exception:  # noqa: BLE001
+            log.warning("Lark status lookup failed for %s", actor_id, exc_info=True)
+            kind = "error"
+        status["lark"] = kind == "token"
+    elif lark_3lo.configured():
+        provider, scopes = lark_3lo.lark_provider()
+        status["lark"] = bool(lark_3lo.peek_user_token_for(actor_id, provider, scopes,
+                                                          workload_token))
     for idp, (_, provider, scopes) in _DOWNSTREAMS.items():
         status[idp] = bool(lark_3lo.peek_user_token_for(actor_id, provider, scopes, workload_token))
     return status
@@ -1691,16 +1808,23 @@ def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
     Per-IdP, and the Lark path stays distinct for a reason: only it can ask the vendor whose
     token this actually is and refuse a mismatch. A second system reuses the generic vault
     fetch, which cannot make that check — see lark_3lo.get_user_token_for."""
-    idp = idp or "lark"
+    lark_user = actor_id.startswith("lark:") and lark_3lo.configured()
+    idp = idp or ("lark" if lark_user else "")
+    if idp == "lark" and not lark_3lo.configured():
+        return {"reply": "这个部署没有接入 Lark。", "needs_auth": False}
     if idp != "lark" and idp not in _DOWNSTREAMS:
         # The router lists what it has registered; the agent may lack the server or provider.
         known = idp == "google"
         return {"reply": f"{idp.capitalize()} 未配置（需要 OAuth provider 与已部署的 MCP server）"
                 if known else f"IdP 尚未接入：{idp}", "needs_auth": False}
     _drop_sessions(actor_id)
-    if idp == "lark":
+    if idp == "lark" and lark_user:
         kind, value = lark_3lo.get_user_lark_token(actor_id, force=True,
                                                    workload_token=workload_token)
+    elif idp == "lark":
+        provider, scopes = lark_3lo.lark_provider()
+        kind, value = lark_3lo.get_user_token_for(actor_id, provider, scopes, workload_token,
+                                                  force=True)
     else:
         _, provider, scopes = _DOWNSTREAMS[idp]
         kind, value = lark_3lo.get_user_token_for(actor_id, provider, scopes, workload_token,

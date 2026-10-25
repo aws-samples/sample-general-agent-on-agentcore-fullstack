@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from aiohttp import web
 
@@ -49,9 +50,47 @@ async def _error_stream(request: web.Request, message: str) -> web.StreamRespons
     return resp
 
 
+def _run_input_fields(payload: dict, thread_id: str) -> dict:
+    """The page's RunAgentInput with our own fields taken out and the thread replaced: AG-UI's
+    threadId is the page's to choose, and it decides whose conversation this is."""
+    fields = {k: v for k, v in payload.items() if k not in ("actorId", "memorySessionId")}
+    return {**fields, "threadId": thread_id, "runId": payload.get("runId") or thread_id}
+
+
+def _consent(session: dict) -> bytes:
+    """A CUSTOM `consent` event naming the system a tool of this run was refused for, else
+    b"". No link in it: the page mints one through `/auth` when the user clicks, with the
+    token it will complete with — only the token a consent was started with can complete it,
+    and a link minted now could be killed by a later build before it is clicked."""
+    try:
+        idp = agent_core._hit_auth_wall(session)
+    except Exception:  # noqa: BLE001 — a missing prompt must not cost the answer
+        log.warning("could not check for a consent wall", exc_info=True)
+        return b""
+    if not idp:
+        return b""
+    body = {"type": "CUSTOM", "name": "consent", "value": {"idp": idp}}
+    return f"data: {json.dumps(body)}\n\n".encode()
+
+
+def _walls(session: dict, event) -> bool:
+    """Whether `event` starts a tool whose system has no grant. Such a call is certain to be
+    refused, so the run stops there, as a Lark turn does, rather than have the model narrate
+    the refusal before the page offers to authorise."""
+    if getattr(event, "type", "") != "TOOL_CALL_START":
+        return False
+    name = getattr(event, "tool_call_name", "") or ""
+    if not agent_core._walled_idp(session, name):
+        return False
+    session["walled_tool"] = name
+    log.info("aborting web turn: %s needs consent", name)
+    return True
+
+
 async def handle(request: web.Request, payload: dict,
                  workload_token: str) -> web.StreamResponse:
     """Run one AG-UI turn, streaming events as they are produced."""
+    received_ms = int(time.time() * 1000)   # the user's message is stamped with this
     # Verified by server.py from the bearer, not taken from what the page sent.
     actor_id = payload.get("actorId") or ""
     if not actor_id:
@@ -66,14 +105,12 @@ async def handle(request: web.Request, payload: dict,
 
     # The session carries the tools, the checkpointer and the summarisation middleware, so a
     # web turn lands in the same conversation as a Lark turn for the same person.
-    session = await agent_core.aget_session(actor_id, workload_token=workload_token)
-    log.info("agui gate: auth_url=%s identity_error=%s tools=%s keys=%s",
-             bool(session.get("auth_url")), bool(session.get("identity_error")),
-             len((session.get("graph") and getattr(session["graph"], "nodes", None)) or []) or "?",
-             sorted(session.keys()))
-    if session.get("auth_url"):
-        return await _error_stream(
-            request, "请先在 Lark 聊天里完成一次授权，然后回到网页继续。")
+    # The thread the page names was checked against the actor by server.py; a page that
+    # names none gets the one the router last named.
+    session = await agent_core.aget_session(actor_id, workload_token=workload_token,
+                                            thread=payload.get("memorySessionId") or "")
+    # Only a Lark user's own Lark lookup can fail this way; a system not yet granted is not
+    # an error here — its consent link comes at the end of the run that needs it.
     if session.get("identity_error"):
         return await _error_stream(request, "暂时无法访问你的 Lark 账号，请稍后再试。")
 
@@ -86,26 +123,28 @@ async def handle(request: web.Request, payload: dict,
         return await _error_stream(request, agent_core._BUSY_ELSEWHERE.get(
             owner, agent_core._BUSY_ELSEWHERE["sync"]))
 
+    # Set by the run itself when it stops at a tool that needs a grant.
+    session.pop("walled_tool", None)
     # From the claim until the run has started, a failure — a malformed payload included —
     # has to release the thread itself: no run exists yet to release it.
     try:
         # thread_id comes from the session, never from the request: it decides whose
         # conversation this is.
-        run_input = RunAgentInput(**{**payload,
-                                    "threadId": thread_id,
-                                    "runId": payload.get("runId") or thread_id})
+        run_input = RunAgentInput(**_run_input_fields(payload, thread_id))
         # The page has no way to carry a file yet, and this session is also served to
         # Lark, so the run says so explicitly rather than inheriting whatever chat was
         # served last.
         agui = LangGraphAgent(name="agentcore-fullstack", graph=session["graph"],
                               config=agent_core._run_config(
-                                  session, agent_core.delivery.NoDelivery("the web page")))
+                                  session, agent_core.delivery.NoDelivery("the web page"),
+                                  received_ms))
         # The graph's MCP sessions live on agent_core's own loop, so the run happens there
         # and the events come back over a queue. Released when the run finishes, not when
         # this handler stops reading: a page closed mid-answer leaves the graph running,
         # and a Lark message must see the thread busy until it ends.
         events = agent_core.stream_on_agent_loop(
-            lambda: agui.run(run_input), on_done=lambda: agent_core.release(thread_id))
+            lambda: agui.run(run_input), on_done=lambda: agent_core.release(thread_id),
+            until=lambda event: _walls(session, event))
     except BaseException:
         agent_core.release(thread_id)
         raise
@@ -114,9 +153,27 @@ async def handle(request: web.Request, payload: dict,
                                        "Cache-Control": "no-cache",
                                        "X-Accel-Buffering": "no"})
     await resp.prepare(request)
+    # Tool results, for the consent check the Lark path makes from the same texts.
+    session["tool_texts"] = []
+    names: dict[str, str] = {}
     try:
         async for event in events:
+            kind = getattr(event, "type", "")
+            if kind == "TOOL_CALL_START":
+                names[event.tool_call_id] = event.tool_call_name
+            elif kind == "TOOL_CALL_RESULT":
+                session["tool_texts"].append((names.get(event.tool_call_id, ""),
+                                              str(getattr(event, "content", "") or "")))
+            elif kind == "RUN_FINISHED":
+                # Before the run ends, or a client that stops at RUN_FINISHED never sees it.
+                prompt = _consent(session)
+                if prompt:
+                    await resp.write(prompt)
             await resp.write(_sse(event))
+        # Stopped at a tool that needs a grant: the run never finished by itself.
+        if session.get("walled_tool"):
+            finished = {"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_input.run_id}
+            await resp.write(_consent(session) + f"data: {json.dumps(finished)}\n\n".encode())
     except Exception as e:  # noqa: BLE001 — the stream is open, so report in-band
         log.exception("agui turn failed for %s", actor_id)
         await resp.write(f'data: {json.dumps({"type": "RUN_ERROR", "message": type(e).__name__})}\n\n'

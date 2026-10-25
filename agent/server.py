@@ -243,7 +243,8 @@ async def handle_invocations(request: web.Request) -> web.Response:
         actor_id = payload["actorId"]
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.transcript, actor_id, agent_core.thread_for(actor_id))
+                None, agent_core.transcript, actor_id,
+                payload.get("memorySessionId") or agent_core.thread_for(actor_id))
             return web.json_response(result)
         except Exception as e:
             log.exception("transcript failed")
@@ -280,9 +281,16 @@ async def handle_invocations(request: web.Request) -> web.Response:
             log.exception("auth_status failed")
             return web.json_response({"error": str(e)})
 
+    # After a consent completes, so the next turn is built with the new grant rather than
+    # the cached session's empty one. Precise rather than a short TTL for everyone.
+    if action == "refresh_session":
+        await asyncio.get_event_loop().run_in_executor(
+            None, agent_core._drop_sessions, payload["actorId"])
+        return web.json_response({"refreshed": True})
+
     if action == "reauth":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
-        idp = payload.get("message", "") or "lark"   # router sends the idp key here
+        idp = payload.get("message", "")   # the router sends the idp key here
         try:
             result = await asyncio.get_event_loop().run_in_executor(
                 None, agent_core.reauth, actor_id, idp, workload_token

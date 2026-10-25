@@ -1,5 +1,11 @@
 """Who is calling: the actor a verified Cognito access token names.
 
+Two app clients of one pool issue tokens, and the client decides the actor's namespace —
+Cognito signs `client_id`, so a caller cannot choose it. The router's client (admin auth,
+reachable only with IAM) is used for Lark users, named `lark:{open_id}` as their username;
+the web client (the hosted login) for everyone else, named `web:{sub}` because an email can
+change and `sub` cannot.
+
 The Runtime's CUSTOM_JWT authorizer has checked a token before the request arrives, but
 which one it checked when a request carries more than one Authorization header is not
 something we have measured, so the container verifies the token it reads itself rather
@@ -17,7 +23,8 @@ log = logging.getLogger("agent.caller")
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 _POOL = os.environ.get("COGNITO_USER_POOL_ID", "")
-_CLIENT = os.environ.get("COGNITO_CLIENT_ID", "")
+_CLIENT = os.environ.get("COGNITO_CLIENT_ID", "")              # the router's
+_WEB_CLIENT = os.environ.get("COGNITO_WEB_CLIENT_ID", "")      # the hosted login's; unset = no web login
 _ISSUER = f"https://cognito-idp.{_REGION}.amazonaws.com/{_POOL}" if _POOL else ""
 _jwks: jwt.PyJWKClient | None = None   # created on first use: no network at import (V2)
 
@@ -31,10 +38,9 @@ def _keys() -> jwt.PyJWKClient:
 
 
 def actor(authorization: list[str]) -> str:
-    """The actor ("lark:{open_id}") named by the request's Authorization headers, or ""
-    when there is not exactly one, or its token does not verify as an access token this
-    pool issued to this deployment's client. The username is the actor: the router creates
-    each Cognito user under it (lambda/router/cognito.py)."""
+    """The actor named by the request's Authorization headers, or "" when there is not
+    exactly one, or its token does not verify as an access token this pool issued to one of
+    this deployment's clients."""
     scheme, _, token = (authorization[0] if len(authorization) == 1 else "").partition(" ")
     if scheme.lower() != "bearer" or not token.strip() or not _ISSUER:
         return ""
@@ -45,11 +51,24 @@ def actor(authorization: list[str]) -> str:
         # as issued in the future, and on V2 the container's clock is not established.
         claims = jwt.decode(token, key, algorithms=["RS256"], issuer=_ISSUER, leeway=60,
                             options={"require": ["exp", "iss", "token_use", "client_id",
-                                                 "username"]})
+                                                 "sub"]})
     except Exception as e:  # noqa: BLE001 — any failure is an unverified caller
         log.warning("bearer did not verify: %s", type(e).__name__)
         return ""
-    if claims["token_use"] != "access" or claims["client_id"] != _CLIENT:
-        log.warning("bearer is not this client's access token")
+    if claims["token_use"] != "access":
+        log.warning("bearer is not an access token")
         return ""
-    return claims["username"]
+    if claims["client_id"] == _CLIENT:
+        # Only the router mints for this client, and only for Lark users; anything else
+        # holding one of its tokens is no actor at all.
+        username = claims.get("username") or ""
+        return username if username.startswith("lark:") else ""
+    if _WEB_CLIENT and claims["client_id"] == _WEB_CLIENT:
+        # A Lark user's Cognito account signing in at the hosted login would carry their sub,
+        # and with it whatever grants are keyed by it. Lark users come in through Lark.
+        if (claims.get("username") or "").startswith("lark:"):
+            log.warning("a Lark user's account signed in through the web client")
+            return ""
+        return f"web:{claims['sub']}"
+    log.warning("bearer is not from this deployment's clients")
+    return ""

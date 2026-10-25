@@ -8,16 +8,21 @@ Lark tools carry (see docs/agentcore-behavior.md).
 The connector is only offered in us-east-1, so this gateway typically lives in a
 different region from everything else and is called cross-region.
 
-Inbound auth is a Cognito access token (not an ID token — the Gateway validates
-the `client_id` claim, which only access tokens carry).
+Inbound auth is IAM: the agent signs with its own role. Search reads no user data, so the
+Gateway has no use for a per-user token — and not minting one keeps the agent from holding
+Cognito admin rights at all. Who searched is in the agent's own logs.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
+from datetime import timedelta
 
-import identity
+import boto3
+
+import lark_3lo
 
 log = logging.getLogger("agent.websearch")
 
@@ -29,20 +34,24 @@ def available() -> bool:
     return bool(_GATEWAY_URL)
 
 
-def connection_for(actor_id: str) -> dict:
-    """A `StreamableHttpConnection` for the search gateway, authenticated as this user.
+def _gateway_region() -> str:
+    """The region the URL names: the connector lives in us-east-1 whatever ours is, and a
+    SigV4 signature for the wrong region is refused."""
+    m = re.search(r"\.bedrock-agentcore\.([a-z0-9-]+)\.amazonaws\.com", _GATEWAY_URL)
+    return m.group(1) if m else "us-east-1"
 
-    The token is per-user even though search isn't: the Gateway authorises the
-    caller, and reusing the same identity keeps the audit trail consistent.
-    """
-    token = identity.get_user_jwt(actor_id)
+
+def connection_for(actor_id: str) -> dict:
+    """A `StreamableHttpConnection` for the search gateway, signed with the agent's role.
+    Credentials are resolved per call, as for the MCP servers (lark_3lo.mcp_connection_for)."""
+    region = _gateway_region()
+    creds = boto3.Session(region_name=region).get_credentials()
     return {
         "transport": "streamable_http",
         "url": _GATEWAY_URL,
-        "headers": {
-            "Authorization": f"Bearer {token}",
-            # The Gateway is stateless and returns no session id; without this
-            # header it negotiates 2025-03-26 and rejects the request (-32022).
-            "MCP-Protocol-Version": _MCP_VERSION,
-        },
+        # The Gateway is stateless and returns no session id; without this header it
+        # negotiates 2025-03-26 and rejects the request (-32022).
+        "headers": {"MCP-Protocol-Version": _MCP_VERSION},
+        "auth": lark_3lo._SigV4HTTPXAuth(creds, "bedrock-agentcore", region),
+        "timeout": timedelta(seconds=60),
     }

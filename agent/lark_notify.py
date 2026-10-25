@@ -27,7 +27,7 @@ import boto3
 log = logging.getLogger("agent.notify")
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
-_API_DOMAIN = os.environ["LARK_API_DOMAIN"].rstrip("/")  # injected at deploy, from .env
+_API_DOMAIN = os.environ.get("LARK_API_DOMAIN", "https://open.larksuite.com").rstrip("/")
 _SECRET_ID = os.environ.get("LARK_SECRET_ID", "")
 _MAX_TEXT_LEN = 4000  # Lark rejects longer bodies; split rather than truncate
 
