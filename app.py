@@ -49,11 +49,9 @@ env = cdk.Environment(
     account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
     region=os.environ.get("CDK_DEFAULT_REGION") or "us-west-2",
 )
-# From .env via the deploy scripts (-c lark_api_domain=...); no default here, so a missing
-# value stops the synth instead of quietly pointing a Feishu tenant at Lark.
-lark_api_domain = ctx("lark_api_domain")
-if not lark_api_domain:
-    raise SystemExit("lark_api_domain context is missing — set LARK_API_DOMAIN in .env and deploy with ./deploy.sh")
+# From .env via the deploy scripts (-c lark_api_domain=...). preflight.sh requires it when
+# Lark is configured; a deployment without Lark never calls it, and gets Lark's default.
+lark_api_domain = ctx("lark_api_domain") or "https://open.larksuite.com"
 
 
 # Context values arrive as strings when passed with -c, and the string "false" is truthy,
@@ -62,7 +60,11 @@ def _flag(name: str) -> bool:
     return str(ctx(name)).strip().lower() == "true"
 
 # --- Security: Cognito user pool + Secrets Manager slots ---
-security = SecurityStack(app, f"{prefix}-security", env=env)
+# The web page's origin travels through .cdk-state.<name>.json: CloudFront assigns it, and
+# the hosted login's callback, the router's CORS and the shim all need it.
+web_origin = ctx("web_origin") or ""
+security = SecurityStack(app, f"{prefix}-security", webui=_flag("webui"),
+                         web_origin=web_origin, env=env)
 
 # --- AgentCore base: execution role, ECR image, S3 user files ---
 # Runtime itself is created out-of-band by deploy.sh; runtime_arn is derived
@@ -86,6 +88,7 @@ shim = ShimStack(
     f"{prefix}-shim",
     lark_api_domain=lark_api_domain,
     lark_secret_name=security.lark_secret.secret_name,
+    web_url=web_origin,
     env=env,
 )
 
@@ -111,7 +114,11 @@ router = RouterStack(
     # The page's origin, so it may trade an h5 code for a JWT. Travels through
     # .cdk-state.<name>.json because CloudFront assigns the domain — the same route the file
     # system id takes, and it breaks the cycle between this stack and the WebUI one.
-    web_allowed_origins=ctx("web_origin") or "",
+    web_allowed_origins=web_origin,
+    # Only when the page is deployed: the web routes sit behind a JWT authorizer for it.
+    web_client_id=security.web_client.user_pool_client_id if security.web_client else "",
+    cognito_issuer_url=security.cognito_issuer_url,
+    lark_enabled=_flag("lark"),
     runtime_arn=agentcore.runtime_arn,
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
     lark_api_domain=lark_api_domain,
@@ -125,9 +132,8 @@ router = RouterStack(
 )
 
 # --- WebUI: static web chat on S3 + CloudFront (opt-in) ---
-# Off unless webui=true: the page only works inside the Lark client, which needs an h5 app
-# registered against the distribution's domain — deploying it without that yields a page
-# nobody can sign in to.
+# Off unless webui=true. Outside Lark a user signs in at the pool's hosted login; inside the
+# Lark client the page uses Lark's h5 sign-in, which needs an h5 app registered on the domain.
 webui = None
 if _flag("webui"):
     webui = WebUiStack(
@@ -137,8 +143,12 @@ if _flag("webui"):
         # unable to change an export this stack imports (UPDATE_ROLLBACK, measured), the
         # same deadlock the sandbox stack hit.
         router_api_url=ctx("router_api_url") or "",
-        # From .env, which deploy.sh sources — the page needs it for requestAuthCode.
+        # From .env, which deploy.sh sources — the page needs it for requestAuthCode. Empty
+        # when the deployment has no Lark: the page then never loads Lark's SDK.
         lark_app_id=os.environ.get("LARK_APP_ID", ""),
+        # Through state, like router_api_url, so this stack holds no reference to security.
+        web_client_id=ctx("web_client_id") or "",
+        web_login_domain=ctx("web_login_domain") or "",
         env=env,
     )
 

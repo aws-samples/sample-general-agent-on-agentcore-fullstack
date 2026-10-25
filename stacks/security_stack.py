@@ -1,13 +1,16 @@
 """Security stack — Cognito user pool + Secrets Manager slots.
 
-Identity model: Lark is the IdP. A user's stable identity is `lark:{open_id}`,
-which is used verbatim as the Cognito username. Both entrypoints (webhook
-messages and the embedded web UI) resolve to the same identity, so a user's
-session/workspace is shared across them.
+One pool, two kinds of user, told apart by the app client their token was issued to:
 
-Cognito's role here is narrow: mint a standard OIDC JWT for a Lark-authenticated
-user so that AgentCore / API Gateway JWT authorizers can validate it. Passwords
-are HMAC-derived (never user-chosen), so the pool is effectively a token factory.
+- **Lark users**: Lark is the IdP. The router creates them as `lark:{open_id}` with an
+  HMAC-derived password and mints their tokens through the `app` client, which only allows
+  admin auth (IAM). Lark chat and the page opened inside Lark both resolve to that user.
+- **Web users** (when the web page is deployed): created by an admin, username = their
+  email, their own password, signed in at the pool's hosted login through the `web` client
+  (authorization code + PKCE). Their actor is `web:{sub}` (agent/caller.py).
+
+The pool is only ever updated in place: AgentCore Identity keys a user's grants by the
+token's `sub`, so a replaced pool would orphan every Lark and Google grant.
 """
 
 from aws_cdk import (
@@ -21,28 +24,30 @@ from constructs import Construct
 
 
 class SecurityStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, *, webui: bool = False,
+                 web_origin: str = "", **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         prefix = self.node.get_context("deployment_name")
 
-        # --- Cognito user pool: token factory for Lark-authenticated users ---
-        # username == "lark:{open_id}"; passwords are HMAC-derived by the agent
-        # Lambda, so no interactive sign-up / recovery / MFA applies.
+        # --- Cognito user pool ---
+        # Self sign-up stays off: a web user exists because an admin created them, which is
+        # the web's allowlist. Recovery by email lets them reset their own password.
         self.user_pool = cognito.UserPool(
             self,
             "UserPool",
             user_pool_name=f"{prefix}-users",
             self_sign_up_enabled=False,
             sign_in_aliases=cognito.SignInAliases(username=True),
+            # People choose web users' passwords; a Lark user's is derived (36 characters).
             password_policy=cognito.PasswordPolicy(
-                min_length=16,
-                require_lowercase=False,
+                min_length=8,
+                require_lowercase=True,
                 require_uppercase=False,
-                require_digits=False,
+                require_digits=True,
                 require_symbols=False,
             ),
-            account_recovery=cognito.AccountRecovery.NONE,
+            account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
             removal_policy=RemovalPolicy.DESTROY,  # PoC — recreate freely
         )
 
@@ -53,6 +58,36 @@ class SecurityStack(Stack):
             generate_secret=False,
             # id_token_validity left at Cognito default (1h)
         )
+
+        # --- Hosted login for the web page ---
+        # Classic hosted UI: it needs no per-client branding resource. The callback is the
+        # page itself, known only once CloudFront assigns it — until then a placeholder, and
+        # scripts/provision.sh redeploys this stack with the real origin.
+        self.web_client = None
+        self.web_login_domain = ""
+        if webui:
+            page = (web_origin.rstrip("/") + "/") if web_origin else "https://localhost/"
+            domain = self.user_pool.add_domain(
+                "WebLogin",
+                # Unique per region across all accounts, hence the account in it.
+                cognito_domain=cognito.CognitoDomainOptions(
+                    domain_prefix=f"{prefix}-{Stack.of(self).account}"),
+            )
+            self.web_client = self.user_pool.add_client(
+                "WebClient",
+                user_pool_client_name=f"{prefix}-web",
+                generate_secret=False,                     # a browser cannot keep one
+                auth_flows=cognito.AuthFlow(),
+                o_auth=cognito.OAuthSettings(
+                    flows=cognito.OAuthFlows(authorization_code_grant=True),
+                    scopes=[cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL],
+                    callback_urls=[page], logout_urls=[page]),
+                supported_identity_providers=[cognito.UserPoolClientIdentityProvider.COGNITO],
+                prevent_user_existence_errors=True,
+            )
+            self.web_login_domain = domain.base_url()
+            CfnOutput(self, "WebClientId", value=self.web_client.user_pool_client_id)
+            CfnOutput(self, "WebLoginDomain", value=self.web_login_domain)
 
         self.user_pool_id = self.user_pool.user_pool_id
         self.user_pool_arn = self.user_pool.user_pool_arn

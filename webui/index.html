@@ -2,18 +2,17 @@
 <!--
   Web chat for the agent, served as one static file.
 
-  Three destinations, and the split is the point:
-    1. POST {code} to the router's /web/session — the code comes from Lark's h5 SDK, so the
-       router can establish who is asking rather than be told. It answers with a user JWT.
-    2. POST an AG-UI RunAgentInput straight to the AgentCore Runtime with that JWT, and read
-       the answer as an SSE stream. No backend sits in this hop.
-    3. A /command goes to the router's /web/command instead: those rotate session ids the
-       router owns, and the agent cannot reach the identity table at all.
+  Who you are is established one of two ways, and everything after is the same:
+    - in a browser: Cognito's hosted login (authorization code + PKCE). The page holds the
+      user's own access token and sends it everywhere; the router never mints for them.
+    - inside the Lark client: Lark's h5 SDK hands out a single-use code, which the router's
+      /web/h5/session trades for the Lark user's token.
+  Then: chat goes as AG-UI straight to the AgentCore Runtime with that token (SSE back), and
+  a /command goes to the router, which owns the session ids those rotate.
 
-  The page sends no open_id and no thread id: both address a person, and a claimed one
-  would address the wrong person. It does carry the router's runtime session id, which
-  only routes — and sharing it puts this tab in the same container as the Lark chat,
-  which is what lets the agent serialise the two. See docs/architecture.md.
+  A system a tool needs and the user has not granted (Lark, Google) is authorised here, on
+  demand: the page mints the link through /auth when the user clicks, and completes the
+  consent itself with the same token — the only one that can complete it.
 -->
 <html lang="zh">
 <head>
@@ -22,10 +21,6 @@
 <title>Agent</title>
 <!-- Deploy-time values (router URL, Lark app id); written by the WebUI stack. -->
 <script src="config.js"></script>
-<!-- This exact path, not the /goofy/locality/openplatform/ one — that 404s, so h5sdk never
-     defines itself and every failure presents as "not in the Lark client". No integrity hash:
-     Lark's CDN makes no immutability promise, and a stale hash would break the page outright. -->
-<script src="https://lf1-cdn-tos.bytegoofy.com/goofy/lark/op/h5-js-sdk-1.5.34.js"></script>  <!-- nosemgrep: missing-integrity — vendor CDN, no immutability promise -->
 <!-- Model output is markdown. Sanitised because a tool result is untrusted input that
      reaches this page through the model. -->
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
@@ -63,11 +58,23 @@
          background: color-mix(in oklab, currentColor 6%, transparent);
          border: 1px solid var(--edge); }
   .cmd a { color: var(--accent); }
-  .tool { align-self: flex-start; font-size: 13px; opacity: .75; border: 1px dashed var(--edge); }
-  .tool summary { cursor: pointer; font-style: italic; }
-  .tool pre { margin: .4rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere;
-              font-size: 12px; opacity: .85; }
-  .tool pre:empty { display: none; }
+  /* A turn, the way the Lark card lays it out: text blocks with grey status chips between
+     them, and a full-width grey band summing the turn up. */
+  .turn { display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; }
+  .turn .block { align-self: stretch; }
+  .turn .block > :first-child { margin-top: 0; } .turn .block > :last-child { margin-bottom: 0; }
+  .pill { display: inline-flex; align-items: center; gap: .45rem; font-size: 12px; color: #8f959e;
+          background: color-mix(in oklab, currentColor 7%, transparent); border-radius: .4rem;
+          padding: .15rem .65rem; }
+  .band { align-self: stretch; font-size: 12px; color: #8f959e; padding: .25rem .5rem;
+          background: color-mix(in oklab, currentColor 7%, transparent); border-radius: .3rem; }
+  .dots { display: inline-flex; gap: 3px; align-items: center; height: 12px; }
+  .dots i { width: 4px; height: 4px; border-radius: 50%; background: #8f959e; display: block; }
+  .dots.think i { animation: rise 1s infinite ease-in-out; }
+  .dots.work i { animation: swell 1s infinite ease-in-out; }
+  .dots i:nth-child(2) { animation-delay: .18s; } .dots i:nth-child(3) { animation-delay: .36s; }
+  @keyframes rise { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-3px); } }
+  @keyframes swell { 0%, 100% { transform: scale(.6); } 50% { transform: scale(1.2); } }
   .think { align-self: flex-start; font-size: 13px; opacity: .55; font-style: italic;
            white-space: pre-wrap; }
   .err { align-self: flex-start; color: #c0392b; white-space: pre-wrap; }
@@ -86,10 +93,27 @@
   #pending { padding: 0 1rem; font-size: 13px; opacity: .7; display: none; align-items: center;
              gap: .5rem; }
   #pending img { max-height: 2.4rem; border-radius: .3rem; }
+  .consent { align-self: flex-start; border: 1px solid var(--accent); display: flex;
+             gap: .7rem; align-items: center; }
+  header button.ghost { font-size: 13px; padding: .25rem .6rem; }
+  /* A message as Lark chat shows one: avatar beside it, sender and time above it. */
+  .row { display: flex; gap: .6rem; align-items: flex-start; align-self: stretch; }
+  .row.mine { flex-direction: row-reverse; }
+  .row .col { display: flex; flex-direction: column; gap: .25rem; min-width: 0;
+              align-items: flex-start; }
+  .row.mine .col { align-items: flex-end; }
+  .row .msg { align-self: auto; }
+  .meta { font-size: 12px; color: #8f959e; }
+  .meta:empty { display: none; }
+  .meta time { margin-left: .5em; cursor: default; } .row.mine .meta time { margin-left: 0; }
+  .avatar { width: 34px; height: 34px; border-radius: 50%; flex: none; display: grid;
+            place-items: center; font-size: 14px; font-weight: 600; color: #fff;
+            background: var(--accent); user-select: none; }
+  .avatar.bot { background: linear-gradient(135deg, #3370ff, #8b5cf6); font-size: 12px; }
 </style>
 </head>
 <body>
-<header>Agent <small id="who">connecting…</small></header>
+<header>Agent <small id="who">connecting…</small><span style="flex:1"></span><button type="button" id="logout" class="ghost" hidden>退出</button></header>
 <div id="log"></div>
 <div id="pending"></div>
 <form id="f">
@@ -103,11 +127,56 @@
 const log = document.getElementById('log');
 const $ = (id) => document.getElementById(id);
 
-const say = (cls, text) => {
+// Today's messages carry the time alone, older ones the date too.
+const clock = (d) => {
+  const hm = d.toTimeString().slice(0, 5);
+  return d.toDateString() === new Date().toDateString() ? hm
+    : `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+};
+
+// The exact moment, on hover: 2026-10-25 Sun 22:14:51.
+const fullClock = (d) => {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+    + `${d.toLocaleDateString('en-US', {weekday: 'short'})} ${d.toTimeString().slice(0, 8)}`;
+};
+
+// A message from the user or the agent gets an avatar, the sender and the time; status lines
+// and errors stay bare. `when` is null for history older than the agent's own timestamps.
+function placed(el, mine, when) {
+  const row = document.createElement('div');
+  row.className = 'row' + (mine ? ' mine' : '');
+  const face = document.createElement('div');
+  face.className = 'avatar' + (mine ? '' : ' bot');
+  face.textContent = mine ? me.initial() : 'AI';
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  if (!mine) meta.append('Agent');
+  if (when) {
+    const t = document.createElement('time');
+    t.textContent = clock(when);
+    t.title = fullClock(when);
+    t.dateTime = when.toISOString();
+    meta.append(t);
+  }
+  const col = document.createElement('div');
+  col.className = 'col';
+  col.append(meta, el);
+  row.append(face, col);
+  log.append(row);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+const say = (cls, text, when = new Date()) => {
   const el = document.createElement('div');
   el.className = 'msg ' + cls; el.textContent = text;
+  if (['me', 'bot', 'cmd'].includes(cls)) return placed(el, cls === 'me', when);
   log.append(el); log.scrollTop = log.scrollHeight; return el;
 };
+
+// Whose avatar the user's messages carry: the signed-in email's first letter, or 我 in Lark.
+const me = {initial: () => (!inLark() && login.email() || '我').charAt(0).toUpperCase()};
 
 // Markdown is re-rendered from the accumulated source on every delta: parsing a partial
 // stream incrementally would produce broken trees mid-token. `breaks` because a chat
@@ -130,7 +199,7 @@ function paintMarkdown(el, raw) {
   log.scrollTop = log.scrollHeight;
 }
 
-// The router's base URL is injected at deploy time so the page needs no build step.
+// Deploy-time values, injected so the page needs no build step.
 const ROUTER = window.ROUTER_BASE || '';
 let session = null;
 
@@ -138,31 +207,71 @@ const enableInput = (on) => {
   for (const id of ['q', 'send', 'attach']) $(id).disabled = !on;
 };
 
+// Inside the Lark client the user is a Lark user; anywhere else they sign in at the hosted
+// login. Told apart by the client's user agent rather than by the SDK, which defines itself
+// in any browser — and the SDK is only fetched when this deployment has Lark at all.
+const inLark = () => !!window.LARK_APP_ID && /Lark|Feishu/i.test(navigator.userAgent);
+
 async function connect() {
   try {
     $('who').textContent = '正在识别身份…';
-    const code = await larkAuthCode();
-    const r = await fetch(ROUTER + '/web/session', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({code}),
-    });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
-    session = await r.json();
+    if (inLark()) await loadLarkSdk();
+    else { await login.ready(); $('logout').hidden = false; }
+    session = await fetchSession();
     // Input stays disabled until the transcript has landed: a message sent mid-restore
     // would be appended first and then have the older history arrive above it.
     await restore();
     $('who').textContent = '已连接';
     enableInput(true);
     $('q').focus();
+    consent.resume();
   } catch (e) {
     $('who').textContent = '未连接';
     say('err', '无法建立会话：' + e.message);
   }
 }
 
+const fetchSession = async () => inLark()
+  ? routerPost('/web/h5/session', {code: await larkAuthCode()})
+  : routerPost('/web/session', {});
+
+// The router owns the session ids and drops them on a deploy or on /new from Lark chat, so a
+// turn re-reads them first; a thread changed elsewhere takes the stale transcript with it.
+async function syncSession(...keep) {
+  const next = await fetchSession();
+  if (session && next.memorySessionId !== session.memorySessionId) {
+    log.innerHTML = '';
+    log.append(...keep);
+  }
+  session = {...session, ...next};
+}
+
+// The router: inside Lark a fresh h5 code proves who is asking each time; outside, the
+// signed-in user's own token does, checked by the API's JWT authorizer.
+async function routerPost(path, body, token) {
+  const headers = {'Content-Type': 'application/json'};
+  if (!inLark()) headers.Authorization = 'Bearer ' + (token || await login.token());
+  const r = await fetch(ROUTER + path, {method: 'POST', headers, body: JSON.stringify(body)});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.status);
+  return data;
+}
+
+function loadLarkSdk() {
+  return new Promise((resolve, reject) => {
+    // This exact path, not the /goofy/locality/openplatform/ one — that 404s, so h5sdk
+    // never defines itself. No integrity hash: Lark's CDN makes no immutability promise.
+    const s = document.createElement('script');
+    s.src = 'https://lf1-cdn-tos.bytegoofy.com/goofy/lark/op/h5-js-sdk-1.5.34.js';  // nosemgrep: missing-integrity — vendor CDN, no immutability promise
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('h5sdk 未加载（CDN 脚本没取到）'));
+    document.head.append(s);
+  });
+}
+
 // Lark's h5 SDK hands out a single-use code; that is the whole identity step.
 // The two globals fail for different reasons and must be reported apart: h5sdk comes from
-// the script above (a bad URL and it is simply absent), tt is injected by the client.
+// the script loaded above, tt is injected by the client.
 function larkAuthCode() {
   return new Promise((resolve, reject) => {
     if (!window.h5sdk) return reject(new Error('h5sdk 未加载（CDN 脚本没取到）'));
@@ -179,6 +288,199 @@ function larkAuthCode() {
   });
 }
 
+// The hosted login, as the OAuth authorization code flow with PKCE: a page can keep no
+// client secret. The access token is held in memory and renewed before it runs low; the
+// refresh token sits in this tab's sessionStorage, so a reload keeps the user signed in and
+// closing the tab signs them out.
+const login = (() => {
+  const domain = window.WEB_LOGIN_DOMAIN, client = window.WEB_CLIENT_ID;
+  const page = location.origin + '/';
+  let access = '', expiresAt = 0, email = '';
+  const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  async function exchange(form) {
+    const r = await fetch(domain + '/oauth2/token', {
+      method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({client_id: client, ...form}),
+    });
+    const got = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error('登录失败：' + (got.error || r.status));
+    access = got.access_token;
+    expiresAt = Date.now() + (got.expires_in || 3600) * 1000;
+    // Display only: nothing is authorised on the id token, so it is read, not verified.
+    try {
+      const claims = JSON.parse(atob(got.id_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+      email = claims.email || email;
+    } catch { /* no id token on this grant */ }
+    if (got.refresh_token) sessionStorage.setItem('refresh', got.refresh_token);
+  }
+
+  async function begin() {
+    const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+    const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+    const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    sessionStorage.setItem('pkce', JSON.stringify({verifier, state}));
+    location.assign(domain + '/oauth2/authorize?' + new URLSearchParams({
+      response_type: 'code', client_id: client, redirect_uri: page, scope: 'openid email',
+      state, code_challenge: challenge, code_challenge_method: 'S256'}));
+    return new Promise(() => {});      // the page is leaving
+  }
+
+  return {
+    async ready() {
+      if (!domain || !client) throw new Error('这个部署没有配置网页登录');
+      const q = new URLSearchParams(location.search);
+      if (q.get('code')) {
+        const saved = JSON.parse(sessionStorage.getItem('pkce') || '{}');
+        sessionStorage.removeItem('pkce');
+        // The code is single-use and must not stay in the address bar or the history.
+        history.replaceState(null, '', page + location.hash);
+        if (!saved.state || q.get('state') !== saved.state) return begin();
+        return exchange({grant_type: 'authorization_code', code: q.get('code'),
+                         redirect_uri: page, code_verifier: saved.verifier});
+      }
+      if (sessionStorage.getItem('refresh')) {
+        try { return await this.renew(); } catch { sessionStorage.removeItem('refresh'); }
+      }
+      return begin();
+    },
+    renew() {
+      return exchange({grant_type: 'refresh_token', refresh_token: sessionStorage.getItem('refresh')});
+    },
+    // Renewed with half an hour to spare: a consent started with this token has to be
+    // completed with this very token, so it must not be about to expire.
+    async token() {
+      if (Date.now() > expiresAt - 30 * 60 * 1000) await this.renew();
+      return access;
+    },
+    email: () => email,
+    signOut() {
+      sessionStorage.clear();
+      location.assign(domain + '/logout?' + new URLSearchParams({client_id: client, logout_uri: page}));
+    },
+  };
+})();
+$('logout').addEventListener('click', () => login.signOut());
+
+// Authorising a system on demand. The link is minted through /auth when the user clicks,
+// not when the tool was refused: a consent can be completed only with the very token it was
+// started with, and minting at the click is what lets the page know which token that is.
+// After consenting, the browser comes back to this page with `#consent=<session>`, and the
+// tab that holds that session's token completes it at /web/consent and resends the message
+// the refusal interrupted — as Lark chat replays it.
+const LABELS = {lark: 'Lark', google: 'Google'};
+let lastAsk = null;          // the message a refusal interrupted, to send again after consent
+
+const consent = (() => {
+  const channel = 'BroadcastChannel' in window ? new BroadcastChannel('consent') : null;
+  const pending = () => JSON.parse(sessionStorage.getItem('consents') || '{}');
+  const keep = (all) => sessionStorage.setItem('consents', JSON.stringify(all));
+  const sessionOf = (url) => new URL(url).searchParams.get('request_uri') || '';
+  // Before any sign-in redirect, which would drop the fragment.
+  const back = new URLSearchParams(location.hash.slice(1)).get('consent');
+  if (back) {
+    sessionStorage.setItem('consentBack', back);
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+
+  // Whether the consent completed; null when this tab holds no such consent.
+  async function complete(id) {
+    const p = pending()[id];
+    if (!p) return null;
+    const done = await routerPost('/web/consent', {sessionId: id}, p.token)
+      .catch((e) => ({ok: false, error: e.message}));
+    const all = pending(); delete all[id]; keep(all);
+    if (!done.ok) { say('err', `授权没有完成：${done.error || '未知原因'}，请再点一次授权。`); return false; }
+    say('cmd', `✅ 已授权 ${LABELS[p.idp] || p.idp}`);
+    if (p.retry) send(p.retry);
+    return true;
+  }
+
+  if (channel) channel.onmessage = async ({data}) => {
+    if (data.type === 'consent' && pending()[data.id]) {
+      const ok = await complete(data.id);
+      channel.postMessage({type: 'consent-done', id: data.id, ok});
+    }
+  };
+
+  return {
+    // A link /auth handed back: keep the token it was minted with, under its session.
+    minted(url, token, idp, retry) {
+      if (!token) return;            // inside Lark: the router completes it, with the Lark token
+      const id = sessionOf(url);
+      if (id) keep({...pending(), [id]: {token, idp: idp || '', retry: retry || null}});
+    },
+    prompt(idp) {
+      const label = LABELS[idp] || idp;
+      const retry = lastAsk;
+      const el = document.createElement('div');
+      el.className = 'consent';
+      const b = document.createElement('button');
+      b.textContent = `授权 ${label}`;
+      el.append(document.createTextNode(`这一步需要访问你的 ${label} 账号。`), b);
+      b.onclick = async () => {
+        b.disabled = true;
+        // Opened before the request so a popup blocker sees a click, not a callback.
+        const w = window.open('', '_blank');
+        // The link takes a second or two to mint; an empty window reads as a broken one.
+        if (w) { w.document.title = `授权 ${label}`; w.document.body.textContent = `正在打开 ${label} 授权页…`; }
+        try {
+          const token = inLark() ? '' : await login.token();
+          const body = inLark()
+            ? await routerPost('/web/h5/command', {code: await larkAuthCode(), command: `/auth ${idp}`})
+            : await routerPost('/web/command', {command: `/auth ${idp}`}, token);
+          if (!body.link) { if (w) w.close(); say('cmd', body.text || '已授权'); return; }
+          this.minted(body.link.url, token, idp, retry);
+          if (w) w.location = body.link.url; else location.assign(body.link.url);
+          if (inLark()) say('cmd', `授权完成后回到这里，再发一次刚才的消息。`);
+        } catch (e) {
+          if (w) w.close();
+          say('err', '无法开始授权：' + e.message);
+        } finally { b.disabled = false; }
+      };
+      return el;
+    },
+    // Called once signed in: finish a consent this page was sent back from.
+    async resume() {
+      const id = sessionStorage.getItem('consentBack');
+      if (!id) return;
+      sessionStorage.removeItem('consentBack');
+      if (await complete(id) === null) say('err', '请回到发起授权的页面，再点一次授权。');
+    },
+    // Consented in a window that does not hold the token — the one the button opened: hand
+    // the consent to the tab that does and close, without signing in or showing the chat.
+    // True when this page is that window.
+    handoff() {
+      const id = sessionStorage.getItem('consentBack');
+      if (!id || pending()[id] || !channel || inLark()) return false;
+      sessionStorage.removeItem('consentBack');
+      document.body.innerHTML = '';
+      const note = document.createElement('div');
+      note.className = 'msg cmd';
+      note.style.margin = '2rem auto';
+      note.textContent = '正在完成授权…';
+      document.body.append(note);
+      new Promise((resolve) => {
+        const t = setTimeout(() => resolve(null), 5000);
+        channel.addEventListener('message', ({data}) => {
+          if (data.type === 'consent-done' && data.id === id) { clearTimeout(t); resolve(data); }
+        });
+        channel.postMessage({type: 'consent', id});
+      }).then((answered) => {
+        if (answered && answered.ok) {
+          note.textContent = '✅ 授权完成，可以关闭这个窗口。';
+          window.close();   // allowed: the page's own button opened this window
+        } else {
+          note.textContent = answered ? '授权没有完成，请回到对话页再点一次授权。'
+                                      : '没有找到发起授权的页面。请回到对话页，再点一次授权。';
+        }
+      });
+      return true;
+    },
+  };
+})();
+
 const uuid = () => crypto.randomUUID();
 // The router's own routing key, not one of our own: a session id maps to exactly one
 // microVM, so sharing it puts this tab and the Lark chat in the same container — which is
@@ -192,9 +494,13 @@ const runtimeUrl = () =>
   + `${encodeURIComponent(session.runtimeArn)}/invocations`
   + `?qualifier=${encodeURIComponent(session.qualifier)}`;
 
-const runtimeHeaders = (accept) => ({
+// The token of whoever is signed in: the Lark user's from /web/h5/session, or the web user's
+// own. The agent takes the actor from it and refuses a payload naming anybody else.
+const currentToken = async () => inLark() ? session.token : login.token();
+
+const runtimeHeaders = async (accept, token) => ({
   'Content-Type': 'application/json', 'Accept': accept,
-  'Authorization': 'Bearer ' + session.token,
+  'Authorization': 'Bearer ' + (token || await currentToken()),
   'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': runtimeSession(),
 });
 
@@ -209,8 +515,9 @@ async function restore() {
   let data;
   try {
     const r = await fetch(runtimeUrl(), {
-      method: 'POST', headers: runtimeHeaders('application/json'),
-      body: JSON.stringify({action: 'transcript', actorId: session.actorId}),
+      method: 'POST', headers: await runtimeHeaders('application/json'),
+      body: JSON.stringify({action: 'transcript', actorId: session.actorId,
+                            memorySessionId: session.memorySessionId}),
     });
     data = await r.json();
   } catch {
@@ -223,39 +530,54 @@ async function restore() {
   const msgs = (data && data.messages) || [];
   if (!msgs.length) return;
   if (data.truncated) say('think', '（仅显示最近的对话）');
+  // The same shape as a live turn. Messages from before the agent kept times have none.
+  const at = (m) => m.ts ? new Date(m.ts) : null;
+  let past = null, calls = 0;
+  const flush = () => {
+    if (calls) past.append(pill(`🔧 调用工具${times(calls)}`, ''));
+    calls = 0;
+  };
   for (const m of msgs) {
-    if (m.role === 'user') say('me', m.content || '');
-    else if (m.role === 'summary') say('think', '（更早的对话已压缩为摘要）');
-    else if (m.role === 'assistant') sayMarkdown(m.content || '');
-    else if (m.role === 'toolCall') {
-      const t = toolCard(m.id || uuid());
-      t.name = m.name; t.args = m.args || ''; t.done = true; paintTool(t);
-    } else if (m.role === 'toolResult') {
-      const t = toolCard(m.id || uuid());
-      t.done = true; t.result = m.content || ''; paintTool(t);
+    if (m.role === 'user' || m.role === 'summary') {
+      flush(); past = null;
+      if (m.role === 'user') say('me', m.content || '', at(m));
+      else say('think', '（更早的对话已压缩为摘要）');
+      continue;
+    }
+    if (!past) { past = document.createElement('div'); past.className = 'msg bot turn'; placed(past, false, at(m)); }
+    if (m.role === 'toolCall') calls += 1;
+    else if (m.role === 'assistant' && (m.content || '').trim()) {
+      flush();
+      const block = document.createElement('div'); block.className = 'block';
+      past.append(block); paintMarkdown(block, m.content);
     }
   }
-  tools.clear();   // a restored card must not be reused by the next live turn
-  bubble = null;
+  flush();
 }
 
-// A command needs a fresh code: the router establishes identity per request rather than
-// trusting a token the page holds.
+// Inside Lark a command carries a fresh code; outside, the signed-in user's token. A link
+// it hands back is a consent, minted with that token — the one that must complete it.
 async function runCommand(command) {
-  const code = await larkAuthCode();
-  const r = await fetch(ROUTER + '/web/command', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({code, command}),
-  });
-  const body = await r.json().catch(() => ({}));
-  firstEventArrived();   // drop the placeholder before the answer, not after
-  if (!r.ok) throw new Error(body.error || r.status);
+  const token = inLark() ? '' : await login.token();
+  let body;
+  try {
+    body = inLark()
+      ? await routerPost('/web/h5/command', {code: await larkAuthCode(), command})
+      : await routerPost('/web/command', {command}, token);
+  } finally {
+    firstEventArrived();   // drop the placeholder before the answer, not after
+  }
+  // The system it is for names the outcome: 「✅ 已授权 Lark」, not a bare 「✅ 已授权」.
+  if (body.link) consent.minted(body.link.url, token, (command.match(/^\/auth\s+(\S+)/) || [])[1]);
   // Not markdown: this is aligned diagnostic output, where the runs of spaces and the line
   // breaks are the formatting. The link is a real anchor rather than markdown for the same
   // reason — nothing here is parsed.
   // These change which thread the next turn reads, so the transcript on screen is no longer
   // this conversation. Leaving it would show history the agent has stopped remembering.
-  if (/^\/(clear|reset|new)\b/.test(command)) { log.innerHTML = ''; tools.clear(); }
+  if (/^\/(clear|reset|new)\b/.test(command)) {
+    log.innerHTML = '';
+    await syncSession();
+  }
   const el = say('cmd', body.text || '');
   if (body.link) {
     const a = document.createElement('a');
@@ -265,18 +587,17 @@ async function runCommand(command) {
 }
 
 async function ask(content) {
-  // Neither actorId nor threadId carries authority: the agent takes the actor from the
-  // verified bearer, and derives the thread from it.
-  // No thread id: it addresses a conversation by user alone, so a forged one would read
-  // somebody else's. The agent resolves it — and because this tab shares the router's
-  // runtime session id, it lands in the same container and inherits the same thread.
-  const body = {actorId: session.actorId, runId: uuid(), threadId: 'resolved-by-agent',
+  // Nothing here carries authority: the agent takes the actor from the token, refuses a
+  // memorySessionId outside that actor's threads, and replaces AG-UI's threadId with it.
+  const body = {actorId: session.actorId, memorySessionId: session.memorySessionId,
+                runId: uuid(), threadId: 'resolved-by-agent',
                 messages: [{id: uuid(), role: 'user', content}],
                 tools: [], context: [], state: {}, forwardedProps: {}};
   const res = await fetch(runtimeUrl(), {
     method: 'POST', body: JSON.stringify(body),
-    headers: runtimeHeaders('text/event-stream'),
+    headers: await runtimeHeaders('text/event-stream'),
   });
+  if (!res.ok) throw new Error('请求失败：' + res.status);
 
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = '';
@@ -294,10 +615,13 @@ async function ask(content) {
   }
 }
 
-// Tool calls arrive as a lifecycle keyed by toolCallId, interleaved with everything else,
-// so each one needs its own element to grow into. Args stream as JSON fragments.
-const tools = new Map();
-let bubble = null, thinking = null, waitingForFirst = null;
+// --- the answer, laid out the way the Lark card is ----------------------------
+// One block per turn: the answer's text with status lines between its parts, where they
+// happened, and a one-line summary at the end. A status line says what the turn is doing
+// now — thinking, a tool running — with moving dots instead of a clock, and when text
+// resumes it freezes as the record of that wait ("🤔 思考 · 3 秒 · 🔧 调用工具 ×2 · 5 秒").
+// Tools are not named: the chat is not a log (agent/lark_notify.py, StreamingCard).
+let turn = null, waitingForFirst = null;
 
 // Between submit and the first event there is real latency (session assembly, MCP
 // handshake, model). Cleared by whichever event arrives first.
@@ -305,78 +629,128 @@ function firstEventArrived() {
   if (waitingForFirst) { waitingForFirst.remove(); waitingForFirst = null; }
 }
 
-function toolCard(id) {
-  let t = tools.get(id);
-  if (!t) {
-    const el = document.createElement('details');
-    el.className = 'msg tool';
-    el.innerHTML = '<summary></summary><pre></pre>';
-    log.append(el); log.scrollTop = log.scrollHeight;
-    t = {el, name: '', args: '', done: false};
-    tools.set(id, t);
-  }
-  return t;
+const secs = (ms) => Math.max(1, Math.round(ms / 1000));
+const times = (n) => n > 1 ? ` ×${n}` : '';
+
+function pill(text, dots) {
+  const el = document.createElement('div');
+  el.className = 'pill';
+  setPill(el, text, dots);
+  return el;
 }
 
-function paintTool(t) {
-  t.el.querySelector('summary').textContent =
-    (t.done ? '✓ ' : '· ') + (t.name || 'tool') + (t.done ? '' : ' …');
-  const body = [t.args && '入参 ' + t.args, t.result && '结果 ' + t.result]
-    .filter(Boolean).join('\n');
-  t.el.querySelector('pre').textContent = body;
+function setPill(el, text, dots) {
+  el.textContent = text;
+  if (dots) {
+    const d = document.createElement('span');
+    d.className = 'dots ' + dots;
+    d.innerHTML = '<i></i><i></i><i></i>';
+    el.append(d);
+  }
+}
+
+class Turn {
+  constructor() {
+    this.el = document.createElement('div');
+    this.el.className = 'msg bot turn';
+    placed(this.el, false, new Date());
+    this.t0 = this.since = performance.now();
+    this.phase = 'think';
+    this.steps = {think: 0, tool: 0, write: 0};
+    this.toolsDone = 0;
+    this.gap = {think: 0, tool: 0, tools: 0};
+    this.text = null; this.raw = '';
+    this.live = pill('🤔 思考中', 'think');
+    this.el.append(this.live);
+    this.scroll();
+  }
+  scroll() { log.scrollTop = log.scrollHeight; }
+  enter(phase) {
+    const now = performance.now(), spent = now - this.since;
+    if (this.steps[this.phase] !== undefined) this.steps[this.phase] += spent;
+    if (this.live && (this.phase === 'think' || this.phase === 'tool')) this.gap[this.phase] += spent;
+    this.phase = phase; this.since = now;
+    this.paintLive();
+  }
+  done() {          // what a finished wait leaves behind
+    const parts = [];
+    if (this.gap.think >= 1000) parts.push(`🤔 思考 · ${secs(this.gap.think)} 秒`);
+    if (this.gap.tools) parts.push(`🔧 调用工具${times(this.gap.tools)} · ${secs(this.gap.tool)} 秒`);
+    return parts.join(' · ');
+  }
+  paintLive() {
+    if (!this.live) return;
+    if (this.phase === 'tool') setPill(this.live, `🔧 调用工具${times(this.gap.tools + 1)}`, 'work');
+    else if (this.phase === 'think') {
+      const tools = this.gap.tools ? `🔧 调用工具${times(this.gap.tools)} · ${secs(this.gap.tool)} 秒 · ` : '';
+      setPill(this.live, tools + '🤔 思考中', 'think');
+    }
+  }
+  startWait() {     // text stopped and something else began
+    if (this.text) { this.text = null; this.raw = ''; }
+    if (!this.live) { this.live = pill('', ''); this.el.append(this.live); }
+  }
+  endWait() {       // the wait is over: its line freezes as a record, or goes
+    if (!this.live) return;
+    const record = this.done();
+    if (record) setPill(this.live, record, ''); else this.live.remove();
+    this.live = null;
+    this.gap = {think: 0, tool: 0, tools: 0};
+  }
+  toolStarted() {
+    if (this.phase === 'tool') return;
+    this.startWait(); this.enter('tool'); this.scroll();
+  }
+  toolFinished() {
+    this.toolsDone += 1;
+    if (this.live) this.gap.tools += 1;
+    this.enter('think');
+  }
+  write(delta) {
+    if (!delta) return;
+    if (this.phase !== 'write' && !(this.raw + delta).trim()) { this.raw += delta; return; }
+    if (this.phase !== 'write') this.enter('write');
+    if (!this.text) {
+      this.endWait();
+      this.text = document.createElement('div');
+      this.text.className = 'block';
+      this.el.append(this.text);
+    }
+    this.raw += delta;
+    paintMarkdown(this.text, this.raw.trimStart());
+  }
+  append(el) { this.el.append(el); this.scroll(); }
+  finish() {
+    this.enter('done'); this.endWait();
+    const parts = [];
+    if (this.steps.think >= 500) parts.push(`思考 ${secs(this.steps.think)} 秒`);
+    if (this.toolsDone) parts.push(`${this.toolsDone} 次工具调用 ${secs(this.steps.tool)} 秒`);
+    if (this.steps.write >= 500) parts.push(`撰写回答 ${secs(this.steps.write)} 秒`);
+    const band = document.createElement('div');
+    band.className = 'band';
+    band.textContent = `⏱️ 耗时 ${secs(performance.now() - this.t0)} 秒`
+      + (parts.length ? `（${parts.join(' · ')}）` : '');
+    this.append(band);
+  }
 }
 
 function render(ev) {
   if (ev.type !== 'RUN_STARTED') firstEventArrived();
+  if (!turn && ev.type !== 'RUN_ERROR') turn = new Turn();
   switch (ev.type) {
-    case 'RUN_STARTED': tools.clear(); break;
     // The stream ends by itself, so this only matters as the signal that it ended
     // cleanly — a dropped connection looks identical without it.
-    case 'RUN_FINISHED': bubble = thinking = null; break;
+    case 'RUN_FINISHED': turn.finish(); turn = null; break;
     case 'RUN_ERROR': say('err', ev.message || '出错了'); break;
-
-    case 'TEXT_MESSAGE_START': bubble = sayMarkdown(''); break;
     case 'TEXT_MESSAGE_CONTENT':
-    case 'TEXT_MESSAGE_CHUNK':
-      if (!bubble) bubble = sayMarkdown('');
-      paintMarkdown(bubble, bubble.dataset.md + (ev.delta || ''));
-      break;
-    case 'TEXT_MESSAGE_END': bubble = null; break;
-
-    // Only produced when the model is asked for reasoning, which this deployment does
-    // not enable — handled so turning it on needs no page change.
-    case 'THINKING_START':
-    case 'REASONING_START':
-      thinking = say('think', ''); thinking.dataset.text = ''; break;
-    case 'THINKING_TEXT_MESSAGE_CONTENT':
-    case 'REASONING_MESSAGE_CONTENT':
-      if (thinking) {
-        thinking.dataset.text += ev.delta || '';
-        thinking.textContent = thinking.dataset.text;
-      }
-      break;
-    case 'THINKING_END':
-    case 'REASONING_END': thinking = null; break;
-
-    case 'TOOL_CALL_START': {
-      const t = toolCard(ev.toolCallId);
-      t.name = ev.toolCallName || ''; paintTool(t); break;
-    }
-    case 'TOOL_CALL_ARGS': {
-      const t = toolCard(ev.toolCallId);
-      t.args += ev.delta || ''; paintTool(t); break;
-    }
-    case 'TOOL_CALL_END': {
-      const t = toolCard(ev.toolCallId);
-      t.done = true; paintTool(t); break;
-    }
+    case 'TEXT_MESSAGE_CHUNK': turn.write(ev.delta || ''); break;
+    case 'TOOL_CALL_START': turn.toolStarted(); break;
     // The result is what proves a tool ran rather than the model narrating one.
-    case 'TOOL_CALL_RESULT': {
-      const t = toolCard(ev.toolCallId);
-      t.done = true;
-      t.result = (ev.content || '').slice(0, 2000);
-      paintTool(t); break;
-    }
+    case 'TOOL_CALL_RESULT': turn.toolFinished(); break;
+    // A tool of this run was refused for want of a grant: offer to authorise, here.
+    case 'CUSTOM':
+      if (ev.name === 'consent') turn.append(consent.prompt(ev.value && ev.value.idp));
+      break;
   }
 }
 
@@ -413,35 +787,43 @@ function showPending() {
   p.append(img, document.createTextNode('已附图片'), drop);
 }
 
-$('f').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const q = $('q'), btn = $('send');
-  const text = q.value.trim();
-  if ((!text && !attached) || !session) return;
-  q.value = '';
-
+// One message out: a /command to the router, anything else as a turn to the Runtime.
+async function send(text, image = null) {
   const mine = say('me', text);
-  if (attached) {
-    const img = document.createElement('img'); img.src = attached.dataUrl; mine.append(img);
+  if (image) {
+    const img = document.createElement('img'); img.src = image.dataUrl; mine.append(img);
   }
-  const image = attached; attached = null; showPending();
-
   enableInput(false);
   const isCommand = text.startsWith('/') && !image;
   waitingForFirst = say('think', isCommand ? '执行中…' : '思考中…');
   try {
     if (isCommand) await runCommand(text);
-    else await ask(image
-      ? [{type: 'text', text: text || '看看这张图。'},
-         {type: 'image', source: {type: 'data', value: image.value, mimeType: image.mimeType}}]
-      : text);
+    else {
+      await syncSession(mine.closest('.row'), waitingForFirst);
+      lastAsk = image ? null : text;
+      await ask(image
+        ? [{type: 'text', text: text || '看看这张图。'},
+           {type: 'image', source: {type: 'data', value: image.value, mimeType: image.mimeType}}]
+        : text);
+    }
   } catch (err) { say('err', String(err && err.message || err)); }
   firstEventArrived();   // also the fallback for a turn that produced no events at all
+  if (turn) { turn.finish(); turn = null; }   // a stream that broke off still ends its turn
   enableInput(true);
-  q.focus();
+  $('q').focus();
+}
+
+$('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const q = $('q');
+  const text = q.value.trim();
+  if ((!text && !attached) || !session) return;
+  q.value = '';
+  const image = attached; attached = null; showPending();
+  await send(text, image);
 });
 
-connect();
+if (!consent.handoff()) connect();
 </script>
 </body>
 </html>

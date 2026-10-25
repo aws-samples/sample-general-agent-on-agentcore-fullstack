@@ -247,12 +247,14 @@ def test_the_thread_comes_from_the_router_never_from_a_client():
     assert agent_core.thread_for("lark:ou_other") == agent_core._session_id_for("lark:ou_other")
 
 
-def test_the_page_sends_no_thread_id():
-    """It cannot be trusted with one, so it must not be in a position to send one."""
-    import pathlib as _p
+def test_the_page_names_its_thread_only_alongside_a_verified_token():
+    """It names the thread the router handed it, so /reset on the page takes effect; that is
+    safe only because server.py refuses a thread outside the token's actor."""
+    import pathlib as _p, server, inspect
     page = (_p.Path(__file__).parents[1] / "webui" / "index.html").read_text()
-    assert "memorySessionId" not in page
+    assert "memorySessionId: session.memorySessionId" in page
     assert "runtimeSessionId" in page      # the routing key, which is not a capability
+    assert "thread_belongs(" in inspect.getsource(server._bind_caller)
 
 
 def test_a_message_arriving_mid_turn_is_steered_not_refused():

@@ -1,9 +1,11 @@
 """Router stack — Lark webhook ingestion (HTTP API + Lambda + DynamoDB identity).
 
-Owns the DynamoDB identity table (channel→user mapping, allowlist, sessions),
-which the WebUI stack also reads/writes. Exposes explicit routes:
-  POST /webhook/lark   — Lark event subscription callback
+Owns the DynamoDB identity table (channel→user mapping, allowlist, sessions, a Lark user's
+shared token). Exposes explicit routes:
+  POST /webhook/lark   — Lark event subscription callback (only with Lark)
   GET  /health         — health probe
+  POST /web/h5/*       — the page inside Lark; a Lark h5 code is the proof
+  POST /web/*          — the page in a browser; behind a JWT authorizer for the web client
 Signature verification + AES event decryption happen inside the Lambda
 (fail-closed). Processing is async: the sync path validates + returns 200 fast,
 then self-invokes for the actual agent call.
@@ -15,6 +17,7 @@ from aws_cdk import (
     RemovalPolicy,
     Stack,
     aws_apigatewayv2 as apigwv2,
+    aws_apigatewayv2_authorizers as apigwv2_authorizers,
     aws_apigatewayv2_integrations as apigwv2_integrations,
     aws_dynamodb as dynamodb,
     aws_iam as iam,
@@ -42,6 +45,9 @@ class RouterStack(Stack):
         user_pool_client_id: str,
         cognito_password_secret_name: str,
         web_allowed_origins: str = "",
+        web_client_id: str = "",
+        cognito_issuer_url: str = "",
+        lark_enabled: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -98,8 +104,8 @@ class RouterStack(Stack):
                 # Without this the code assumed 60s and cut the agent off early,
                 # leaving part of the Lambda's budget unused.
                 "LAMBDA_TIMEOUT_SECONDS": str(timeout),
-                # 3LO consent-wait: poll the vault so the user needn't re-send.
-                "LARK_OAUTH_PROVIDER": f"{prefix}-3lo",
+                # Empty without Lark: then there is no Lark provider to offer.
+                "LARK_OAUTH_PROVIDER": f"{prefix}-3lo" if lark_enabled else "",
                 "AGENT_WORKLOAD_NAME": f"{prefix}-wl",
                 "LARK_SCOPES": "drive:drive docx:document offline_access",
                 # Per-IdP registry for /auth; written by scripts/setup-3lo.sh.
@@ -109,6 +115,8 @@ class RouterStack(Stack):
                 "COGNITO_USER_POOL_ID": user_pool_id,
                 "COGNITO_CLIENT_ID": user_pool_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
+                # The hosted login's client: its tokens are web users' (see index.py).
+                "COGNITO_WEB_CLIENT_ID": web_client_id,
             },
             log_group=log_group,
         )
@@ -125,30 +133,35 @@ class RouterStack(Stack):
         cors = apigwv2.CorsPreflightOptions(
             allow_origins=[o.strip() for o in web_allowed_origins.split(",") if o.strip()],
             allow_methods=[apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
-            allow_headers=["content-type"],
+            allow_headers=["content-type", "authorization"],
         ) if web_allowed_origins else None
         self.http_api = apigwv2.HttpApi(
             self, "RouterApi", api_name=f"{prefix}-router",
             description="Lark webhook ingestion (explicit routes only)",
             cors_preflight=cors,
         )
-        self.http_api.add_routes(
-            path="/webhook/lark", methods=[apigwv2.HttpMethod.POST], integration=integration,
-        )
+        if lark_enabled:
+            self.http_api.add_routes(
+                path="/webhook/lark", methods=[apigwv2.HttpMethod.POST], integration=integration,
+            )
         self.http_api.add_routes(
             path="/health", methods=[apigwv2.HttpMethod.GET], integration=integration,
         )
-        # The web entrypoint's identity step: an h5 authorization code in, a user JWT out.
-        self.http_api.add_routes(
-            path="/web/session", methods=[apigwv2.HttpMethod.POST],
-            integration=integration,
-        )
-        # Chat commands for the web page. Here rather than on the Runtime because they
-        # rotate session ids the router owns.
-        self.http_api.add_routes(
-            path="/web/command", methods=[apigwv2.HttpMethod.POST],
-            integration=integration,
-        )
+        # The page inside Lark: an h5 authorization code in, the user's token out; and the
+        # chat commands, here rather than on the Runtime because they rotate ids the router owns.
+        if lark_enabled:
+            for path in ("/web/h5/session", "/web/h5/command"):
+                self.http_api.add_routes(path=path, methods=[apigwv2.HttpMethod.POST],
+                                         integration=integration)
+        # The page in a browser: the hosted login's access token, verified here before the
+        # handler reads its sub, and forwarded to the Runtime, which verifies it again.
+        if web_client_id:
+            authorizer = apigwv2_authorizers.HttpJwtAuthorizer(
+                "WebLogin", cognito_issuer_url, jwt_audience=[web_client_id],
+                identity_source=["$request.header.Authorization"])
+            for path in ("/web/session", "/web/command", "/web/consent"):
+                self.http_api.add_routes(path=path, methods=[apigwv2.HttpMethod.POST],
+                                         integration=integration, authorizer=authorizer)
 
         # throttling on default stage
         default_stage = self.http_api.default_stage

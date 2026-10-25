@@ -42,7 +42,9 @@ CDK="npx --yes aws-cdk@2"
 # Every cdk deploy gets the same context: a deploy that omitted one would synth that stack
 # with the switch off and tear the resources out.
 CDK_CTX=(-c "deployment_name=$PREFIX" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY"
-         -c "agent_build=$AGENT_BUILD" -c "lark_api_domain=$LARK_API_DOMAIN" --output "$CDK_OUT")
+         -c "agent_build=$AGENT_BUILD" -c "lark_api_domain=$LARK_API_DOMAIN"
+         -c "webui=${WEBUI:-false}" -c "lark=$([ -n "${LARK_APP_ID:-}" ] && echo true || echo false)"
+         --output "$CDK_OUT")
 . scripts/lib/codebuild.sh
 
 # Control-plane calls whose parameters are newer than the AWS CLI's bundled service model.
@@ -207,7 +209,7 @@ phase2_runtime() {
   ensure_agent_image
   log "Runtime — create/update the agent Runtime from $AGENT_IMAGE"
 
-  local role image model memory shim mcp_arn mcp_url pool client ws_url
+  local role image model memory shim mcp_arn mcp_url pool client webclient ws_url
   local approval_url approval_arn issuer ckpt_table ckpt_bucket google_url google_arn
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
   image="$AGENT_IMAGE"
@@ -215,6 +217,9 @@ phase2_runtime() {
   ckpt_bucket="$(cfn_out "$PREFIX-agentcore" CheckpointBucketName)"
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
+  # The hosted login's client, when the web page is deployed: its tokens are web users'.
+  webclient="$(cfn_out "$PREFIX-security" WebClientId)"
+  if [ "$webclient" = "None" ]; then webclient=""; fi
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
   ws_url="$(ctx_get websearch_gateway_url)"
   model="$MODEL_ID"
@@ -267,6 +272,7 @@ phase2_runtime() {
 
   local rname="${PREFIX//-/_}_agent" params rid
   params="$(RNAME="$rname" IMAGE="$image" ROLE="$role" ISSUER="$issuer" CLIENT="$client" \
+    WEBCLIENT="$webclient" \
     MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
     SHIM="$shim" POOL="$pool" WS_URL="$ws_url" \
     APPROVAL_URL="$approval_url" FS_ARN="$fs_arn" CI_ID="$ci_id" PREFIX="$PREFIX" \
@@ -306,6 +312,7 @@ env = {
     "LARK_API_DOMAIN": e["LARK_DOMAIN"],
     "COGNITO_USER_POOL_ID": e["POOL"],
     "COGNITO_CLIENT_ID": e["CLIENT"],
+    "COGNITO_WEB_CLIENT_ID": e["WEBCLIENT"],
     "WEBSEARCH_GATEWAY_URL": e["WS_URL"],
     "APPROVAL_MCP_URL": e["APPROVAL_URL"],
     # Both empty unless the google server is deployed; the agent then has no Google tools.
@@ -343,7 +350,7 @@ print(json.dumps({
     # token derived from that identity, so the agent never names a user itself.
     "authorizerConfiguration": {"customJWTAuthorizer": {
         "discoveryUrl": e["ISSUER"] + "/.well-known/openid-configuration",
-        "allowedClients": [e["CLIENT"]]}},
+        "allowedClients": [c for c in (e["CLIENT"], e.get("WEBCLIENT", "")) if c]}},
 }))
 PYEOF
 )"
@@ -485,6 +492,7 @@ phase_a2a() {
   params="$(RNAME="$rname" IMAGE="$image" ROLE="$role" PREFIX="$PREFIX" \
     ISSUER="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)" \
     CLIENT="$(cfn_out "$PREFIX-security" UserPoolClientId)" \
+    WEBCLIENT="$(cfn_out "$PREFIX-security" WebClientId | grep -v '^None$' || true)" \
     AGENT_ARN="$(aws bedrock-agentcore-control list-agent-runtimes \
       --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_agent'].agentRuntimeArn" \
       --output text | head -1)" \
@@ -515,7 +523,7 @@ print(json.dumps({
     "environmentVariables": {k: v for k, v in env.items() if v},
     "authorizerConfiguration": {"customJWTAuthorizer": {
         "discoveryUrl": e["ISSUER"] + "/.well-known/openid-configuration",
-        "allowedClients": [e["CLIENT"]]}},
+        "allowedClients": [c for c in (e["CLIENT"], e.get("WEBCLIENT", "")) if c]}},
 }))
 PYEOF
 )"
@@ -543,22 +551,49 @@ print(json.dumps(p))')" >/dev/null
 }
 
 
+# The first web user, from WEB_ADMIN_EMAIL, so a deployment can be signed in to at once —
+# self sign-up is off. Created only when absent, with a temporary password printed here once
+# (Cognito also emails it); the first sign-in replaces it.
+web_admin() {
+  [ -n "${WEB_ADMIN_EMAIL:-}" ] || { echo "  no WEB_ADMIN_EMAIL in .env — add a web user with scripts/manage-users.sh add <email>"; return 0; }
+  local pool tmp
+  pool="$(cfn_out "$PREFIX-security" UserPoolId)"
+  if aws cognito-idp admin-get-user --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" >/dev/null 2>&1; then
+    echo "  web user $WEB_ADMIN_EMAIL exists"
+    return 0
+  fi
+  tmp="Tmp$(openssl rand -hex 6)9"
+  aws cognito-idp admin-create-user --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" \
+    --temporary-password "$tmp" --desired-delivery-mediums EMAIL \
+    --user-attributes Name=email,Value="$WEB_ADMIN_EMAIL" Name=email_verified,Value=true >/dev/null
+  printf '\033[1;32m  sign in as %s with the temporary password %s\033[0m\n' "$WEB_ADMIN_EMAIL" "$tmp"
+}
+
+
 phase_webui() {
   log "WebUI — static web chat on S3 + CloudFront"
   if [ "${WEBUI:-false}" != "true" ]; then
     echo "  webui: off (set WEBUI=true in .env)"; return 0
   fi
-  $CDK deploy "$PREFIX-webui" -c webui=true "${CDK_CTX[@]}" \
-             --require-approval never
+  # The hosted login's client and domain come from the security stack, through state so the
+  # page's stack holds no reference to it.
+  ctx_set web_client_id "$(cfn_out "$PREFIX-security" WebClientId)"
+  ctx_set web_login_domain "$(cfn_out "$PREFIX-security" WebLoginDomain)"
+  $CDK deploy "$PREFIX-webui" "${CDK_CTX[@]}" --require-approval never
   local url
   url="$(cfn_out "$PREFIX-webui" WebUiUrl)"
-  # The router must allow this origin to trade an h5 code for a JWT, and CloudFront only
-  # assigns the domain now — so it travels through .cdk-state.<name>.json and the router is
-  # re-deployed, the same route the file system id takes.
+  # CloudFront only assigns the domain now, and three stacks need it: the hosted login's
+  # callback (security), CORS (router), and where a web user's consent goes back (shim).
+  # It travels through .cdk-state.<name>.json, the same route the file system id takes.
   ctx_set web_origin "$url"
-  $CDK deploy "$PREFIX-router" -c webui=true "${CDK_CTX[@]}" \
+  $CDK deploy "$PREFIX-security" "$PREFIX-shim" "$PREFIX-router" "${CDK_CTX[@]}" \
              --exclusively --require-approval never
-  log "Web chat: $url  (register this domain on the Lark h5 app)"
+  log "Web chat: $url"
+  web_admin
+  if [ -n "${LARK_APP_ID:-}" ]; then
+    echo "  inside Lark: register this domain on the Lark h5 app (docs/console-setup.md)"
+  fi
+  echo "  add a web user: scripts/manage-users.sh add <email>"
 }
 
 

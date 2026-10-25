@@ -26,7 +26,7 @@ from stacks import retention_days
 
 class ShimStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, *, lark_api_domain: str,
-                 lark_secret_name: str, **kwargs) -> None:
+                 lark_secret_name: str, web_url: str = "", **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         prefix = self.node.get_context("deployment_name")
@@ -55,7 +55,9 @@ class ShimStack(Stack):
                          # Lets /return DM the user once consent completes.
                          "LARK_SECRET_ID": lark_secret_name,
                          # /return pokes this to replay the message that hit the wall.
-                         "ROUTER_FUNCTION_NAME": router_function},
+                         "ROUTER_FUNCTION_NAME": router_function,
+                         # Where a web user's consent goes back to be completed.
+                         **({"WEB_URL": web_url} if web_url else {})},
             log_group=log_group,
         )
         # Invoke the router for consent-resume. Scoped to that one function by ARN

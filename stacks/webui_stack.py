@@ -1,12 +1,9 @@
 """WebUI stack — the static web chat page on S3 behind CloudFront.
 
-Nothing dynamic lives here. The page's two hops go straight to the router (to trade a Lark
-h5 code for a user JWT) and to the AgentCore Runtime (AG-UI over SSE), so this stack owns
-no compute and no state — only the bucket, the distribution, and the two values the page
-needs injected at deploy time.
-
-Off by default: Lark requires an h5 app registered against this distribution's domain, so
-deploying it without doing that in the console produces a page nobody can use.
+Nothing dynamic lives here. The page signs in at the Cognito hosted login (or, inside the
+Lark client, trades a Lark h5 code at the router), then talks to the router for commands and
+straight to the AgentCore Runtime for chat (AG-UI over SSE). So this stack owns no compute
+and no state — only the bucket, the distribution, and the values injected at deploy time.
 """
 
 from aws_cdk import (
@@ -29,6 +26,8 @@ class WebUiStack(Stack):
         *,
         router_api_url: str,
         lark_app_id: str,
+        web_client_id: str = "",
+        web_login_domain: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -61,10 +60,13 @@ class WebUiStack(Stack):
             ),
         )
 
-        # Injected rather than built: the page needs the router's URL and the Lark app id,
-        # and a build step for two constants is not worth a toolchain.
+        # Injected rather than built: a build step for a few constants is not worth a
+        # toolchain. LARK_APP_ID is empty without Lark, and the hosted-login pair empty until
+        # the second webui pass (scripts/provision.sh).
         config = (f"window.ROUTER_BASE={router_api_url.rstrip('/')!r};"
-                  f"window.LARK_APP_ID={lark_app_id!r};")
+                  f"window.LARK_APP_ID={lark_app_id!r};"
+                  f"window.WEB_CLIENT_ID={web_client_id!r};"
+                  f"window.WEB_LOGIN_DOMAIN={web_login_domain.rstrip('/')!r};")
         s3deploy.BucketDeployment(
             self,
             "WebUiContent",
