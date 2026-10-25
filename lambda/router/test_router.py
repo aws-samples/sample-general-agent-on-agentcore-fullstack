@@ -721,7 +721,7 @@ def test_complete_consent_names_the_user_by_token_not_by_id():
     with that identity. Passing userId fails as `Invalid or expired session`, which reads
     like a timing bug and is really a namespace mismatch (measured)."""
     import index
-    with mock.patch.object(index.cognito, "user_jwt", return_value="JWT-FOR-U"), \
+    with mock.patch.object(index.cognito, "consent_tokens", return_value=["JWT-FOR-U"]), \
          mock.patch.object(index, "agentcore") as ac:
         index.complete_consent("lark:ou_u", "sess-uri")
     ac.complete_resource_token_auth.assert_called_once_with(
@@ -777,7 +777,7 @@ def test_web_session_requires_a_lark_code_and_never_trusts_an_open_id():
     """The browser proves identity with a single-use code Lark issued to this app inside the
     Lark client. Accepting an open_id instead would let anyone name anyone."""
     import index, inspect
-    src = inspect.getsource(index._web_identity) + inspect.getsource(index._web_session)
+    src = inspect.getsource(index._h5_identity) + inspect.getsource(index._h5_session)
     assert "open_id_from_auth_code" in src
     assert 'payload.get("openId")' not in src and 'payload.get("open_id")' not in src
 
@@ -824,7 +824,7 @@ class _ctx:
 def test_web_session_refuses_an_unexchangeable_code():
     import index
     with mock.patch.object(index.lark, "open_id_from_auth_code", return_value=""):
-        assert index._web_session('{"code": "bad"}')["statusCode"] == 401
+        assert index._h5_session('{"code": "bad"}')["statusCode"] == 401
 
 
 def test_run_command_returns_text_and_never_sends_it_itself():
@@ -857,8 +857,8 @@ def test_web_command_refuses_anything_that_is_not_a_command():
     with mock.patch.object(index.lark, "open_id_from_auth_code", return_value="ou_x"), \
          mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
          mock.patch.object(identity, "is_user_allowed", return_value=True):
-        assert index._web_command('{"code":"c","command":"你好"}')["statusCode"] == 400
-        r = index._web_command('{"code":"c","command":"/help"}')
+        assert index._h5_command('{"code":"c","command":"你好"}')["statusCode"] == 400
+        r = index._h5_command('{"code":"c","command":"/help"}')
     assert r["statusCode"] == 200 and "/status" in json.loads(r["body"])["text"]
 
 
@@ -866,7 +866,7 @@ def test_web_command_establishes_identity_per_request():
     """It rotates session ids, so it cannot trust a token the page is holding."""
     import index
     with mock.patch.object(index.lark, "open_id_from_auth_code", return_value="") as ex:
-        assert index._web_command('{"code":"bad","command":"/status"}')["statusCode"] == 401
+        assert index._h5_command('{"code":"bad","command":"/status"}')["statusCode"] == 401
     assert ex.call_count == 1
 
 
@@ -887,7 +887,7 @@ def test_web_session_honours_the_allowlist():
     with mock.patch.object(index.lark, "open_id_from_auth_code", return_value="ou_x"), \
          mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
          mock.patch.object(identity, "is_user_allowed", return_value=False):
-        assert index._web_session('{"code": "c"}')["statusCode"] == 403
+        assert index._h5_session('{"code": "c"}')["statusCode"] == 403
 
 
 def test_web_session_hands_back_the_same_routing_key_lark_chat_uses():
@@ -902,7 +902,7 @@ def test_web_session_hands_back_the_same_routing_key_lark_chat_uses():
          mock.patch.object(identity, "get_or_create_session", return_value="ses_shared"), \
          mock.patch.object(identity, "get_or_create_memory_session", return_value="sess_mem"), \
          mock.patch.object(index.cognito, "user_jwt", return_value="JWT"):
-        r = index._web_session('{"code": "c"}')
+        r = index._h5_session('{"code": "c"}')
     body = json.loads(r["body"])
     assert r["statusCode"] == 200 and body["token"] == "JWT"
     assert body["runtimeSessionId"] == "ses_shared"
@@ -946,3 +946,96 @@ def test_status_shows_who_serves_you_and_points_at_the_rest():
     for pointer in ("/context", "/model", "/tools", "/auth"):
         assert pointer in block, pointer
     assert "thread_stats" not in block, "turns and context size belong to /context"
+
+
+# --------------------------- the web page outside Lark -------------------------
+# A web user signs in at the hosted login and everything is done with their own token: the
+# router can mint only for Lark users, and only the token a consent was started with can
+# complete it.
+
+def _web_event(claims, token="tok-web"):
+    return {"requestContext": {"authorizer": {"jwt": {"claims": claims}}},
+            "headers": {"authorization": f"Bearer {token}"}}
+
+
+def test_a_web_caller_is_web_sub_and_only_from_the_web_client():
+    import index, identity
+    good = {"sub": "s-1", "client_id": "web-client", "username": "carol@example.com"}
+    with mock.patch.object(index, "_WEB_CLIENT_ID", "web-client"), \
+         mock.patch.object(identity, "resolve_user", return_value=("u-web", True)):
+        assert index._web_caller(_web_event(good))[1:3] == ("web:s-1", "tok-web")
+        assert index._web_caller(_web_event({**good, "client_id": "router"}))[3]["statusCode"] == 401
+        assert index._web_caller(_web_event({**good, "username": "lark:ou_x"}))[3]["statusCode"] == 403
+    # The pool is a web user's allowlist: no ALLOW# entry, registration closed or not.
+    with mock.patch.object(identity, "_REGISTRATION_OPEN", False):
+        assert identity.is_user_allowed("web", "s-1") is True
+
+
+def test_a_web_command_reaches_the_agent_with_the_callers_own_token():
+    """Minting for `web:{sub}` would create a shadow Cognito user whose vault namespace is
+    not the page's: /auth and /tools would read somebody else's grants."""
+    import index, identity
+    seen = []
+
+    def fake_urlopen(req, timeout=0):
+        seen.append(req.headers["Authorization"])
+        raise RuntimeError("stop here")
+    claims = {"sub": "s-1", "client_id": "web-client", "username": "carol@example.com"}
+    with mock.patch.object(index, "_WEB_CLIENT_ID", "web-client"), \
+         mock.patch.object(identity, "resolve_user", return_value=("u-web", True)), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
+         mock.patch.object(identity, "session_info", return_value={"sessionId": "ses_x"}), \
+         mock.patch.object(identity, "get_or_create_memory_session", return_value="m"), \
+         mock.patch.object(index.cognito, "user_jwt", side_effect=AssertionError("minted")), \
+         mock.patch.object(index.urllib.request, "urlopen", fake_urlopen):
+        index._web_command(_web_event(claims), '{"command": "/model"}')
+    assert seen and all(h == "Bearer tok-web" for h in seen)
+    assert index._caller_bearer.get() == ""        # not left set for the next request
+
+
+def test_a_consent_is_completed_only_with_a_token_it_can_have_been_started_with():
+    import index
+    calls = []
+
+    def complete(sessionUri, userIdentifier):
+        calls.append(userIdentifier["userToken"])
+        if userIdentifier["userToken"] != "previous":
+            raise RuntimeError("Invalid or expired session")
+        return {}
+    with mock.patch.object(index.agentcore, "complete_resource_token_auth", side_effect=complete), \
+         mock.patch.object(index.cognito, "consent_tokens", return_value=["current", "previous"]), \
+         mock.patch.object(index.cognito, "user_jwt", side_effect=AssertionError("minted")):
+        index.complete_consent("lark:ou_x", "urn:s")             # a Lark user: both stored ones
+        assert calls == ["current", "previous"]
+        calls.clear()
+        with pytest.raises(RuntimeError):
+            index.complete_consent("web:s-1", "urn:s", bearer="page-token")
+        assert calls == ["page-token"]                          # a web user: theirs alone
+
+
+def test_a_lark_users_token_is_shared_and_renewed_by_a_conditional_write():
+    import cognito, time as _t
+    from botocore.exceptions import ClientError
+    table = mock.Mock()
+    fresh = {"current": "tok-a", "currentExp": int(_t.time()) + 3000}
+    table.get_item.return_value = {"Item": fresh}
+    with mock.patch.object(cognito, "_table", table), \
+         mock.patch.object(cognito, "configured", return_value=True), \
+         mock.patch.object(cognito, "_mint", side_effect=AssertionError("minted")):
+        assert cognito.user_jwt("lark:ou_x") == "tok-a"          # every container, same token
+        with pytest.raises(ValueError):
+            cognito.user_jwt("web:s-1")
+    stale = {"current": "tok-a", "currentExp": int(_t.time()) + 60}
+    table.get_item.side_effect = [{"Item": stale}, {"Item": {"current": "tok-winner"}}]
+    table.put_item.side_effect = ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
+    with mock.patch.object(cognito, "_table", table), \
+         mock.patch.object(cognito, "configured", return_value=True), \
+         mock.patch.object(cognito, "_mint", return_value="x.eyJleHAiOjk5OTk5OTk5OTl9.y"):
+        assert cognito.user_jwt("lark:ou_x") == "tok-winner"     # lost the race: the winner's
+    kw = table.put_item.call_args.kwargs
+    assert kw["Item"]["previous"] == "tok-a" and kw["ExpressionAttributeValues"] == {":seen": "tok-a"}
+    table.get_item.side_effect = None
+    table.get_item.return_value = {"Item": {"current": "c", "currentExp": int(_t.time()) + 100,
+                                            "previous": "p", "previousExp": int(_t.time()) - 1}}
+    with mock.patch.object(cognito, "_table", table):
+        assert cognito.consent_tokens("lark:ou_x") == ["c"]      # an expired one is not tried

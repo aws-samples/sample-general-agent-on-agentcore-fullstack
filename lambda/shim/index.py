@@ -33,7 +33,7 @@ logger.setLevel(logging.INFO)
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 # Token host, e.g. https://open.larksuite.com (or open.feishu.cn).
-_TOKEN_DOMAIN = os.environ["LARK_API_DOMAIN"].rstrip("/")
+_TOKEN_DOMAIN = os.environ.get("LARK_API_DOMAIN", "https://open.larksuite.com").rstrip("/")
 
 
 def _authorize_domain(api_domain: str) -> str:
@@ -58,6 +58,8 @@ _LARK_SECRET_ID = os.environ.get("LARK_SECRET_ID", "")
 # Empty → no resume (consent still completes; the user just re-sends). Passed in
 # rather than hardcoded so the name stays owned by the router stack.
 _ROUTER_FUNCTION = os.environ.get("ROUTER_FUNCTION_NAME", "")
+# The web page, for a consent a web user started: they complete it there (see /return).
+_WEB_URL = os.environ.get("WEB_URL", "").rstrip("/")
 _lambda = boto3.client("lambda", region_name=_REGION)
 
 
@@ -210,6 +212,15 @@ def handle_return(qs: dict) -> dict:
         return _resp(400, {"error": "missing session_id", "received": qs})
     if not user_id:
         return _resp(400, {"error": "missing state/uid (userId)", "received": qs})
+    # A web user's consent can only be completed with the token their page started it with,
+    # which the router does not hold — so the browser goes back to the page, which completes
+    # it with that token. Only a Lark user's is completed here.
+    if not user_id.startswith("lark:"):
+        if not _WEB_URL:
+            return _page(400, "Authorization failed", "No web page is configured to finish this.")
+        return {"statusCode": 302, "headers": {
+            "Location": f"{_WEB_URL}/#consent={urllib.parse.quote(session_id, safe='')}",
+            "Cache-Control": "no-store"}, "body": ""}
     # Completion is delegated to the router, synchronously: the consent session lives in
     # the JWT-derived vault namespace, so it can only be completed by naming the user
     # with their signed token — and the router is the one component that mints those.

@@ -9,8 +9,13 @@ Access tokens, not id tokens: `client_id` (which authorizers match on) is only i
 access token, and it is the access token AgentCore derives the vault identity from.
 
 Passwords are HMAC-derived from a Secrets Manager salt, so they are deterministic and
-never stored. Same scheme as agent/identity.py — that copy stays, it mints the token
-the web-search Gateway authorises with.
+never stored. Only Lark users are minted for: a web user signs in with their own password,
+which a reset here would overwrite.
+
+One token per Lark user, shared by every router container through the identity table. A
+consent can only be completed with the very token it was started with (measured — see
+docs/agentcore-behavior.md), and a per-container cache handed the completion a different
+one whenever the consent came back to another container.
 """
 
 from __future__ import annotations
@@ -32,12 +37,16 @@ _REGION = os.environ.get("AWS_REGION", "us-west-2")
 _USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 _CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
 _PASSWORD_SECRET_ID = os.environ.get("COGNITO_PASSWORD_SECRET_ID", "")
+_TABLE_NAME = os.environ.get("IDENTITY_TABLE_NAME", "")
+# Renewed when less than this remains, so a turn never starts on a token about to expire;
+# the one it replaces is kept as `previous` for consents started with it.
+_RENEW_SECONDS = 20 * 60
 
 _cognito = boto3.client("cognito-idp", region_name=_REGION)
 _secrets = boto3.client("secretsmanager", region_name=_REGION)
+_table = boto3.resource("dynamodb", region_name=_REGION).Table(_TABLE_NAME) if _TABLE_NAME else None
 
 _salt: str | None = None
-_cache: dict[str, tuple[str, float]] = {}   # username -> (access_token, exp_epoch)
 
 
 def configured() -> bool:
@@ -85,17 +94,7 @@ def _exp(token: str) -> float:
         return 0.0
 
 
-def user_jwt(actor_id: str) -> str:
-    """A valid Cognito access token for `actor_id` ("lark:{open_id}").
-
-    Cached with a 60 s early-refresh margin; provisions the user on first use.
-    """
-    if not configured():
-        raise RuntimeError("Cognito env not configured "
-                           "(COGNITO_USER_POOL_ID / CLIENT_ID / PASSWORD_SECRET_ID)")
-    hit = _cache.get(actor_id)
-    if hit and time.time() < hit[1] - 60:
-        return hit[0]
+def _mint(actor_id: str) -> str:
     _ensure_user(actor_id)
     params = {"USERNAME": actor_id, "PASSWORD": _password(actor_id)}
     try:
@@ -113,6 +112,54 @@ def user_jwt(actor_id: str) -> str:
         resp = _cognito.admin_initiate_auth(
             UserPoolId=_USER_POOL_ID, ClientId=_CLIENT_ID,
             AuthFlow="ADMIN_USER_PASSWORD_AUTH", AuthParameters=params)
-    token = resp["AuthenticationResult"]["AccessToken"]
-    _cache[actor_id] = (token, _exp(token))
+    return resp["AuthenticationResult"]["AccessToken"]
+
+
+def _key(actor_id: str) -> dict:
+    return {"PK": f"TOKEN#{actor_id}", "SK": "LARK"}
+
+
+def _stored(actor_id: str) -> dict:
+    return _table.get_item(Key=_key(actor_id), ConsistentRead=True).get("Item") or {}
+
+
+def user_jwt(actor_id: str) -> str:
+    """The Lark user's shared access token, renewed when under _RENEW_SECONDS remain.
+
+    Renewal is a conditional write on the token it replaces: two containers renewing at once
+    must not each go on with a token of their own, or the one that lost holds a token no
+    completion will try. The loser re-reads and uses the winner's."""
+    if not configured():
+        raise RuntimeError("Cognito env not configured "
+                           "(COGNITO_USER_POOL_ID / CLIENT_ID / PASSWORD_SECRET_ID)")
+    if not actor_id.startswith("lark:"):
+        raise ValueError(f"tokens are minted for Lark users only, not {actor_id!r}")
+    item = _stored(actor_id)
+    if item.get("current") and float(item.get("currentExp", 0)) - time.time() > _RENEW_SECONDS:
+        return item["current"]
+    token = _mint(actor_id)
+    exp = _exp(token)
+    try:
+        _table.put_item(
+            Item={**_key(actor_id), "current": token, "currentExp": int(exp),
+                  "previous": item.get("current", ""), "previousExp": int(item.get("currentExp", 0)),
+                  "ttl": int(exp)},
+            ConditionExpression=("attribute_not_exists(PK)" if not item.get("current")
+                                 else "#c = :seen"),
+            **({"ExpressionAttributeNames": {"#c": "current"},
+                "ExpressionAttributeValues": {":seen": item["current"]}}
+               if item.get("current") else {}))
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        return _stored(actor_id)["current"]
     return token
+
+
+def consent_tokens(actor_id: str) -> list[str]:
+    """The tokens a consent of this Lark user can have been started with, newest first —
+    read only: completing with a token minted now would be the one token that cannot work."""
+    item = _stored(actor_id)
+    now = time.time()
+    return [item[k] for k in ("current", "previous")
+            if item.get(k) and float(item.get(k + "Exp", 0)) > now]

@@ -208,6 +208,21 @@ def test_an_api_domain_it_cannot_map_is_refused():
             index._authorize_domain(bad)
 
 
+def test_a_web_users_consent_goes_back_to_the_page_to_be_completed():
+    """Only the token a consent was started with can complete it, and for a web user that is
+    the page's — the router does not hold it. So nothing is completed here."""
+    import base64
+    st = base64.urlsafe_b64encode(b"web:sub-1").decode().rstrip("=")
+    with mock.patch.object(index, "_WEB_URL", "https://d1.cloudfront.net"), \
+         mock.patch.object(index, "_lambda") as lam:
+        r = index.handler(_evt("GET", "/return",
+                               qs={"session_id": "urn:ietf:params:oauth:request_uri:abc", "state": st}), None)
+    assert r["statusCode"] == 302
+    assert r["headers"]["Location"] == ("https://d1.cloudfront.net/#consent="
+                                        "urn%3Aietf%3Aparams%3Aoauth%3Arequest_uri%3Aabc")
+    assert lam.invoke.call_count == 0
+
+
 def test_the_done_page_links_back_to_the_bot_chat_in_the_lark_client():
     """Lark opened this tab, so it cannot close itself; one tap gets the user back."""
     import base64

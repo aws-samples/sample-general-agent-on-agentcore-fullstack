@@ -34,7 +34,9 @@ _table = boto3.resource("dynamodb", region_name=_REGION).Table(_TABLE_NAME)
 
 
 def is_user_allowed(channel: str, channel_user_id: str) -> bool:
-    if _REGISTRATION_OPEN:
+    # A web user exists only because an admin created them in the Cognito pool, and only a
+    # token that pool signed for the web client gets this far: the pool is their allowlist.
+    if _REGISTRATION_OPEN or channel == "web":
         return True
     key = f"{channel}:{channel_user_id}"
     resp = _table.get_item(Key={"PK": f"ALLOW#{key}", "SK": "ALLOW"})

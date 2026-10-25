@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import base64
+import contextvars
 import json
 import logging
 import os
@@ -83,6 +84,12 @@ def thread_stats(session_id: str, user_id: str, actor_id: str, mem_sid: str) -> 
     return {} if r.get("unavailable") else r
 
 
+# The caller's own access token, for a web request: everything done for a web user is done
+# with their token — the router can mint only for Lark users, and a consent can only be
+# completed with the token that started it. Unset on the Lark paths, which mint.
+_caller_bearer: contextvars.ContextVar[str] = contextvars.ContextVar("caller_bearer", default="")
+
+
 def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
                  action: str = "chat", mem_sid: str = "",
                  budget: float | None = None, chat_id: str = "",
@@ -119,7 +126,7 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
             # The identity of this turn, signed. The Runtime validates it and hands the
             # agent a workload access token derived from it — the agent cannot name a
             # different user, because it never gets to state one.
-            "Authorization": f"Bearer {cognito.user_jwt(actor_id)}",
+            "Authorization": f"Bearer {_caller_bearer.get() or cognito.user_jwt(actor_id)}",
             "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
         },
     )
@@ -366,8 +373,9 @@ def _secs(seconds) -> str:
 # How long the async Lambda holds, waiting for the user to finish 3LO consent.
 # Bounded by the Lambda timeout (see the agentcore read_timeout above); on
 # timeout we fall back to "send your message again".
-LARK_OAUTH_PROVIDER = os.environ["LARK_OAUTH_PROVIDER"]
-AGENT_WORKLOAD_NAME = os.environ["AGENT_WORKLOAD_NAME"]
+# Empty when the deployment has no Lark.
+LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "")
+AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "")
 LARK_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # required by GetResourceOauth2Token
 
@@ -381,6 +389,8 @@ def _load_idps() -> dict:
             return {i["key"]: i for i in json.loads(raw)}
         except Exception:
             logger.exception("bad IDP_REGISTRY, falling back to single provider")
+    if not LARK_OAUTH_PROVIDER:
+        return {}
     return {"lark": {"key": "lark", "provider": LARK_OAUTH_PROVIDER,
                      "scopes": LARK_SCOPES, "label": "Lark"}}
 
@@ -417,25 +427,30 @@ def _jwt_claim(token: str, name: str) -> str:
         return "?"
 
 
-def complete_consent(actor_id: str, session_uri: str) -> None:
-    """Bind a finished 3LO consent to this user's signed identity.
+def complete_consent(actor_id: str, session_uri: str, bearer: str = "") -> None:
+    """Bind a finished 3LO consent to the token it was started with.
 
-    Called by the shim's /return, which owns the browser redirect but deliberately not
-    the identity: minting user JWTs stays in one place. `userToken`, not `userId` — the
-    consent session belongs to the JWT-derived vault namespace, and naming the user by
-    string instead fails with `AccessDeniedException: Invalid or expired session`, which
-    reads like a timing problem and is really a namespace mismatch (measured)."""
-    jwt = cognito.user_jwt(actor_id)
-    # Logged before the call, because a failure raises and would otherwise say nothing about
-    # which session was refused. jwt_id identifies the token *instance*: the completion may
-    # need the same one the session was opened with, not merely one for the same user.
-    logger.info("completing consent for %s: session=%s jwt_sub=%s jwt_id=%s",
-                actor_id, session_uri[-24:], _jwt_claim(jwt, "sub"),
-                hashlib.sha256(jwt.encode()).hexdigest()[:12])
-    resp = agentcore.complete_resource_token_auth(
-        sessionUri=session_uri,
-        userIdentifier={"userToken": jwt},
-    )
+    Only that very token completes it; another token of the same user, a refreshed one
+    included, gets `Invalid or expired session` (measured). A web user's page sends the token
+    its `/auth` ran with as `bearer`. A Lark user's consent was started with their shared
+    token, which may have been renewed since, so both stored ones are tried — a failed
+    attempt does not spend the session. Nothing is minted here: a new token is the one that
+    cannot work. `userToken`, not `userId`: naming the user by string fails the same way."""
+    tokens = [bearer] if bearer else cognito.consent_tokens(actor_id)
+    if not tokens:
+        raise RuntimeError("no token this consent can have been started with (expired)")
+    last = None
+    for jwt in tokens:
+        logger.info("completing consent for %s: session=%s jwt_id=%s",
+                    actor_id, session_uri[-24:], hashlib.sha256(jwt.encode()).hexdigest()[:12])
+        try:
+            resp = agentcore.complete_resource_token_auth(
+                sessionUri=session_uri, userIdentifier={"userToken": jwt})
+            break
+        except Exception as e:  # noqa: BLE001 — the next stored token may be the one
+            last = e
+    else:
+        raise last
     # This call returning without raising is NOT evidence that a grant was stored: a
     # consent completed here has been observed to leave the vault empty for every reader
     # (both namespaces, every scope set), so log what identity and session it actually
@@ -951,9 +966,12 @@ def _resp(status: int, body: dict) -> dict:
 # The allowlisted origin is set in stacks/router_stack.py from web_origin.
 
 
-def _web_identity(payload: dict) -> tuple[str, str, dict | None]:
-    """(user_id, actor_id, error_response). A fresh h5 code each time, because that is what
-    makes the identity established rather than claimed."""
+_WEB_CLIENT_ID = os.environ.get("COGNITO_WEB_CLIENT_ID", "")
+
+
+def _h5_identity(payload: dict) -> tuple[str, str, dict | None]:
+    """(user_id, actor_id, error_response) for the page opened inside Lark. A fresh h5 code
+    each time, because that is what makes the identity established rather than claimed."""
     open_id = lark.open_id_from_auth_code(payload.get("code", ""))
     if not open_id:
         return "", "", _resp(401, {"error": "could not establish identity from that code"})
@@ -965,50 +983,129 @@ def _web_identity(payload: dict) -> tuple[str, str, dict | None]:
     return user_id, actor_id, None
 
 
-def _web_command(body: str) -> dict:
-    """{code, command} -> {text, link?}. The chat commands, on the web surface.
+def _web_caller(event: dict) -> tuple[str, str, str, dict | None]:
+    """(user_id, actor_id, bearer, error_response) for a page signed in at the hosted login.
 
-    The page cannot run these against the Runtime: they rotate router-owned session ids and
-    read the identity table, which the agent has no access to by design."""
-    try:
-        payload = json.loads(body or "{}")
-    except Exception:  # noqa: BLE001
-        return _resp(400, {"error": "invalid JSON"})
-    user_id, actor_id, err = _web_identity(payload)
-    if err:
-        return err
-    reply = run_command((payload.get("command") or "").strip(), user_id, actor_id)
-    if reply is None:
-        return _resp(400, {"error": "not a command"})
-    return _resp(200, reply)
+    API Gateway's JWT authorizer has verified the token; this only reads what it verified.
+    The web client's users are `web:{sub}` — the same rule as agent/caller.py, which checks
+    the token again when it is forwarded."""
+    claims = (((event.get("requestContext") or {}).get("authorizer") or {})
+              .get("jwt") or {}).get("claims") or {}
+    sub = claims.get("sub", "")
+    if not sub or not _WEB_CLIENT_ID or claims.get("client_id") != _WEB_CLIENT_ID:
+        return "", "", "", _resp(401, {"error": "sign in on the web page first"})
+    if str(claims.get("username", "")).startswith("lark:"):
+        return "", "", "", _resp(403, {"error": "Lark users sign in through Lark"})
+    auth = ((event.get("headers") or {}).get("authorization") or "")
+    bearer = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") else ""
+    user_id, _ = identity.resolve_user("web", sub)
+    return user_id, f"web:{sub}", bearer, None
 
 
-def _web_session(body: str) -> dict:
-    """{code} -> {token, runtimeArn, region, threadId}. The code proves who is asking."""
-    try:
-        payload = json.loads(body or "{}")
-    except Exception:  # noqa: BLE001
-        return _resp(400, {"error": "invalid JSON"})
-    user_id, actor_id, err = _web_identity(payload)
-    if err:
-        return err
-    logger.info("web session issued for %s", actor_id)
-    return _resp(200, {
-        "token": cognito.user_jwt(actor_id),
+def _session_body(user_id: str, actor_id: str) -> dict:
+    return {
         # Echoed so the page can name itself. Not a credential: the agent takes the actor
         # from the token and refuses a payload naming anybody else.
         "actorId": actor_id,
         # The same routing key Lark chat uses, so both surfaces land on one microVM and one
         # conversation. AgentCore maps a session id to exactly one microVM, which is what
         # lets the agent serialise two surfaces' turns in process instead of needing a
-        # distributed lock — see docs/architecture.md. Neither id is a credential: one routes, the
-        # other names a thread, and without the JWT above neither does anything.
+        # distributed lock — see docs/architecture.md. Neither id is a credential: one routes,
+        # the other names a thread the agent checks against the token's actor.
         "runtimeSessionId": identity.get_or_create_session(user_id),
         "memorySessionId": identity.get_or_create_memory_session(user_id, actor_id),
         "runtimeArn": RUNTIME_ARN,
         "region": os.environ.get("AWS_REGION", ""),
         "qualifier": QUALIFIER,
-    })
+    }
+
+
+def _json_body(body: str) -> tuple[dict, dict | None]:
+    try:
+        return json.loads(body or "{}"), None
+    except Exception:  # noqa: BLE001
+        return {}, _resp(400, {"error": "invalid JSON"})
+
+
+def _command(message: str, user_id: str, actor_id: str, bearer: str = "") -> dict:
+    """The chat commands, on the web surface. Router-side because they rotate ids the router
+    owns and read the identity table, which the agent has no access to by design."""
+    tok = _caller_bearer.set(bearer)
+    try:
+        reply = run_command(message.strip(), user_id, actor_id)
+    finally:
+        _caller_bearer.reset(tok)
+    if reply is None:
+        return _resp(400, {"error": "not a command"})
+    return _resp(200, reply)
+
+
+def _h5_command(body: str) -> dict:
+    """{code, command} -> {text, link?}."""
+    payload, err = _json_body(body)
+    if err:
+        return err
+    user_id, actor_id, err = _h5_identity(payload)
+    return err or _command(payload.get("command") or "", user_id, actor_id)
+
+
+def _h5_session(body: str) -> dict:
+    """{code} -> {token, runtimeArn, …}. The code proves who is asking; the token is the
+    user's shared one, so a consent the page starts completes like one started in chat."""
+    payload, err = _json_body(body)
+    if err:
+        return err
+    user_id, actor_id, err = _h5_identity(payload)
+    if err:
+        return err
+    logger.info("web session issued for %s", actor_id)
+    return _resp(200, {"token": cognito.user_jwt(actor_id), **_session_body(user_id, actor_id)})
+
+
+def _web_session(event: dict) -> dict:
+    """{} -> {runtimeArn, runtimeSessionId, …} for a signed-in web user. No token: the page
+    has its own."""
+    user_id, actor_id, _, err = _web_caller(event)
+    if err:
+        return err
+    return _resp(200, _session_body(user_id, actor_id))
+
+
+def _web_command(event: dict, body: str) -> dict:
+    payload, err = _json_body(body)
+    if err:
+        return err
+    user_id, actor_id, bearer, err = _web_caller(event)
+    return err or _command(payload.get("command") or "", user_id, actor_id, bearer)
+
+
+def _web_consent(event: dict, body: str) -> dict:
+    """{sessionId} -> {ok}. Completes a consent the page started through `/auth`, with the
+    token it is called with — the page sends the one that `/auth` ran with, since only that
+    token can complete it — then has the agent drop the session cached without the grant."""
+    payload, err = _json_body(body)
+    if err:
+        return err
+    user_id, actor_id, bearer, err = _web_caller(event)
+    if err:
+        return err
+    session_uri = payload.get("sessionId") or ""
+    if not session_uri.startswith("urn:ietf:params:oauth:request_uri:"):
+        return _resp(400, {"error": "sessionId required"})
+    try:
+        complete_consent(actor_id, session_uri, bearer)
+    except Exception as e:  # noqa: BLE001 — reported to the page
+        logger.warning("web consent failed for %s: %s", actor_id, e)
+        return _resp(200, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+    tok = _caller_bearer.set(bearer)
+    try:
+        invoke_agent(identity.get_or_create_session(user_id), user_id, actor_id, "",
+                     action="refresh_session")
+    except Exception:  # noqa: BLE001 — the grant is stored; the next build picks it up
+        logger.warning("could not refresh the agent session for %s", actor_id, exc_info=True)
+    finally:
+        _caller_bearer.reset(tok)
+    return _resp(200, {"ok": True})
 
 
 def handler(event, context):
@@ -1050,16 +1147,21 @@ def handler(event, context):
     if path.endswith("/health"):
         return _resp(200, {"status": "ok"})
 
-    # Web entrypoint: trade a Lark h5 authorization code for a token the browser can use to
-    # call the Runtime directly. The router stays the only place that mints user JWTs, and
-    # the code is what makes the identity verified rather than claimed.
-    if path.endswith("/web/session") and method == "POST":
-        return _web_session(body)
+    # The page inside Lark: a Lark h5 code proves who is asking. Unauthenticated routes,
+    # because the code is the proof.
+    if path.endswith("/web/h5/session") and method == "POST":
+        return _h5_session(body)
+    if path.endswith("/web/h5/command") and method == "POST":
+        return _h5_command(body)
 
-    # The chat commands, for the web surface. Router-side because they rotate ids the
-    # router owns; the agent cannot reach the identity table at all.
+    # The page in a browser, signed in at the hosted login: behind API Gateway's JWT
+    # authorizer, and everything is done with the caller's own token.
+    if path.endswith("/web/session") and method == "POST":
+        return _web_session(event)
     if path.endswith("/web/command") and method == "POST":
-        return _web_command(body)
+        return _web_command(event, body)
+    if path.endswith("/web/consent") and method == "POST":
+        return _web_consent(event, body)
 
     if not path.endswith("/webhook/lark"):
         return _resp(404, {"error": "not found"})

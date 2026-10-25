@@ -27,7 +27,7 @@ log = logging.getLogger("router.lark")
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 _SECRET_ID = os.environ.get("LARK_SECRET_ID", "")
-_API_DOMAIN = os.environ["LARK_API_DOMAIN"].rstrip("/")  # injected at deploy, from .env
+_API_DOMAIN = os.environ.get("LARK_API_DOMAIN", "https://open.larksuite.com").rstrip("/")
 # Reject webhook events whose timestamp is older than this (replay protection).
 _REPLAY_WINDOW_SECONDS = int(os.environ.get("LARK_REPLAY_WINDOW_SECONDS", "300"))
 _MAX_IMAGE_BYTES = 4 * 1024 * 1024
