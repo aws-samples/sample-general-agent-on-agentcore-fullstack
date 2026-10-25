@@ -12,10 +12,12 @@ would send a web user's file to whichever Lark chat was served last.
 
 from __future__ import annotations
 
+import base64
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 
+import deliveries
 import lark_notify
 
 log = logging.getLogger("agent.delivery")
@@ -34,7 +36,9 @@ class Delivery(ABC):
     @abstractmethod
     def send_file(self, name: str, data: bytes,
                   cover: Callable[[], bytes | None]) -> str:
-        """Send it, and report in a sentence the model can repeat to the user.
+        """Send it, and report in a sentence the model can repeat to the user — or (sentence,
+        artifact), the artifact being what the tool message keeps out of the model's sight,
+        such as a stored file's key, for a surface that shows it again later.
 
         `cover` is only called if this surface needs a still frame to render a video."""
 
@@ -105,8 +109,49 @@ class LarkDelivery(Delivery):
             return f"{name} was not sent. {e}"
 
 
+class WebDelivery(Delivery):
+    """Into the web page, on the turn's own event stream: an image shows inline, anything else
+    downloads. Stored first (agent/deliveries.py), so the event carries a link and a reload of
+    the page shows it again; without a bucket the bytes ride on the event itself and are gone
+    on reload. `out` collects CUSTOM events for the run's stream to write."""
+
+    # One SSE frame through the Runtime's proxy, and base64 adds a third: ~10.5 MB measured
+    # to pass intact. Kept for the stored path too, so the cap does not depend on storage.
+    MAX_BYTES = 8 * 1000 * 1000
+
+    def __init__(self, out: list, actor_id: str = "") -> None:
+        self.out = out
+        self.actor_id = actor_id
+
+    def refusal(self, name: str, size: int) -> str | None:
+        if size > self.MAX_BYTES:
+            return (f"{name} is {size / 1e6:.1f} MB and the web page takes 8 MB. "
+                    "Compress it or split it, then send again.")
+        return None
+
+    def send_file(self, name: str, data: bytes,
+                  cover: Callable[[], bytes | None]) -> str | tuple[str, dict]:
+        # The key is returned, not kept on this object: one run's tool calls can run in
+        # parallel, and a shared slot lost a file's record when two were sent at once.
+        if deliveries.configured() and self.actor_id:
+            try:
+                key = deliveries.put(self.actor_id, name, data)
+                self.out.append({"name": "file", "value": {
+                    "name": name, "size": len(data),
+                    "url": deliveries.url(key, name, self.actor_id)}})
+                return (f"Sent {name} to the page; it shows there and stays in the conversation.",
+                        {"file": {"key": key, "name": name, "size": len(data)}})
+            except Exception:  # noqa: BLE001 — the stream can still carry it
+                log.warning("could not store %s; sending it inline", name, exc_info=True)
+        self.out.append({"name": "file", "value": {
+            "name": name, "size": len(data), "data": base64.b64encode(data).decode()}})
+        # The stream is the only copy: what the model tells the user has to say so.
+        return (f"Sent {name} to the page, where it shows while the page stays open; it is "
+                "not kept there, but stays in the workspace.")
+
+
 class NoDelivery(Delivery):
-    """A surface with no way to carry a file yet — the web page and A2A.
+    """A surface with no way to carry a file yet — A2A.
 
     Says so instead of quietly using Lark, which would send a web user's file to their
     Lark account, and names the path so the model can tell them where it is rather than

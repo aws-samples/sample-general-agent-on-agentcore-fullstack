@@ -335,6 +335,10 @@ class AgentCoreStack(Stack):
                     # reference wastes storage, the reverse breaks a checkpoint.
                     expiration=Duration.days(400),
                     abort_incomplete_multipart_upload_after=Duration.days(7)),
+                # Files sent to the web page. A history older than this shows the file's
+                # name without a working link; the workspace copy is untouched.
+                s3.LifecycleRule(id="expire-web-deliveries", prefix="deliveries/",
+                                 expiration=Duration.days(30)),
             ],
         )
 
@@ -360,7 +364,10 @@ class AgentCoreStack(Stack):
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-                resources=[f"{self.checkpoint_bucket.bucket_arn}/state/*"],
+                resources=[f"{self.checkpoint_bucket.bucket_arn}/state/*",
+                           # Files sent to the web page; the page reads them through links
+                           # this role signs, so GetObject is what makes a link work.
+                           f"{self.checkpoint_bucket.bucket_arn}/deliveries/*"],
             )
         )
 

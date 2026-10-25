@@ -53,6 +53,7 @@ from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 import code_tools
+import deliveries
 import delivery
 import images
 import lark_3lo
@@ -585,15 +586,23 @@ async def atools_overview(actor_id: str, mem_sid: str, workload_token: str = "")
     return tools_overview(session)
 
 
-def _track(delta: int, thread_id: str = "", surface: str = "lark") -> None:
+def _track(delta: int, thread_id: str = "", surface: str = "lark", dest: str = "") -> None:
     global _in_flight
     with _in_flight_lock:
         _in_flight += delta
         if thread_id:
             if delta > 0:
                 _in_flight_threads[thread_id] = surface
+                _claim_dest[thread_id] = dest
             else:
                 _in_flight_threads.pop(thread_id, None)
+                _claim_dest.pop(thread_id, None)
+
+
+# Where the running turn's answer goes — a Lark chat, or one web page's stream. A message is
+# steered into a turn only if its answer would appear where it was sent: one user's DM and
+# group chats share a thread, and so do every tab and device a web user has open.
+_claim_dest: dict[str, str] = {}
 
 
 def thread_busy(thread_id: str) -> bool:
@@ -608,15 +617,46 @@ def thread_owner(thread_id: str) -> str | None:
         return _in_flight_threads.get(thread_id)
 
 
-def try_claim(thread_id: str, surface: str) -> str | None:
+def try_claim(thread_id: str, surface: str, dest: str = "") -> str | None:
     """Claim the thread for a turn on `surface`. Returns None on success, or the surface
     already holding it. One step under the lock: a separate check and mark left seconds
     between them (a cold session build), and two turns could start on one thread."""
     with _in_flight_lock:
         owner = _in_flight_threads.get(thread_id)
         if owner is None:
-            _track(+1, thread_id, surface)
+            _track(+1, thread_id, surface, dest)
         return owner
+
+
+def claim_or_steer(thread_id: str, surface: str, dest: str, message: str,
+                   message_id: str = "") -> str | None:
+    """Claim the thread, or hand `message` to the turn already answering into `dest` — one
+    step under the lock, as chat_async does for Lark, so the message cannot land in a turn
+    that has just released. None when claimed, "steered" when handed over, f"{surface}-other"
+    when the turn answers into another of this surface's destinations, else the other
+    surface that holds the thread."""
+    with _in_flight_lock:
+        owner = _in_flight_threads.get(thread_id)
+        if owner is None:
+            _track(+1, thread_id, surface, dest)
+            return None
+        if owner != surface:
+            return owner
+        if not dest or _claim_dest.get(thread_id) != dest:
+            return f"{surface}-other"
+        steer(thread_id, message, message_id)
+        return "steered"
+
+
+def take_steer_or_release(thread_id: str) -> list[tuple]:
+    """What was steered in after the turn's last model call, to answer as a continuation —
+    or, when nothing was, the release, in the same step: a message arriving in between
+    would otherwise be steered into a turn that no longer reads it."""
+    with _in_flight_lock:
+        queued = _take_steer(thread_id)
+        if not queued:
+            release(thread_id)
+        return queued
 
 
 def release(thread_id: str) -> list[tuple[str, str, bool]]:
@@ -649,6 +689,8 @@ def _release_unanswered(thread_id: str, chat_id: str) -> None:
 
 _BUSY_ELSEWHERE = {"web": "这段对话正在网页上回答，等它结束后再发送。",
                    "lark": "这段对话正在 Lark 里回答，等它结束后再发送。",
+                   "web-other": "这段对话正在另一个窗口里回答，等它结束后再发送。",
+                   "lark-other": "这段对话正在另一个聊天里回答，等它结束后再发送。",
                    "sync": "这段对话正在另一处回答，等它结束后再发送。"}
 
 
@@ -818,6 +860,31 @@ async def _arepair_interrupted_turn(graph, config: dict, own_claim: bool = False
                     name=tc.get("name") or "tool")
         for tc in pending]}, as_node="tools" if "tools" in nodes else "model")
     return len(pending)
+
+
+async def astamp_unanswered(graph, config: dict, at_ms: int) -> int:
+    """Give a message whose turn ended before any model reply — stopped for consent, or
+    failed — the time it arrived. _ClockMiddleware stamps a message when the model returns,
+    so without this the next turn would stamp it with its own, later, arrival."""
+    from langgraph.errors import InvalidUpdateError
+    state = await graph.aget_state(config)
+    said = []
+    for m in reversed((getattr(state, "values", None) or {}).get("messages") or []):
+        if isinstance(m, AIMessage):
+            break
+        if isinstance(m, HumanMessage) and m.id and "ts" not in m.additional_kwargs \
+                and not _is_summary(m):
+            said.append(m.model_copy(update={"additional_kwargs": {**m.additional_kwargs,
+                                                                    "ts": at_ms}}))
+    if not said:
+        return 0
+    update = {"messages": said[::-1]}     # same ids, so replaced in place
+    try:
+        await graph.aupdate_state(config, update)
+    except InvalidUpdateError:
+        # The last writer was not one node LangGraph can attribute the write to.
+        await graph.aupdate_state(config, update, as_node="model")
+    return len(said)
 
 
 async def _aopen_tools(stack: AsyncExitStack, connection: dict) -> list:
@@ -1209,9 +1276,12 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     # it cannot join that turn's attachments.
     with _in_flight_lock:
         owner = _in_flight_threads.get(thread_id)
+        # The running turn answers into another chat — a DM and a group share one thread.
+        if owner == "lark" and _claim_dest.get(thread_id) != chat_id:
+            owner = "lark-other"
         if owner in (None, "lark"):
             if owner is None:
-                _track(+1, thread_id, "lark")
+                _track(+1, thread_id, "lark", chat_id)
             marks, turn_message_id = images.register(thread_id, handles, blocks)
             if marks:
                 message = "\n".join([message, marks]).strip() if message else marks
@@ -1480,12 +1550,15 @@ async def arun_in_thread(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
 
 
-async def aget_session(actor_id: str, workload_token: str = "", thread: str = "") -> dict:
+async def aget_session(actor_id: str, workload_token: str = "", thread: str = "",
+                       own_claim: bool = False) -> dict:
     """The cached session for this actor, fetched without blocking the caller's loop.
     Session building opens MCP connections, which is seconds of I/O. `thread` is one the
-    caller named and server.py checked belongs to the actor; else the one last named."""
+    caller named and server.py checked belongs to the actor; else the one last named.
+    `own_claim` when the caller holds the thread's claim, so the build still repairs it."""
     return await arun_in_thread(_get_session, actor_id, "",
-                               thread or thread_for(actor_id), False, workload_token)
+                               thread or thread_for(actor_id), False, workload_token,
+                               own_claim)
 
 
 def stream_on_agent_loop(agen_factory, on_done=None, until=None):
@@ -1498,7 +1571,8 @@ def stream_on_agent_loop(agen_factory, on_done=None, until=None):
     producer finishes, not when the consumer stops: a web page that is closed mid-answer
     stops reading, but the graph runs on and keeps writing the checkpoint, so anything
     marking the turn as running has to last until the producer is done. An item `until`
-    accepts ends the run there: it is not passed on, and the generator is closed."""
+    accepts ends the run there: it is not passed on, and the generator is closed. Items
+    `on_done` returns are passed on last."""
     q: queue.Queue = queue.Queue()
 
     async def _pump() -> None:
@@ -1512,12 +1586,15 @@ def stream_on_agent_loop(agen_factory, on_done=None, until=None):
         except Exception as e:  # noqa: BLE001 — re-raised in the consumer
             q.put(e)
         finally:
-            q.put(_STREAM_END)
+            # Before the end of the stream, so whatever on_done hands back reaches the
+            # consumer: the release reports messages it had to drop.
             if on_done is not None:
                 try:
-                    on_done()
+                    for item in on_done() or []:
+                        q.put(item)
                 except Exception:  # noqa: BLE001 — never lose the release to a logging bug
                     log.exception("on_done failed")
+            q.put(_STREAM_END)
 
     asyncio.run_coroutine_threadsafe(_pump(), _LOOP)
 
@@ -1725,7 +1802,25 @@ def transcript(actor_id: str, mem_sid: str = "") -> dict:
         elif isinstance(m, ToolMessage):
             out.append({"role": "toolResult", "id": getattr(m, "tool_call_id", "") or "",
                         "content": _text_of(m)[:_TRANSCRIPT_TOOL_CHARS]})
+            sent = _delivered(m)
+            if sent:
+                # Signed afresh on every read. A failed signature costs the link, not the
+                # history: the file is still named.
+                try:
+                    link = deliveries.url(sent["key"], sent["name"], actor_id)
+                except Exception:  # noqa: BLE001
+                    log.warning("could not sign a delivered file's link", exc_info=True)
+                    link = ""
+                out.append({"role": "file", "name": sent["name"], "size": sent.get("size", 0),
+                            "url": link})
     return {"messages": out, "truncated": len(history) > len(tail)}
+
+
+def _delivered(message) -> dict | None:
+    """The stored file a deliver_file result carries on its artifact, if any."""
+    artifact = getattr(message, "artifact", None)
+    sent = artifact.get("file") if isinstance(artifact, dict) else None
+    return sent if isinstance(sent, dict) and sent.get("key") and sent.get("name") else None
 
 
 def _said_at(message) -> dict:
@@ -1760,6 +1855,19 @@ def clear_history(actor_id: str, mem_sid: str = "") -> dict:
             s = _sessions.pop(key, None)
             if s:
                 _close_session(s)
+    # The files it delivered go with it; read before the thread is, as nothing else records
+    # their keys. Every checkpoint, not the latest: a summary removes older messages from
+    # the latest, and their files with them from view.
+    try:
+        async def keys() -> list[str]:
+            found = []
+            async for tup in _checkpointer().alist(config):
+                values = (tup.checkpoint or {}).get("channel_values") or {}
+                found += [f["key"] for f in map(_delivered, values.get("messages") or []) if f]
+            return found
+        deliveries.delete(_run(keys(), timeout=120), actor_id)
+    except Exception:  # noqa: BLE001 — the lifecycle rule removes what this misses
+        log.warning("could not remove delivered files of %s", thread_id, exc_info=True)
     try:
         _run(_checkpointer().adelete_thread(thread_id), timeout=60)
     except Exception as e:  # noqa: BLE001

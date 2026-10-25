@@ -241,11 +241,12 @@ async def handle_invocations(request: web.Request) -> web.Response:
     # actor, which is the one the page's turns run on.
     if action == "transcript":
         actor_id = payload["actorId"]
+        thread = payload.get("memorySessionId") or agent_core.thread_for(actor_id)
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.transcript, actor_id,
-                payload.get("memorySessionId") or agent_core.thread_for(actor_id))
-            return web.json_response(result)
+                None, agent_core.transcript, actor_id, thread)
+            # A page reloaded mid-answer would otherwise look idle while the turn runs on.
+            return web.json_response({**result, "running": agent_core.thread_busy(thread)})
         except Exception as e:
             log.exception("transcript failed")
             return web.json_response({"messages": [], "error": str(e)})

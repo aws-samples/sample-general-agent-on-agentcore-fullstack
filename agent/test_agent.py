@@ -1669,6 +1669,37 @@ def test_a_message_steered_in_or_answered_later_keeps_the_time_it_arrived():
     assert by_id["h-q"] == 1000 and by_id["h-steer"] == arrived and by_id["h-late"] == 5000
 
 
+def test_a_message_whose_turn_stopped_before_a_reply_still_gets_its_time():
+    """Stopped at a consent wall the model never returns, so the clock never stamps it."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
+        mw = agent_core._middleware()
+    graph = agent_core.create_agent(
+        model=_ScriptedModel(turns=[{"text": ["one"]}, {"text": ["walled"]}, {"text": ["two"]}]),
+        tools=[_dummy_tool], middleware=mw, checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "t-stop", "received_ms": 1}}
+
+    async def full(text, mid):
+        async for _ in graph.astream({"messages": [HumanMessage(text, id=mid)]}, cfg,
+                                     stream_mode="messages"):
+            pass
+
+    async def stopped(text, mid):     # abandoned at the first token, as _walls does
+        stream = graph.astream({"messages": [HumanMessage(text, id=mid)]}, cfg,
+                               stream_mode="messages")
+        async for _ in stream:
+            break
+        await stream.aclose()
+    agent_core._run(full("q1", "h1"))
+    agent_core._run(stopped("q2", "h2"))
+    assert agent_core._run(agent_core.astamp_unanswered(graph, cfg, 4242)) == 1
+    assert agent_core._run(agent_core.astamp_unanswered(graph, cfg, 9999)) == 0   # idempotent
+    agent_core._run(full("q3", "h3"))
+    msgs = agent_core._run(graph.aget_state(cfg)).values["messages"]
+    by_id = {m.id: m.additional_kwargs.get("ts") for m in msgs if isinstance(m, HumanMessage)}
+    assert by_id["h2"] == 4242 and [m.id for m in msgs if isinstance(m, HumanMessage)] == ["h1", "h2", "h3"]
+
+
 def test_reauthorising_a_system_already_granted_starts_a_new_consent():
     """How a user switches accounts: /auth google answered "Already authorized." while a grant
     was vaulted, so there was no way to consent as anybody else."""
@@ -1795,10 +1826,14 @@ def test_an_attachment_steered_into_a_running_turn_is_not_dropped():
     carried text only, so a file sent while the bot was answering vanished silently."""
     agent_core._pending_steer.clear()
     agent_core._in_flight_threads.clear()
-    agent_core._track(+1, "t-busy", "lark")
+    agent_core._track(+1, "t-busy", "lark", "oc_1")
     try:
         with mock.patch.object(agent_core.images, "blocks_for", return_value=[]), \
              mock.patch.object(agent_core, "lark_notify"):
+            # From another chat — a DM and a group share the thread — it is not steered: the
+            # answer would appear in the chat the turn is answering.
+            other = agent_core.chat_async("lark:ou_x", "elsewhere", "oc_2", mem_sid="t-busy")
+            assert other["busy"] == "lark-other" and "t-busy" not in agent_core._pending_steer
             out = agent_core.chat_async("lark:ou_x", "also this", "oc_1", mem_sid="t-busy",
                                         image_handles=[{"kind": "file", "key": "f_1",
                                                         "name": "q3.pdf", "message_id": "om_9"}])
@@ -2430,13 +2465,329 @@ def test_a_web_turn_stops_at_a_tool_that_needs_a_grant():
          mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
          mock.patch.object(agui.web, "StreamResponse", Resp):
         resp = asyncio.run(agui.handle(None, {"actorId": "web:s-1", "runId": "r-1",
-                                              "messages": []}, ""))
+                                              "memorySessionId": "sess-x", "messages": []}, ""))
     frames = [f[len("data: "):] for f in resp.out.decode().split("\n\n") if f]
     assert frames[:2] == ["RUN_STARTED", "TEXT_MESSAGE_CONTENT"]
     assert json.loads(frames[2]) == {"type": "CUSTOM", "name": "consent", "value": {"idp": "lark"}}
     assert json.loads(frames[3])["type"] == "RUN_FINISHED" and len(frames) == 4
     assert reached == [] and agent_core.try_claim("sess-x", "web") is None
     agent_core.release("sess-x")
+
+
+def test_a_file_the_run_sends_reaches_the_page_on_that_runs_stream():
+    import agui, asyncio
+    from types import SimpleNamespace as E
+
+    class Run:
+        def __init__(self, config=None, **kw):
+            self.channel = config["configurable"]["delivery"]
+
+        async def run(self, _input):
+            yield E(type="RUN_STARTED")
+            yield E(type="TOOL_CALL_START", tool_call_id="t1", tool_call_name="deliver_file")
+            self.channel.send_file("chart.png", b"png!", lambda: None)
+            yield E(type="TOOL_CALL_RESULT", tool_call_id="t1", content="Sent")
+            yield E(type="RUN_FINISHED")
+
+    class Resp:
+        def __init__(self, **kw): self.out = b""
+        async def prepare(self, _r): pass
+        async def write(self, b): self.out += b
+        async def write_eof(self): pass
+
+    session = {"mem_sid": "sess-f", "graph": None, "config": {"configurable": {}},
+               "tool_idp": {}, "consent": {}}
+    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+         mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
+         mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
+         mock.patch.object(agui.web, "StreamResponse", Resp):
+        resp = asyncio.run(agui.handle(None, {"actorId": "web:s-1", "runId": "r-1",
+                                              "memorySessionId": "sess-f", "messages": []}, ""))
+    frames = [f[len("data: "):] for f in resp.out.decode().split("\n\n") if f]
+    # Written between the events, wherever the producer had got to; before the run ends.
+    sent = [json.loads(f) for f in frames if f.startswith("{")]
+    assert [f for f in frames if not f.startswith("{")] == [
+        "RUN_STARTED", "TOOL_CALL_START", "TOOL_CALL_RESULT", "RUN_FINISHED"]
+    assert len(sent) == 1 and frames.index(json.dumps(sent[0])) < frames.index("RUN_FINISHED")
+    sent = sent[0]
+    assert sent["name"] == "file" and sent["value"]["name"] == "chart.png"
+    assert base64.b64decode(sent["value"]["data"]) == b"png!"
+    agent_core.release("sess-f")
+
+
+class _CapturedResp:
+    def __init__(self, **kw): self.out = b""
+    async def prepare(self, _r): pass
+    async def write(self, b): self.out += b
+    async def write_eof(self): pass
+
+    def frames(self):
+        return [f[len("data: "):] for f in self.out.decode().split("\n\n") if f]
+
+
+def test_a_message_steers_into_its_own_surfaces_turn_and_only_that():
+    agent_core._pending_steer.clear()
+    assert agent_core.claim_or_steer("t-cs", "web", "web:tab-a", "first") is None
+    try:
+        assert agent_core.claim_or_steer("t-cs", "web", "web:tab-a", "also this", "m2") == "steered"
+        # Another tab, a reload or another device would have the answer stream into this one.
+        assert agent_core.claim_or_steer("t-cs", "web", "web:tab-b", "from b") == "web-other"
+        assert agent_core.claim_or_steer("t-cs", "web", "", "no stream id") == "web-other"
+        assert agent_core.claim_or_steer("t-cs", "lark", "oc_1", "from lark") == "web"
+        assert [q[:2] for q in agent_core._pending_steer["t-cs"]] == [("also this", "m2")]
+        # Taken as a continuation, the thread stays claimed; with nothing left it is freed.
+        assert [q[0] for q in agent_core.take_steer_or_release("t-cs")] == ["also this"]
+        assert agent_core.thread_owner("t-cs") == "web"
+        assert agent_core.take_steer_or_release("t-cs") == []
+        assert agent_core.thread_owner("t-cs") is None
+    finally:
+        agent_core.release("t-cs")
+
+
+def test_a_message_sent_from_the_page_mid_turn_joins_it_and_is_answered_below():
+    """As in Lark chat: what the page sends while its turn runs is not refused as busy. Too
+    late for the running model call, it is answered as a continuation on the same stream,
+    marked so the page starts the reply under that message."""
+    import agui, asyncio
+    from types import SimpleNamespace as E
+    agent_core._pending_steer.clear()
+    inputs = []
+
+    class Run:
+        def __init__(self, **kw): pass
+
+        async def run(self, run_input):
+            inputs.append([m.content for m in run_input.messages])
+            yield E(type="RUN_STARTED")
+            if len(inputs) == 1:      # the page sends a second message meanwhile
+                resp = _CapturedResp()
+                with mock.patch.object(agui.web, "StreamResponse", lambda **kw: resp):
+                    await agui.handle(None, {**page, "messages": [
+                        {"id": "m2", "role": "user", "content": "also this"}]}, "")
+                frames = resp.frames()
+                assert [json.loads(f)["type"] for f in frames] == ["RUN_STARTED", "CUSTOM", "RUN_FINISHED"]
+                assert json.loads(frames[1])["name"] == "queued"
+                # Another tab is told, not steered: its answer would appear in this one.
+                other = _CapturedResp()
+                with mock.patch.object(agui.web, "StreamResponse", lambda **kw: other):
+                    await agui.handle(None, {**page, "forwardedProps": {"streamId": "tab-b"},
+                                             "messages": [{"id": "m3", "role": "user",
+                                                           "content": "from b"}]}, "")
+                assert "另一个窗口" in other.out.decode()
+            yield E(type="RUN_FINISHED")
+
+    session = {"mem_sid": "sess-st", "graph": None, "config": {"configurable": {}},
+               "tool_idp": {}, "consent": {}}
+    page = {"actorId": "web:s-1", "memorySessionId": "sess-st",
+            "forwardedProps": {"streamId": "tab-a"}}
+    resp = _CapturedResp()
+    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+         mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
+         mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
+         mock.patch.object(agui.web, "StreamResponse", lambda **kw: resp):
+        asyncio.run(agui.handle(None, {**page, "runId": "r-1", "messages": [
+            {"id": "m1", "role": "user", "content": "first"}]}, ""))
+    frames = resp.frames()
+    assert inputs == [["first"], ["also this"]]
+    assert frames[:2] == ["RUN_STARTED", "RUN_FINISHED"] and frames[-1] == "RUN_FINISHED"
+    assert json.loads(frames[2])["name"] == "steered" and frames[3] == "RUN_STARTED"
+    assert agent_core.thread_owner("sess-st") is None and "sess-st" not in agent_core._turn_cards
+
+
+def test_a_message_steered_into_a_turn_that_stops_for_consent_is_reported_not_lost():
+    import agui, asyncio
+    from types import SimpleNamespace as E
+    agent_core._pending_steer.clear()
+
+    class Run:
+        def __init__(self, **kw): pass
+
+        async def run(self, _input):
+            yield E(type="RUN_STARTED")
+            assert agent_core.claim_or_steer("sess-w", "web", "web:tab-a", "also", "m2") == "steered"
+            yield E(type="TOOL_CALL_START", tool_call_id="t1", tool_call_name="lark_docs")
+
+    session = {"mem_sid": "sess-w", "graph": None, "config": {"configurable": {}},
+               "tool_idp": {"lark_docs": "lark"}, "consent": {"lark": ""}}
+    resp = _CapturedResp()
+    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+         mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
+         mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
+         mock.patch.object(agui.web, "StreamResponse", lambda **kw: resp):
+        asyncio.run(agui.handle(None, {"actorId": "web:s-1", "memorySessionId": "sess-w",
+                                       "forwardedProps": {"streamId": "tab-a"}, "runId": "r",
+                                       "messages": []}, ""))
+    marks = [json.loads(f) for f in resp.frames() if f.startswith("{")]
+    assert {"type": "CUSTOM", "name": "unanswered", "value": {"count": 1}} in marks
+    assert agent_core.thread_owner("sess-w") is None
+
+
+def test_a_web_run_never_releases_a_claim_it_no_longer_holds():
+    """The run releases in the same step as finding nothing left; releasing again when the
+    producer ends could free a turn that claimed the thread in between."""
+    import agui
+    state = {"released": True}
+    agent_core._track(+1, "sess-r", "lark", "oc_1")      # someone else's turn, meanwhile
+    try:
+        assert agui._end("sess-r", agui._PageMarks([]), state) == []
+        assert agent_core.thread_owner("sess-r") == "lark"
+    finally:
+        agent_core.release("sess-r")
+
+
+def test_a_delivered_file_is_stored_under_its_owner_and_only_a_picture_is_shown_inline():
+    import deliveries, hashlib
+    s3 = mock.Mock()
+    s3.generate_presigned_url.side_effect = lambda op, ExpiresIn, Params: f"https://s/{Params['Key']}"
+    with mock.patch.object(deliveries, "_BUCKET", "b"), mock.patch.object(deliveries, "_s3", return_value=s3):
+        key = deliveries.put("web:s-1", "../chart.png", b"x")
+        owner = hashlib.sha256(b"web:s-1").hexdigest()[:32]
+        assert key.startswith(f"deliveries/{owner}/") and key.endswith("/chart.png")
+        put = s3.put_object.call_args.kwargs
+        assert put["ContentType"] == "image/png" and put["ContentDisposition"].startswith("inline")
+        deliveries.put("web:s-1", "page.svg", b"<svg/>")
+        svg = s3.put_object.call_args.kwargs
+        assert svg["ContentType"] == "application/octet-stream"
+        assert svg["ContentDisposition"].startswith("attachment")
+        assert deliveries.url(key, "chart.png", "web:s-1") == f"https://s/{key}"
+        # Only this actor's own deliveries are signed or deleted.
+        assert deliveries.url(key, "chart.png", "web:someone-else") == ""
+        assert deliveries.url("state/x", "x.png", "web:s-1") == ""
+        assert deliveries.delete(["state/x", key, key], "web:s-1") == 1
+        assert deliveries.delete([key], "web:someone-else") == 0
+
+
+def test_the_history_shows_a_delivered_file_again_and_clear_removes_it():
+    from langchain_core.messages import AIMessage as _AI, ToolMessage as _Tool
+    from langgraph.checkpoint.memory import InMemorySaver
+    saver = InMemorySaver()
+    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]),
+                                    tools=[_dummy_tool], checkpointer=saver)
+    cfg = {"configurable": {"thread_id": "t-files"}}
+    sent = {"file": {"key": "deliveries/o/u/chart.png", "name": "chart.png", "size": 3}}
+    agent_core._run(graph.aupdate_state(cfg, {"messages": [
+        HumanMessage("chart please", id="h1"),
+        _AI(content="", id="a1", tool_calls=[{"name": "deliver_file", "args": {}, "id": "c1",
+                                              "type": "tool_call"}]),
+        _Tool(content="Sent chart.png to the page", tool_call_id="c1", artifact=sent),
+        _AI(content="here it is", id="a2")]}, as_node="model"))
+    with mock.patch.object(agent_core, "_checkpointer", return_value=saver), \
+         mock.patch.object(agent_core, "_thread_config", return_value=cfg), \
+         mock.patch.object(agent_core.deliveries, "url", return_value="https://fresh") as url, \
+         mock.patch.object(agent_core.deliveries, "delete") as delete:
+        files = [m for m in agent_core.transcript("web:s-1")["messages"] if m["role"] == "file"]
+        assert files == [{"role": "file", "name": "chart.png", "size": 3, "url": "https://fresh"}]
+        url.assert_called_once_with("deliveries/o/u/chart.png", "chart.png", "web:s-1")
+        assert agent_core.clear_history("web:s-1")["deleted"] is True
+        assert delete.call_args.args[0][0] == "deliveries/o/u/chart.png"
+        assert delete.call_args.args[1] == "web:s-1"
+
+
+def test_a_picture_from_the_page_is_seen_on_its_turn_and_kept_as_a_placeholder():
+    """As a Lark picture is: inlined into the checkpoint it would be re-billed on every turn."""
+    import agui, asyncio, io
+    from types import SimpleNamespace as E
+    from PIL import Image
+    buf = io.BytesIO(); Image.new("RGB", (4, 4), "red").save(buf, format="PNG")
+    png = base64.b64encode(buf.getvalue()).decode()
+    seen = {}
+
+    class Run:
+        def __init__(self, **kw): pass
+
+        async def run(self, run_input):
+            m = run_input.messages[-1]
+            seen["message"] = (m.id, m.content)
+            seen["pixels"] = agent_core.images.pixels_for("sess-img")
+            seen["handles"] = agent_core.images.handles_for("sess-img")
+            yield E(type="RUN_STARTED")
+            yield E(type="RUN_FINISHED")
+
+    session = {"mem_sid": "sess-img", "graph": None, "config": {"configurable": {}},
+               "tool_idp": {}, "consent": {}}
+    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+         mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
+         mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
+         mock.patch.object(agui.web, "StreamResponse", lambda **kw: _CapturedResp()):
+        asyncio.run(agui.handle(None, {"actorId": "web:s-1", "memorySessionId": "sess-img",
+                                       "runId": "r", "messages": [{"id": "page-1", "role": "user",
+            "content": [{"type": "text", "text": "what is this"},
+                        {"type": "image", "source": {"type": "data", "value": png,
+                                                     "mimeType": "image/png"}}]}]}, ""))
+    mid, content = seen["message"]
+    assert content == "what is this\n[image 1: image-1.png]" and mid.startswith("msg-")
+    assert [b["type"] for b in seen["pixels"][mid]] == ["image"]
+    assert seen["handles"][0]["data"] == buf.getvalue()          # save_attachment's source
+    assert agent_core.images.pixels_for("sess-img") == {}         # gone with the turn
+
+
+def test_a_picture_the_model_cannot_read_is_kept_but_not_shown_to_it():
+    """Labelled as a jpeg, an unreadable picture would make Bedrock refuse the whole turn."""
+    text, handles, blocks = agent_core.images.from_page([
+        {"type": "text", "text": "look"},
+        {"type": "image", "source": {"type": "data", "value": base64.b64encode(b"not an image").decode(),
+                                     "mimeType": "image/heic"}}])
+    assert text == "look" and blocks == [] and handles[0]["name"] == "image-1.heic"
+    marks, _ = agent_core.images.register("t-heic", handles, blocks)
+    assert "not a picture the model can read" in marks and "save_attachment" in marks
+    agent_core.images.end_turn("t-heic")
+
+
+def test_a_web_run_stamps_an_unanswered_message_only_when_it_ended_without_a_reply():
+    """Stopped at a wall, or failed: stamped with that run's own message's arrival, while the
+    claim is held. A run that replied is left to the clock and costs no extra read."""
+    import agui, asyncio
+    from types import SimpleNamespace as E
+    agent_core._pending_steer.clear()
+    stamped, owners = [], []
+
+    async def fake_stamp(graph, config, at_ms):
+        stamped.append(at_ms)
+        owners.append(agent_core.thread_owner("sess-sm"))
+        return 1
+
+    def run_with(script):
+        class Run:
+            def __init__(self, **kw): pass
+
+            async def run(self, _input):
+                for ev in script.pop(0):
+                    if callable(ev):
+                        ev()
+                    else:
+                        yield ev
+        session = {"mem_sid": "sess-sm", "graph": object(), "config": {"configurable": {}},
+                   "tool_idp": {"lark_docs": "lark"}, "consent": {"lark": ""}}
+        stamped.clear(); owners.clear()
+        with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+             mock.patch.object(agent_core, "astamp_unanswered", fake_stamp), \
+             mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
+             mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
+             mock.patch.object(agui.web, "StreamResponse", lambda **kw: _CapturedResp()):
+            asyncio.run(agui.handle(None, {"actorId": "web:s-1", "memorySessionId": "sess-sm",
+                                           "forwardedProps": {"streamId": "tab"}, "runId": "r",
+                                           "messages": []}, ""))
+        return list(stamped), list(owners)
+
+    ok = [E(type="RUN_STARTED"), E(type="RUN_FINISHED")]
+    assert run_with([ok]) == ([], [])
+    at, held = run_with([[E(type="RUN_STARTED"), E(type="RUN_ERROR")]])
+    assert len(at) == 1 and held == ["web"]
+    at, held = run_with([[E(type="RUN_STARTED"),
+                          E(type="TOOL_CALL_START", tool_call_id="t", tool_call_name="lark_docs")]])
+    assert len(at) == 1 and held == ["web"]
+    # A continuation stopped at the wall: stamped with the steered message's own arrival.
+    sent = {}
+
+    def steer():
+        time.sleep(0.01)       # so the steered message arrives measurably after the first
+        sent["ms"] = int(time.time() * 1000)
+        agent_core.steer("sess-sm", "also", "m2")
+    at, held = run_with([[E(type="RUN_STARTED"), steer, E(type="RUN_FINISHED")],
+                         [E(type="RUN_STARTED"),
+                          E(type="TOOL_CALL_START", tool_call_id="t", tool_call_name="lark_docs")]])
+    assert held == ["web"] and len(at) == 1 and at[0] >= sent["ms"]
+    assert agent_core.thread_owner("sess-sm") is None
 
 
 def test_a_refused_tool_on_the_page_ends_the_run_with_a_consent_prompt():
@@ -2456,7 +2807,8 @@ def test_agui_takes_its_thread_from_the_session_not_the_pages_thread_id():
     the verified actor."""
     import agui, inspect
     src = inspect.getsource(agui.handle)
-    assert 'thread_id = session["mem_sid"]' in src and "_run_input_fields(payload, thread_id)" in src
+    assert 'thread_id = payload.get("memorySessionId") or agent_core.thread_for(actor_id)' in src
+    assert "_pictures_handed_over, payload, thread_id)" in src and "_run_input_fields(handed, thread_id)" in src
     assert agui._run_input_fields({"threadId": "theirs"}, "ours")["threadId"] == "ours"
 
 

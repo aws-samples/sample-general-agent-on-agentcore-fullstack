@@ -82,7 +82,8 @@ def save_to_workspace(sandbox, handle: dict, index: int) -> str:
     Unlike a picture, a document's contents have no business in the model's context: a
     long pdf would not fit, and code can read exactly the part that matters."""
     kind = handle.get("kind", IMAGE)
-    data = lark_notify.fetch_message_resource(
+    # A web picture came with its bytes, held for the turn; a Lark one is fetched again.
+    data = handle.get("data") or lark_notify.fetch_message_resource(
         handle.get("message_id", ""), handle.get("key", ""), kind)
     name = handle.get("name") or (
         f"image-{index}.jpg" if kind == IMAGE else f"attachment-{index}")
@@ -148,13 +149,65 @@ def register(thread_id: str, handles: list[dict], blocks: list[dict]) -> tuple[s
             turn["pixels"][message_id] = blocks
     marks = []
     for i, h in enumerate(handles, start=start):
-        if h.get("kind") == IMAGE:
+        if h.get("kind") == IMAGE and h.get("source") == "web":
+            seen = "" if blocks else " (not a picture the model can read; save_attachment can still open it)"
+            marks.append(f"[image {i}: {h.get('name') or 'image'}{seen}]")
+        elif h.get("kind") == IMAGE:
             mark = placeholder(i, h.get("message_id", ""), h.get("key", ""))
             marks.append(mark if blocks else mark + " (no longer available)")
         else:
             marks.append(f"[attachment {i}: {h.get('name') or 'file'} — "
                          f"call save_attachment({i}) to open it]")
     return "\n".join(marks), message_id
+
+
+def from_page(content: list) -> tuple[str, list[dict], list[dict]]:
+    """A web message's AG-UI content as (text, handles, blocks): the page sends pictures
+    inline, and like a Lark picture each is shown to the model on its own turn only — kept
+    on a handle with its bytes for that turn, not in the conversation."""
+    import base64
+    texts, handles, blocks = [], [], []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            texts.append(part.get("text") or "")
+            continue
+        source = part.get("source") or {}
+        if part.get("type") != "image" or source.get("type") != "data":
+            continue
+        if len(handles) >= MAX_PER_MESSAGE:
+            break
+        try:
+            raw = base64.b64decode(source.get("value") or "")
+        except Exception:  # noqa: BLE001 — a malformed picture is skipped, not fatal
+            continue
+        ext = _EXT.get(source.get("mimeType") or "", "jpg")
+        handle = {"kind": IMAGE, "source": "web", "data": raw,
+                  "name": f"image-{len(handles) + 1}.{ext}"}
+        # Only what Pillow can read reaches the model: anything else (HEIC, SVG) labelled as
+        # a jpeg would make Bedrock refuse every call of the turn. The file can still be saved.
+        if _readable(raw):
+            data, mime = downscale(raw)
+            handle["block"] = {"type": "image", "base64": base64.b64encode(data).decode(),
+                               "mime_type": mime}
+        handles.append(handle)
+    blocks = [h.pop("block") for h in handles if "block" in h]
+    return "\n".join(t for t in texts if t), handles, blocks
+
+
+_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
+        "image/bmp": "bmp", "image/heic": "heic", "image/svg+xml": "svg"}
+
+
+def _readable(data: bytes) -> bool:
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+        return True
+    except Exception:  # noqa: BLE001 — not a picture the model can be shown
+        return False
 
 
 def add_to_turn(thread_id: str, handles: list[dict]) -> tuple[str, str]:

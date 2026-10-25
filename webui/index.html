@@ -95,8 +95,15 @@
   #pending { padding: 0 1rem; font-size: 13px; opacity: .7; display: none; align-items: center;
              gap: .5rem; }
   #pending img { max-height: 2.4rem; border-radius: .3rem; }
-  .consent { align-self: flex-start; border: 1px solid var(--accent); display: flex;
-             gap: .7rem; align-items: center; }
+  .file { display: flex; flex-direction: column; gap: .3rem; font-size: 13px; }
+  .file img { max-width: min(28rem, 100%); border-radius: .4rem; border: 1px solid var(--edge); }
+  .file a { color: var(--accent); }
+  /* A notice with a button, not a field: tinted and rounded, so nothing reads as an input. */
+  .consent { align-self: flex-start; display: flex; gap: .8rem; align-items: center;
+             padding: .5rem .55rem .5rem .85rem; border-radius: .6rem; font-size: 14px;
+             background: color-mix(in oklab, var(--accent) 9%, transparent); }
+  .consent button { padding: .4rem .9rem; font-size: 14px; }
+  .consent .done { color: #16a34a; white-space: nowrap; }
   header button.ghost, header a.ghost { font-size: 13px; padding: .25rem .6rem; }
   header a.ghost { color: inherit; text-decoration: none; border: 1px solid var(--edge);
                    border-radius: .6rem; margin-right: .4rem; }
@@ -330,6 +337,12 @@ const consent = (() => {
     const all = pending(); delete all[id]; keep(all);
     if (!done.ok) { say('err', `授权没有完成：${done.error || '未知原因'}，请再点一次授权。`); return false; }
     say('cmd', `✅ 已授权 ${LABELS[p.idp] || p.idp}`);
+    // The prompts that asked for it are answered: their buttons give way to the outcome.
+    document.querySelectorAll(`.consent[data-idp="${CSS.escape(p.idp)}"] button`).forEach((btn) => {
+      const done = document.createElement('span');
+      done.className = 'done'; done.textContent = '✅ 已授权';
+      btn.replaceWith(done);
+    });
     if (p.retry) send(p.retry);
     return true;
   }
@@ -353,6 +366,7 @@ const consent = (() => {
       const retry = lastAsk;
       const el = document.createElement('div');
       el.className = 'consent';
+      el.dataset.idp = idp;
       const b = document.createElement('button');
       b.textContent = `授权 ${label}`;
       el.append(document.createTextNode(`这一步需要访问你的 ${label} 账号。`), b);
@@ -465,7 +479,9 @@ async function restore() {
     if (waiting.textContent === '正在读取对话记录…') waiting.remove();
   }
   const msgs = (data && data.messages) || [];
-  if (!msgs.length) return;
+  // Reloaded mid-answer: the turn runs on, streaming to the page that started it.
+  const note = () => { if (data && data.running) say('think', '（上一轮还在回答中，结束后刷新即可看到）'); };
+  if (!msgs.length) return note();
   if (data.truncated) say('think', '（仅显示最近的对话）');
   // The same shape as a live turn. Messages from before the agent kept times have none.
   const at = (m) => m.ts ? new Date(m.ts) : null;
@@ -477,11 +493,13 @@ async function restore() {
   for (const m of msgs) {
     if (m.role === 'user' || m.role === 'summary') {
       flush(); past = null;
-      if (m.role === 'user') say('me', m.content || '', at(m));
+      // A picture is kept as a placeholder, not its pixels: show that one was sent.
+      if (m.role === 'user') say('me', (m.content || '').replace(/\[image \d+(?:: | msg=)[^\]]*\]/g, '🖼️'), at(m));
       else say('think', '（更早的对话已压缩为摘要）');
       continue;
     }
     if (!past) { past = document.createElement('div'); past.className = 'msg bot turn'; placed(past, false, at(m)); }
+    if (m.role === 'file') { flush(); past.append(sentFile(m)); continue; }
     if (m.role === 'toolCall') calls += 1;
     else if (m.role === 'assistant' && (m.content || '').trim()) {
       flush();
@@ -490,6 +508,7 @@ async function restore() {
     }
   }
   flush();
+  note();
 }
 
 // Inside Lark a command carries a fresh code; outside, the signed-in user's token. A link
@@ -523,19 +542,23 @@ async function runCommand(command) {
   }
 }
 
-async function ask(content) {
-  // Nothing here carries authority: the agent takes the actor from the token, refuses a
-  // memorySessionId outside that actor's threads, and replaces AG-UI's threadId with it.
-  const body = {actorId: session.actorId, memorySessionId: session.memorySessionId,
-                runId: uuid(), threadId: 'resolved-by-agent',
-                messages: [{id: uuid(), role: 'user', content}],
-                tools: [], context: [], state: {}, forwardedProps: {}};
-  const res = await fetch(runtimeUrl(), {
-    method: 'POST', body: JSON.stringify(body),
-    headers: await runtimeHeaders('text/event-stream'),
-  });
-  if (!res.ok) throw new Error('请求失败：' + res.status);
+// Nothing here carries authority: the agent takes the actor from the token, refuses a
+// memorySessionId outside that actor's threads, and replaces AG-UI's threadId with it.
+// streamId names this page load, so a message joins only a turn whose answer streams here.
+const STREAM = uuid();
+const runBody = (content) => ({actorId: session.actorId, memorySessionId: session.memorySessionId,
+                               runId: uuid(), threadId: 'resolved-by-agent',
+                               messages: [{id: uuid(), role: 'user', content}],
+                               tools: [], context: [], state: {},
+                               forwardedProps: {streamId: STREAM}});
 
+const postRun = async (content) => fetch(runtimeUrl(), {
+  method: 'POST', body: JSON.stringify(runBody(content)),
+  headers: await runtimeHeaders('text/event-stream'),
+});
+
+// Each AG-UI event of a response, in order; `onEvent` may await.
+async function readEvents(res, onEvent) {
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = '';
   for (;;) {
@@ -547,9 +570,41 @@ async function ask(content) {
       const line = frame.split('\n').find(l => l.startsWith('data: '));
       if (!line) continue;
       let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-      render(ev);
+      await onEvent(ev);
     }
   }
+}
+
+// A message sent while this tab's turn runs joins it, as in Lark chat: the agent hands it to
+// the running turn, whose stream carries the answer — below this message, on a card of its
+// own — and this request only says it was taken. If the turn had just ended, the thread was
+// free and this request is a turn of its own: shown once the one before has finished.
+let steerQueue = [];   // texts handed to the running turn, oldest first
+async function steerIn(text) {
+  const res = await postRun(text);
+  if (!res.ok) return say('err', '请求失败：' + res.status);
+  let decided = false, own = false;
+  const started = [];
+  await readEvents(res, async (ev) => {
+    if (!decided) {
+      if (ev.type === 'RUN_STARTED') { started.push(ev); return; }
+      decided = true;
+      if (ev.type === 'CUSTOM' && ev.name === 'queued') { steerQueue.push(text); return; }
+      if (ev.type === 'RUN_ERROR') { say('err', ev.message || '出错了'); return; }
+      own = true;
+      await turnDone;
+      beginTurn(text);
+      started.forEach(render);
+    }
+    if (own) render(ev);
+  });
+  if (own) endTurn();
+}
+
+async function ask(content) {
+  const res = await postRun(content);
+  if (!res.ok) throw new Error('请求失败：' + res.status);
+  await readEvents(res, render);
 }
 
 // --- the answer, laid out the way the Lark card is ----------------------------
@@ -657,6 +712,17 @@ class Turn {
     paintMarkdown(this.text, this.raw.trimStart());
   }
   append(el) { this.el.append(el); this.scroll(); }
+  isEmpty() { return !this.el.querySelector('.block, .file, .consent') && !this.toolsDone; }
+  compacting(started) {   // a summary is written without a word streamed, so say so
+    if (started) {
+      this.compactSince = performance.now();
+      this.compact = pill('🗜️ 正在整理较早的对话', 'work');
+      this.append(this.compact);
+    } else if (this.compact) {
+      setPill(this.compact, `🗜️ 整理较早的对话 · ${secs(performance.now() - this.compactSince)} 秒`, '');
+      this.compact = null;
+    }
+  }
   finish() {
     this.enter('done'); this.endWait();
     const parts = [];
@@ -671,9 +737,42 @@ class Turn {
   }
 }
 
+// A file the agent sent: a picture shows, anything else downloads. A stored one comes as a
+// short-lived link (re-signed whenever the history is read), served inline only if it is a
+// raster picture; one the deployment could not store comes as bytes, gone on reload.
+const PICTURES = {png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+                  webp: 'image/webp', bmp: 'image/bmp'};
+function sentFile({name, size, data, url}) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  let href = url;
+  if (!href && data) {
+    const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+    href = URL.createObjectURL(new Blob([bytes], {type: PICTURES[ext] || 'application/octet-stream'}));
+  }
+  const box = document.createElement('div');
+  box.className = 'file';
+  if (href && PICTURES[ext]) {
+    const img = document.createElement('img');
+    img.src = href; img.alt = name;
+    box.append(img);
+  }
+  const label = `📎 ${name}（${size >= 1e6 ? (size / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(size / 1e3)) + ' kB'}）`;
+  if (!href) {          // a history entry whose link could not be signed
+    box.append(label);
+    return box;
+  }
+  const a = document.createElement('a');
+  a.href = href; a.textContent = label; a.target = '_blank'; a.rel = 'noopener';
+  if (!url) a.download = name;   // a stored file names itself in its Content-Disposition
+  box.append(a);
+  return box;
+}
+
 function render(ev) {
   if (ev.type !== 'RUN_STARTED') firstEventArrived();
-  if (!turn && ev.type !== 'RUN_ERROR') turn = new Turn();
+  // Marks about the conversation, not content: none of them opens a card.
+  const mark = ev.type === 'CUSTOM' && ['steered', 'queued', 'unanswered'].includes(ev.name);
+  if (!turn && ev.type !== 'RUN_ERROR' && !mark) turn = new Turn();
   switch (ev.type) {
     // The stream ends by itself, so this only matters as the signal that it ended
     // cleanly — a dropped connection looks identical without it.
@@ -687,6 +786,20 @@ function render(ev) {
     // A tool of this run was refused for want of a grant: offer to authorise, here.
     case 'CUSTOM':
       if (ev.name === 'consent') turn.append(consent.prompt(ev.value && ev.value.idp));
+      if (ev.name === 'file' && ev.value) turn.append(sentFile(ev.value));
+      // What follows answers a message sent mid-turn, which sits below this card. A card
+      // that shows nothing yet is dropped rather than left as an empty one.
+      if (ev.name === 'steered') {
+        if (turn && turn.isEmpty()) turn.el.closest('.row').remove();
+        else if (turn) turn.finish();
+        turn = null;
+        lastAsk = steerQueue.splice(0).join('\n') || lastAsk;
+      }
+      if (ev.name === 'unanswered') {
+        say('err', `还有 ${(ev.value && ev.value.count) || 1} 条消息没来得及处理，请重新发送。`);
+        steerQueue = [];
+      }
+      if (ev.name === 'compacting' && turn) turn.compacting(!!(ev.value && ev.value.started));
       break;
   }
 }
@@ -725,29 +838,56 @@ function showPending() {
 }
 
 // One message out: a /command to the router, anything else as a turn to the Runtime.
+let running = false;   // this tab's turn is streaming
+let turnDone = Promise.resolve(), turnEnded = () => {};
+
+// Text can still be sent while the answer streams; it joins this turn.
+function beginTurn(text) {
+  lastAsk = text;
+  running = true;
+  turnDone = new Promise((resolve) => { turnEnded = resolve; });
+  $('q').disabled = false; $('send').disabled = false;
+  $('q').placeholder = '回答中，可以继续补充…';
+  $('q').focus();
+}
+
+function endTurn() {
+  running = false;
+  steerQueue = [];
+  $('q').placeholder = '说点什么…（/help 查看命令）';
+  firstEventArrived();   // also the fallback for a turn that produced no events at all
+  if (turn) { turn.finish(); turn = null; }   // a stream that broke off still ends its turn
+  enableInput(true);
+  $('q').focus();
+  turnEnded();
+}
+
 async function send(text, image = null) {
+  const isCommand = text.startsWith('/') && !image;
+  if (running) {
+    if (isCommand || image) return say('err', isCommand ? '这一轮回答结束后再发命令。' : '这一轮回答结束后再发图片。');
+    say('me', text);
+    try { await steerIn(text); } catch (err) { say('err', String(err && err.message || err)); }
+    return;
+  }
   const mine = say('me', text);
   if (image) {
     const img = document.createElement('img'); img.src = image.dataUrl; mine.append(img);
   }
   enableInput(false);
-  const isCommand = text.startsWith('/') && !image;
   waitingForFirst = say('think', isCommand ? '执行中…' : '思考中…');
   try {
     if (isCommand) await runCommand(text);
     else {
       await syncSession(mine.closest('.row'), waitingForFirst);
-      lastAsk = image ? null : text;
+      beginTurn(image ? null : text);
       await ask(image
         ? [{type: 'text', text: text || '看看这张图。'},
            {type: 'image', source: {type: 'data', value: image.value, mimeType: image.mimeType}}]
         : text);
     }
   } catch (err) { say('err', String(err && err.message || err)); }
-  firstEventArrived();   // also the fallback for a turn that produced no events at all
-  if (turn) { turn.finish(); turn = null; }   // a stream that broke off still ends its turn
-  enableInput(true);
-  $('q').focus();
+  endTurn();
 }
 
 $('f').addEventListener('submit', async (e) => {

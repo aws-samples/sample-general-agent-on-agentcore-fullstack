@@ -251,8 +251,9 @@ def _lark():
 def _deliver(box, channel, path="report.pdf"):
     """Call the tool the way a run does: the surface arrives in the config, not the args."""
     tools = _tools(box)
-    return tools["deliver_file"].func(
+    text, _artifact = tools["deliver_file"].func(
         path, {"configurable": {"delivery": channel}})
+    return text
 
 
 def test_a_path_outside_the_workspace_is_refused_before_any_upload(_lark):
@@ -287,16 +288,53 @@ def test_the_file_goes_where_this_run_says_not_where_the_last_one_did(_lark):
 
 
 def test_a_surface_that_cannot_carry_files_says_so_instead_of_using_lark(_lark):
-    out = _deliver(_DeliverBox(), delivery.NoDelivery("the web page"))
-    assert "the web page" in out and "Do not claim it was sent" in out
+    out = _deliver(_DeliverBox(), delivery.NoDelivery("A2A"))
+    assert "A2A" in out and "Do not claim it was sent" in out
     assert not _lark["upload"].called and not _lark["file"].called
+
+
+def test_a_file_for_the_web_page_is_stored_and_its_key_kept_out_of_the_models_sight(_lark):
+    """Stored, so a reload shows it again as in a Lark chat: the event carries a link, and the
+    key rides on the tool message's artifact rather than in what the model reads."""
+    out_files: list = []
+    channel = delivery.WebDelivery(out_files, "web:s-1")
+    with mock.patch.object(delivery.deliveries, "configured", return_value=True), \
+         mock.patch.object(delivery.deliveries, "put", return_value="deliveries/o/u/chart.png") as put, \
+         mock.patch.object(delivery.deliveries, "url", return_value="https://signed") as url:
+        text, artifact = _tools(_DeliverBox(size=3))["deliver_file"].func(
+            "chart.png", {"configurable": {"delivery": channel}})
+    assert put.call_args.args == ("web:s-1", "chart.png", b"\0" * 3)
+    assert url.call_args.args == ("deliveries/o/u/chart.png", "chart.png", "web:s-1")
+    assert "stays in the conversation" in text and "deliveries/" not in text
+    assert artifact == {"file": {"key": "deliveries/o/u/chart.png", "name": "chart.png", "size": 3}}
+    assert out_files == [{"name": "file", "value": {"name": "chart.png", "size": 3,
+                                                     "url": "https://signed"}}]
+    assert not _lark["upload"].called and not _lark["file"].called
+
+
+def test_a_file_for_the_web_page_goes_onto_its_own_run_and_never_to_lark(_lark):
+    """Without storage the bytes ride on the event, and the model is told they are gone on
+    reload."""
+    import base64
+    out_files: list = []
+    with mock.patch.object(delivery.deliveries, "configured", return_value=False):
+        reply = _deliver(_DeliverBox(size=3), delivery.WebDelivery(out_files), "chart.png")
+    assert "Sent chart.png to the page" in reply and "stays in the workspace" in reply
+    assert out_files == [{"name": "file", "value": {
+        "name": "chart.png", "size": 3, "data": base64.b64encode(b"\0" * 3).decode()}}]
+    assert not _lark["upload"].called and not _lark["file"].called
+    # Refused before the bytes are read when the page could not take it.
+    big = _DeliverBox(size=delivery.WebDelivery.MAX_BYTES + 1)
+    assert "takes 8 MB" in _deliver(big, delivery.WebDelivery(out_files), "huge.zip")
+    assert len(out_files) == 1
 
 
 def test_a_run_with_no_surface_refuses_rather_than_guessing(_lark):
     """Forgetting to set the surface must cost a refusal, never a delivery to the wrong
     person — that is the whole reason the target is not kept on the session."""
     tools = _tools(_DeliverBox())
-    out = tools["deliver_file"].func("report.pdf", {"configurable": {}})
+    out, artifact = tools["deliver_file"].func("report.pdf", {"configurable": {}})
+    assert artifact is None
     assert "cannot receive files" in out
     assert not _lark["upload"].called
 
@@ -423,3 +461,37 @@ def test_the_access_point_token_is_per_file_system_not_per_actor():
             code_tools._access_point_for("lark:ou_same")
     assert tokens[0] != tokens[1], "same user, two file systems: tokens must differ"
     assert tokens[0] == tokens[2], "same user, same file system: the retry must be idempotent"
+
+
+def test_a_picture_from_the_page_is_written_to_the_workspace_from_its_own_bytes():
+    import images
+    box = mock.Mock()
+    with mock.patch.object(images.lark_notify, "fetch_message_resource") as fetch:
+        name = images.save_to_workspace(box, {"kind": "image", "source": "web", "data": b"jpg",
+                                             "name": "image-1.jpg"}, 1)
+    assert name == "image-1.jpg" and not fetch.called
+    box.write_bytes.assert_called_once_with("image-1.jpg", b"jpg")
+
+
+def test_two_files_sent_in_one_message_each_keep_their_own_record(_lark):
+    """Through the real ToolNode, which runs a message's tool calls in parallel: a record kept
+    on the shared delivery object lost one of them."""
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode
+    channel = delivery.WebDelivery([], "web:s-1")
+    calls = [{"name": "deliver_file", "args": {"path": n}, "id": n, "type": "tool_call"}
+             for n in ("one.png", "two.png")]
+    with mock.patch.object(delivery.deliveries, "configured", return_value=True), \
+         mock.patch.object(delivery.deliveries, "put", side_effect=lambda a, n, d: f"deliveries/o/{n}"), \
+         mock.patch.object(delivery.deliveries, "url", return_value="https://signed"):
+        g = StateGraph(MessagesState)
+        g.add_node("tools", ToolNode([_tools(_DeliverBox(size=3))["deliver_file"]]))
+        g.add_edge(START, "tools")
+        g.add_edge("tools", END)
+        out = g.compile().invoke({"messages": [AIMessage(content="", tool_calls=calls)]},
+                                 config={"configurable": {"delivery": channel}})
+        out = {"messages": [m for m in out["messages"] if m.type == "tool"]}
+    kept = {m.tool_call_id: (m.artifact or {}).get("file", {}).get("key") for m in out["messages"]}
+    assert kept == {"one.png": "deliveries/o/one.png", "two.png": "deliveries/o/two.png"}
+    assert all("deliveries/" not in m.content for m in out["messages"])

@@ -291,6 +291,15 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
                 return f"The sandbox could not run that ({type(e).__name__})."
         return run
 
+    def _with_artifact(fn):
+        """(text, artifact) for a content_and_artifact tool: a surface's send may hand back
+        an artifact with its sentence; a refusal or a failure is text alone."""
+        @functools.wraps(fn)
+        def run(path: str, config: RunnableConfig = None):
+            out = fn(path, config)
+            return out if isinstance(out, tuple) else (out, None)
+        return run
+
     # Every call is prefixed with a cd: the sandbox's own working directory is elsewhere
     # (/opt/amazon/genesis1p-tools/var) and anything written there dies with the session.
     # The model is not told about the mount — it just has a working directory that persists.
@@ -392,7 +401,9 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
                 "file does or does not exist, since it persists from earlier conversations."),
             args_schema=_ListFilesArgs),
         StructuredTool.from_function(
-            func=_guard(deliver_file), name="deliver_file",
+            func=_with_artifact(_guard(deliver_file)), name="deliver_file",
+            # The stored file's key goes on the tool message, not into the model's context.
+            response_format="content_and_artifact",
             description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "Send a file from the workspace to the person you are talking to, so they "
                 "can open it. The workspace is not visible to them, so a file they asked "
