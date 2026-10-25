@@ -179,6 +179,13 @@ async def handle_invocations(request: web.Request) -> web.Response:
         if refused:
             return refused
 
+    # Before the AG-UI branch, or a session the page talks on reads as served for 0 s.
+    now = time.monotonic()
+    if sid:
+        if sid not in _session_first_seen and len(_session_first_seen) >= _SESSIONS_TRACKED:
+            _session_first_seen.pop(next(iter(_session_first_seen)))  # oldest inserted
+        _session_first_seen.setdefault(sid, now)
+
     # A browser on the AG-UI path posts a RunAgentInput, which carries no `action`. It is
     # answered as an SSE event stream; everything below is the router's JSON protocol. Placed
     # after workload_token so both paths use the one value — reading the headers separately
@@ -186,12 +193,6 @@ async def handle_invocations(request: web.Request) -> web.Response:
     if is_agui:
         log.info("dispatch: agui  instance=%s session=%s", _instance(), sid[:24])
         return await agui.handle(request, payload, workload_token)
-
-    now = time.monotonic()
-    if sid:
-        if sid not in _session_first_seen and len(_session_first_seen) >= _SESSIONS_TRACKED:
-            _session_first_seen.pop(next(iter(_session_first_seen)))  # oldest inserted
-        _session_first_seen.setdefault(sid, now)
 
     if action == "status":
         return web.json_response({

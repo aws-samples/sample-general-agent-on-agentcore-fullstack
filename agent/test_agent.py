@@ -2430,6 +2430,14 @@ def test_only_the_probes_go_without_a_bearer():
     assert 'action not in ("status", "warmup")' in src
 
 
+def test_a_session_the_page_talks_on_counts_as_served_from_its_first_turn():
+    """/status reported 「服务本会话 0 秒」 for a session that had just served a web turn: the
+    AG-UI branch returned before the session was recorded."""
+    import server, inspect
+    src = inspect.getsource(server.handle_invocations)
+    assert src.index("_session_first_seen.setdefault(sid") < src.index("if is_agui:")
+
+
 def test_consent_is_asked_for_the_system_the_tool_acts_on():
     """A Google grant without a Lark one was walled with the Lark card for google_whoami:
     the wall keyed on Lark alone. Each tool now walls only on its own system's grant."""
