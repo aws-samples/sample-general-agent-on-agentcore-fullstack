@@ -7,8 +7,8 @@ The README has the short version. This page is the detail: every step, every opt
 Prereqs: `uv` (Docker only with `AGENT_BUILD=local`), the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `agentcore-fullstack` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
 
 ```bash
-cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID) + Lark appId/appSecret/encryptKey/token + your open_id
-./deploy.sh                   # everything, in order — ends by printing the two URLs to register in Lark
+cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID), plus a Lark app, the web page, or both
+./deploy.sh                   # everything, in order — ends by printing what to register in Lark, and the web page's URL
 ```
 
 That's the whole deploy. It runs the steps in dependency order and nothing stops to ask you anything: the two values you must paste into the Lark console don't block the deploy, they only gate the bot at runtime, so they're printed together at the end (`./deploy.sh urls` reprints them).
@@ -22,10 +22,10 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 | `./deploy.sh webui` | the web chat page on S3 + CloudFront — skipped unless `WEBUI=true` |
 | `./deploy.sh a2a` | the A2A Runtime (same image, `SERVER_MODE=a2a`) — then `scripts/a2a-demo.sh` drives it as a peer would |
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
-| `./deploy.sh 3lo` | workload identity + the `agentcore-fullstack-3lo` OAuth credential provider |
+| `./deploy.sh 3lo` | workload identity + the OAuth credential providers: `<name>-3lo` for Lark (only with a Lark app), `<name>-google` when Google is configured |
 | `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
 | `./deploy.sh runtime` | point the agent Runtime at the image `base` published — agent code changes need `base` first |
-| `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` |
+| `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` — skipped by a full deploy without a Lark app |
 | `./deploy.sh approvals` | subscribe to Lark approval events for each `AGENT_DECIDE_APPROVAL_CODES` definition — no-op when that is empty. Ticking the event in the console is **not** sufficient; Lark delivers approval events only for definitions also subscribed through the API |
 
 Order matters in one place: `3lo` and `gateway` precede `runtime`, because the agent Runtime is created with the provider name and the gateway URL baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
@@ -34,7 +34,13 @@ Order matters in one place: `3lo` and `gateway` precede `runtime`, because the a
 
 Per-deployment ids (runtime/gateway) go to `.cdk-state.<DEPLOYMENT_NAME>.json` (gitignored), so `cdk.json` stays free of environment state. `DEPLOYMENT_NAME` starts every resource name, so deployments with different names live side by side in one account and region; `scripts/destroy.sh` removes only the one `.env` (or the environment) names.
 
-Optional web chat: set `WEBUI=true` in `.env`, then register the printed domain on the Lark app ([step 5](docs/console-setup.md#lark-console-setup)). CloudFront only assigns the domain at deploy time and the router must allow that exact origin to trade an h5 code for a JWT, so `./deploy.sh webui` writes it to `.cdk-state.<name>.json` and re-deploys the router itself — the same route the file system id takes. Off by default: without the Lark-side registration the page loads but can establish nobody.
+Optional web chat: set `WEBUI=true` and `WEB_ADMIN_EMAIL` in `.env`. The page has its own sign-in, Cognito's hosted login, so it works in any browser; inside the Lark client it signs in with Lark's h5 code instead, which needs the printed domain registered on the Lark app ([step 5](docs/console-setup.md#lark-console-setup)). CloudFront only assigns the domain at deploy time, and three stacks need it — the hosted login's callback, the router's CORS origin, and where the shim sends a web user back after a consent — so `./deploy.sh webui` writes it to `.cdk-state.<name>.json` and re-deploys those itself, the same route the file system id takes. It then creates `WEB_ADMIN_EMAIL` as the first user, prints a temporary password, and puts them in the `admins` group.
+
+A web user is `web:{sub}` — their own identity and conversation, not linked to any Lark user. Lark and Google are downstream systems to them: a tool that needs one shows an 授权 button in the chat, and the consent completes on the page with the user's own token. The admin manages who may sign in on the page's 管理 view (`admin.html`) — invite (Cognito emails a temporary password) and remove (signed out everywhere, then deleted); `scripts/manage-users.sh` does the same from a shell. Self sign-up is off, so the pool is the allowlist.
+
+### Without Lark
+
+Leave `LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_ENCRYPT_KEY`, `LARK_VERIFICATION_TOKEN` and `LARK_ADMIN_OPEN_ID` empty, and set `WEBUI=true` and `WEB_ADMIN_EMAIL`. Preflight refuses a half-filled Lark app, a deployment nobody could reach (no Lark and no web page), and approval codes without Lark. The deploy then builds no Lark MCP server, registers no Lark provider, seeds no Lark secret and subscribes to no Lark events; the agent has no Lark tools, and Google, web search, code execution and memory work as they do with Lark. Adding a Lark app later is a matter of filling the keys and running `./deploy.sh` again.
 
 Optional web search: set `WEB_SEARCH=true` in `.env` before deploying (or run `./deploy.sh gateway` then `./deploy.sh runtime`). That provisions a Gateway fronting AgentCore's built-in Web Search connector — **in us-east-1, the only region offering it**, so the agent calls it cross-region. Search carries no end-user identity, so it uses `GATEWAY_IAM_ROLE` and never touches the per-user 3LO path the Lark tools have to avoid. Off by default; the agent just runs without the tool.
 

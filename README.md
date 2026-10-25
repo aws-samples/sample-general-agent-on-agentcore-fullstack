@@ -15,9 +15,9 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT--0-3da639?style=flat-square">
 </p>
 
-A general-purpose agent on **Amazon Bedrock AgentCore**, reachable from **Lark (Feishu) chat**, a web page, and peer agents over A2A.
+A general-purpose agent on **Amazon Bedrock AgentCore**, reachable from **Lark (Feishu) chat**, a web page with its own sign-in, and peer agents over A2A. Lark is optional: without it the web page is the whole product.
 
-The point of the sample is one property: **every tool acts as the person who asked.** A message resolves to one Lark user, and any tool touching their data calls the downstream service — Lark, Google — with *that user's own OAuth token*, vaulted by AgentCore Identity. The service adjudicates access, so there is no second permission system to keep in sync.
+The point of the sample is one property: **every tool acts as the person who asked.** A message resolves to one user — a Lark user, or a web user signed in at the page's hosted login — and any tool touching their data calls the downstream service — Lark, Google — with *that user's own OAuth token*, vaulted by AgentCore Identity. The service adjudicates access, so there is no second permission system to keep in sync.
 
 > **Disclaimer.** This is sample code, for non-production usage. You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment. See [docs/security.md](docs/security.md) for what it does and does not defend against.
 
@@ -33,7 +33,8 @@ The point of the sample is one property: **every tool acts as the person who ask
                                         └──────────────────┬─────────────────────────┘
   Lark bot chat ──webhook──▶ Router Lambda                 │ the user's own token
   Lark h5 page  ──h5 code──▶ (mints the JWT)               │
-  Peer agent    ──bearer───▶ A2A Runtime                   ▼
+  Web page      ──own JWT (Cognito hosted login)──┐        │
+  Peer agent    ──bearer───▶ A2A Runtime          │        ▼
                                   └──────▶  Agent (AgentCore Runtime)  ──▶  Lark MCP server
                                             LangGraph + Bedrock             acts AS the user
                                             DynamoDB checkpoints                    │
@@ -53,7 +54,7 @@ Ten layers, each with a real implementation rather than a stub — that is the "
 
 | Layer | What it decides | How it's built |
 |---|---|---|
-| **Channel** | how a turn starts, how the answer returns | Lark webhook → router Lambda → answer typed into a streaming CardKit card. Two more surfaces reach the same agent: a page inside Lark (AG-UI over SSE) and A2A for peers |
+| **Channel** | how a turn starts, how the answer returns | Lark webhook → router Lambda → answer typed into a streaming CardKit card. Two more surfaces reach the same agent: a web page (AG-UI over SSE; Cognito hosted login, or Lark's h5 sign-in inside the Lark client) that shows a turn the way the card does, and A2A for peers |
 | **Model** | which model answers | **Bedrock** over Converse — an open-weight model by default (Kimi K3), any streaming tool-use model via `MODEL_ID`; prompt caching (`cachePoint`) where the model supports it |
 | **Agent loop** | the prompt, and how tool calls iterate | LangGraph `create_agent`, plus threshold-triggered summarisation to bound a permanent thread |
 | **Identity** | who this turn is, and whose credentials its tools may use | Cognito mints the signed identity; **AgentCore Identity** vaults each person's grant per downstream system; tools act as them |
@@ -68,6 +69,8 @@ Two AgentCore primitives are deliberately **not** used: Browser (nothing here ne
 
 Four layers ship switched off, because each adds cost or console work: `WEB_SEARCH`, `WEBUI`, `A2A`, and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
 
+Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true` and `WEB_ADMIN_EMAIL`, and the deploy serves the web page alone: users sign in at its hosted login, the admin invites them on its 管理 view, and Lark and Google are downstream systems each user authorizes from the chat when a tool first needs one → [docs/deploy.md](docs/deploy.md#without-lark).
+
 ## Layout
 
 | Path | What |
@@ -76,7 +79,7 @@ Four layers ship switched off, because each adds cost or console work: `WEB_SEAR
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
 | `stacks/` | security, agentcore, router, shim, gateway, observability, plus sandbox and webui when their flags are on |
 | `agent/` | the agent container: HTTP contract + DynamoDB checkpoints + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`). `code_tools.py` runs generated code in a per-user sandbox; `agui.py` serves the browser off the same Runtime; `a2a_server.py` is a second entrypoint on the same image (`SERVER_MODE=a2a`) |
-| `webui/` | the web chat page — one static file, no build step; deploy-time values arrive as `config.js` |
+| `webui/` | the web chat page and the admin page (`admin.html`, who may sign in) — static files sharing `login.js`, no build step; deploy-time values arrive as `config.js` |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-servers/` | One directory per MCP server, one Runtime each: `lark-cli/` acts as the user against Lark, `google/` does the same against Google (the second system, added to test that the identity chain is not Lark-specific), `approval/` runs approval decisions on the app identity. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
@@ -90,12 +93,12 @@ Four layers ship switched off, because each adds cost or console work: `WEB_SEAR
 Needs `uv`, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. Images build natively on ARM64 in CodeBuild; Docker is needed only with `AGENT_BUILD=local`.
 
 ```bash
-cp .env.example .env    # deployment target + Lark app credentials + your open_id
+cp .env.example .env    # deployment target, plus a Lark app or the web page (or both)
 ./deploy.sh             # everything, in dependency order
 tests/run.sh            # unit suites, no AWS needed
 ```
 
-`./deploy.sh` never stops to ask you anything. At the end it prints two URLs to paste into the Lark console — they don't block the deploy, they gate the bot at runtime (`./deploy.sh urls` reprints them).
+`./deploy.sh` never stops to ask you anything. With a Lark app, it ends by printing two URLs to paste into the Lark console — they don't block the deploy, they gate the bot at runtime (`./deploy.sh urls` reprints them). With the web page, it prints the page's URL and the admin's temporary password.
 
 Three things to know before the first run:
 
@@ -103,7 +106,7 @@ Three things to know before the first run:
 - **Individual steps are idempotent** (`./deploy.sh base|mcp|3lo|runtime|lark|…`), and the order matters in one place → [docs/deploy.md](docs/deploy.md).
 - **Tear down with `scripts/destroy.sh`.** Deleting the OAuth provider purges every user's vaulted token and mints a new callback URL to register.
 
-Then message the bot. `/help` lists the commands in chat:
+Then message the bot, or sign in to the web page. `/help` lists the commands, the same on both:
 
 | Command | What it does |
 |---|---|
