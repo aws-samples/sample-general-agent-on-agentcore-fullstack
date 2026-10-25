@@ -976,6 +976,56 @@ def test_a_web_caller_is_web_sub_and_only_from_the_web_client():
         assert identity.is_user_allowed("web", "s-1") is True
 
 
+def test_only_an_admin_manages_web_users_and_never_lark_users_or_themselves():
+    """The admin page is gated on the admins group of the verified token, not on the page
+    hiding a link; Lark users are the router's own, and an admin cannot lock everyone out."""
+    import index, identity, json as _j
+    admin = {"sub": "s-a", "client_id": "web-client", "username": "ann@example.com",
+             "cognito:groups": "[admins]"}
+    user = {**admin, "sub": "s-u", "username": "bob@example.com", "cognito:groups": ""}
+
+    def call(claims, method, body=None):
+        return index._web_admin(_web_event(claims), method, _j.dumps(body) if body else "")
+    with mock.patch.object(index, "_WEB_CLIENT_ID", "web-client"), \
+         mock.patch.object(identity, "resolve_user", return_value=("u-web", True)), \
+         mock.patch.object(index.cognito, "web_users", return_value=[{"email": "bob@example.com"}]), \
+         mock.patch.object(index.cognito, "invite") as invite, \
+         mock.patch.object(index.cognito, "remove") as remove:
+        assert call(user, "GET")["statusCode"] == 403
+        assert call(user, "POST", {"email": "eve@example.com"})["statusCode"] == 403
+        assert _j.loads(call(admin, "GET")["body"])["users"] == [{"email": "bob@example.com"}]
+        assert call(admin, "POST", {"email": " Eve@Example.com "})["statusCode"] == 200
+        invite.assert_called_once_with("eve@example.com")
+        for bad in ("lark:ou_x", "not-an-email", ""):
+            assert call(admin, "POST", {"email": bad})["statusCode"] == 400, bad
+        assert call(admin, "DELETE", {"email": "ann@example.com"})["statusCode"] == 400
+        assert call(admin, "DELETE", {"email": "bob@example.com"})["statusCode"] == 200
+        remove.assert_called_once_with("bob@example.com")
+    # The groups claim also arrives as several names in one string.
+    with mock.patch.object(index, "_WEB_CLIENT_ID", "web-client"), \
+         mock.patch.object(identity, "resolve_user", return_value=("u-web", True)), \
+         mock.patch.object(index.cognito, "web_users", return_value=[]):
+        assert call({**admin, "cognito:groups": "[staff admins]"}, "GET")["statusCode"] == 200
+        assert call({**admin, "cognito:groups": "[administrators]"}, "GET")["statusCode"] == 403
+
+
+def test_the_users_listed_are_the_web_ones_with_who_is_an_admin():
+    import cognito
+    client = mock.Mock()
+    client.list_users_in_group.return_value = {"Users": [{"Username": "ann@example.com"}]}
+    client.list_users.side_effect = [
+        {"Users": [{"Username": "ann@example.com", "UserStatus": "CONFIRMED"},
+                   {"Username": "lark:ou_x", "UserStatus": "CONFIRMED"}], "PaginationToken": "p2"},
+        {"Users": [{"Username": "bob@example.com", "UserStatus": "FORCE_CHANGE_PASSWORD"}]}]
+    with mock.patch.object(cognito, "_cognito", client):
+        assert cognito.web_users() == [
+            {"email": "ann@example.com", "status": "CONFIRMED", "admin": True},
+            {"email": "bob@example.com", "status": "FORCE_CHANGE_PASSWORD", "admin": False}]
+        for f in (cognito.invite, cognito.remove):
+            with pytest.raises(ValueError):
+                f("lark:ou_x")
+
+
 def test_a_web_command_reaches_the_agent_with_the_callers_own_token():
     """Minting for `web:{sub}` would create a shadow Cognito user whose vault namespace is
     not the page's: /auth and /tools would read somebody else's grants."""

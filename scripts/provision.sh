@@ -567,13 +567,17 @@ web_admin() {
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
   if aws cognito-idp admin-get-user --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" >/dev/null 2>&1; then
     echo "  web user $WEB_ADMIN_EMAIL exists"
-    return 0
+  else
+    tmp="Tmp$(openssl rand -hex 6)9"
+    aws cognito-idp admin-create-user --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" \
+      --temporary-password "$tmp" --desired-delivery-mediums EMAIL \
+      --user-attributes Name=email,Value="$WEB_ADMIN_EMAIL" Name=email_verified,Value=true >/dev/null
+    printf '\033[1;32m  sign in as %s with the temporary password %s\033[0m\n' "$WEB_ADMIN_EMAIL" "$tmp"
   fi
-  tmp="Tmp$(openssl rand -hex 6)9"
-  aws cognito-idp admin-create-user --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" \
-    --temporary-password "$tmp" --desired-delivery-mediums EMAIL \
-    --user-attributes Name=email,Value="$WEB_ADMIN_EMAIL" Name=email_verified,Value=true >/dev/null
-  printf '\033[1;32m  sign in as %s with the temporary password %s\033[0m\n' "$WEB_ADMIN_EMAIL" "$tmp"
+  # The admin page is for the admins group; this is how its first member gets in.
+  aws cognito-idp admin-add-user-to-group --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" \
+    --group-name admins
+  echo "  $WEB_ADMIN_EMAIL manages web users at admin.html"
 }
 
 

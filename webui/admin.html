@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<!--
+  User management for the web page: who may sign in at the hosted login. Self sign-up is off,
+  so the pool is the allowlist. Only for the pool's admins group, which the router checks on
+  the verified token; this page merely hides itself from anyone else. Lark users are the
+  router's own and never appear here.
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理 · General Agent on AgentCore</title>
+<script src="config.js"></script>
+<script src="login.js"></script>
+<style>
+  :root { color-scheme: light dark; --edge: color-mix(in oklab, currentColor 14%, transparent);
+          --accent: #2563eb; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.6 -apple-system, "Segoe UI", "PingFang SC", sans-serif; }
+  header { padding: .7rem 1rem; border-bottom: 1px solid var(--edge); font-weight: 600;
+           display: flex; gap: .6rem; align-items: baseline; }
+  header small { font-weight: 400; opacity: .6; }
+  header a { font-size: 13px; font-weight: 400; color: inherit; text-decoration: none;
+             border: 1px solid var(--edge); border-radius: .6rem; padding: .25rem .6rem; }
+  main { max-width: 46rem; margin: 1.5rem auto; padding: 0 1rem; }
+  h2 { font-size: 16px; margin: 1.5rem 0 .6rem; }
+  form { display: flex; gap: .5rem; }
+  input { flex: 1; padding: .55rem .8rem; border-radius: .6rem; border: 1px solid var(--edge);
+          background: transparent; color: inherit; font: inherit; min-width: 0; }
+  button { padding: .55rem 1rem; border-radius: .6rem; border: 0; font: inherit;
+           background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap; }
+  button.ghost { background: transparent; color: #c0392b; border: 1px solid var(--edge);
+                 padding: .2rem .7rem; font-size: 13px; }
+  button[disabled] { opacity: .45; cursor: default; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .5rem .4rem; border-bottom: 1px solid var(--edge); }
+  th { font-size: 13px; font-weight: 500; opacity: .6; }
+  .tag { font-size: 12px; padding: .05rem .45rem; border-radius: .4rem;
+         background: color-mix(in oklab, var(--accent) 15%, transparent); margin-left: .4rem; }
+  .note { font-size: 13px; opacity: .65; margin-top: .4rem; }
+  #msg { min-height: 1.4em; font-size: 14px; margin-top: .6rem; }
+  #msg.err { color: #c0392b; }
+</style>
+</head>
+<body>
+<header>用户管理 <small id="who">正在登录…</small><span style="flex:1"></span><a href="./">返回对话</a></header>
+<main id="main" hidden>
+  <h2>邀请用户</h2>
+  <form id="invite">
+    <input type="email" id="email" placeholder="对方的邮箱" required autocomplete="off">
+    <button id="send">邀请</button>
+  </form>
+  <div class="note">对方会收到一封带临时密码的邮件，首次登录时设置自己的密码。</div>
+  <div id="msg"></div>
+  <h2>可以登录的用户</h2>
+  <table>
+    <thead><tr><th>邮箱</th><th>状态</th><th></th></tr></thead>
+    <tbody id="users"></tbody>
+  </table>
+  <div class="note">只列出网页用户；从 Lark 进入的用户由 Lark 管理，不在这里。</div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const ROUTER = window.ROUTER_BASE || '';
+const STATUS = {CONFIRMED: '已激活', FORCE_CHANGE_PASSWORD: '待首次登录',
+                RESET_REQUIRED: '需重置密码', UNCONFIRMED: '未确认'};
+
+async function api(method, body) {
+  const r = await fetch(ROUTER + '/web/admin/users', {
+    method, headers: {'Content-Type': 'application/json',
+                      Authorization: 'Bearer ' + await login.token()},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.status);
+  return data;
+}
+
+function note(text, isError = false) {
+  $('msg').textContent = text;
+  $('msg').className = isError ? 'err' : '';
+}
+
+function row(u) {
+  const tr = document.createElement('tr');
+  const who = document.createElement('td');
+  who.textContent = u.email;
+  if (u.admin) {
+    const tag = document.createElement('span');
+    tag.className = 'tag'; tag.textContent = '管理员';
+    who.append(tag);
+  }
+  const status = document.createElement('td');
+  status.textContent = STATUS[u.status] || u.status;
+  const act = document.createElement('td');
+  // The router refuses it too: an admin removing themselves could lock everyone out.
+  if (u.email !== login.email()) {
+    const b = document.createElement('button');
+    b.className = 'ghost'; b.textContent = '移除';
+    b.onclick = async () => {
+      if (!confirm(`移除 ${u.email}？对方会被立即登出，之后无法再登录。`)) return;
+      b.disabled = true;
+      try { await api('DELETE', {email: u.email}); note(`已移除 ${u.email}`); await load(); }
+      catch (e) { note('移除失败：' + e.message, true); b.disabled = false; }
+    };
+    act.append(b);
+  }
+  tr.append(who, status, act);
+  return tr;
+}
+
+async function load() {
+  const {users} = await api('GET');
+  $('users').replaceChildren(...users.map(row));
+}
+
+$('invite').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = $('email').value.trim();
+  if (!email) return;
+  $('send').disabled = true;
+  try {
+    await api('POST', {email});
+    note(`已邀请 ${email}，临时密码已发到对方邮箱。`);
+    $('email').value = '';
+    await load();
+  } catch (err) {
+    note('邀请失败：' + (err.message === 'UsernameExistsException' ? '这个邮箱已经是用户' : err.message), true);
+  } finally { $('send').disabled = false; }
+});
+
+(async () => {
+  try {
+    await login.ready();
+    $('who').textContent = login.email();
+    if (!login.groups().includes('admins')) {
+      $('who').textContent = '仅管理员可用';
+      return;
+    }
+    $('main').hidden = false;
+    await load();
+  } catch (e) {
+    $('who').textContent = '无法加载：' + e.message;
+  }
+})();
+</script>
+</body>
+</html>

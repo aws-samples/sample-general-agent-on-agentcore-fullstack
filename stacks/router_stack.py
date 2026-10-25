@@ -132,7 +132,8 @@ class RouterStack(Stack):
         # a preflight first. Without this it 404s and the page reports only "Failed to fetch".
         cors = apigwv2.CorsPreflightOptions(
             allow_origins=[o.strip() for o in web_allowed_origins.split(",") if o.strip()],
-            allow_methods=[apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
+            allow_methods=[apigwv2.CorsHttpMethod.GET, apigwv2.CorsHttpMethod.POST,
+                           apigwv2.CorsHttpMethod.DELETE, apigwv2.CorsHttpMethod.OPTIONS],
             allow_headers=["content-type", "authorization"],
         ) if web_allowed_origins else None
         self.http_api = apigwv2.HttpApi(
@@ -162,6 +163,11 @@ class RouterStack(Stack):
             for path in ("/web/session", "/web/command", "/web/consent"):
                 self.http_api.add_routes(path=path, methods=[apigwv2.HttpMethod.POST],
                                          integration=integration, authorizer=authorizer)
+            # The admin page; the handler checks the admins group on the verified token.
+            self.http_api.add_routes(
+                path="/web/admin/users",
+                methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST, apigwv2.HttpMethod.DELETE],
+                integration=integration, authorizer=authorizer)
 
         # throttling on default stage
         default_stage = self.http_api.default_stage
@@ -225,6 +231,11 @@ class RouterStack(Stack):
                     "cognito-idp:AdminCreateUser",
                     "cognito-idp:AdminSetUserPassword",
                     "cognito-idp:AdminInitiateAuth",
+                    # The admin page, managing web users.
+                    "cognito-idp:ListUsers",
+                    "cognito-idp:ListUsersInGroup",
+                    "cognito-idp:AdminDeleteUser",
+                    "cognito-idp:AdminUserGlobalSignOut",
                 ],
                 resources=[user_pool_arn],
             )

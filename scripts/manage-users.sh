@@ -5,7 +5,8 @@
 #   scripts/manage-users.sh remove <email>   sign them out everywhere, then delete them
 #   scripts/manage-users.sh list             the web users (Lark users are created by the router)
 #
-# Self sign-up is off, so this is the web's allowlist. Target comes from .env.
+# Self sign-up is off, so this is the web's allowlist; an admin can do the same on the page's
+# 管理 view (admin.html). Target comes from .env.
 set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/lib/env.sh"
 
@@ -34,5 +35,5 @@ case "${1:-}" in
     aws cognito-idp list-users --user-pool-id "$pool" \
       --query "Users[?!starts_with(Username, 'lark:')].[Username,UserStatus]" --output text
     ;;
-  *) sed -n '2,8p' "$0" | cut -c3-; exit 1 ;;
+  *) sed -n '2,9p' "$0" | cut -c3-; exit 1 ;;
 esac

@@ -1109,6 +1109,45 @@ def _web_consent(event: dict, body: str) -> dict:
     return _resp(200, {"ok": True})
 
 
+_EMAIL = re.compile(r"^[^@\s:]+@[^@\s]+\.[^@\s]+$")
+
+
+def _web_admin(event: dict, method: str, body: str) -> dict:
+    """The admin page's user management: GET lists web users, POST {email} invites one,
+    DELETE {email} removes one. A page, not a chat command, so nobody mistakes it for the
+    agent acting. Only for members of the pool's admins group, read from the token API
+    Gateway verified; an admin cannot remove themselves and lock the deployment out."""
+    user_id, actor_id, _, err = _web_caller(event)
+    if err:
+        return err
+    claims = event["requestContext"]["authorizer"]["jwt"]["claims"]
+    # API Gateway hands a list claim over as a string such as "[admins]".
+    groups = str(claims.get("cognito:groups", "")).strip("[]").replace(",", " ").split()
+    if cognito.ADMINS_GROUP not in groups:
+        logger.warning("admin request refused for %s", actor_id)
+        return _resp(403, {"error": "admins only"})
+    if method == "GET":
+        return _resp(200, {"users": cognito.web_users()})
+    payload, err = _json_body(body)
+    if err:
+        return err
+    email = str(payload.get("email") or "").strip().lower()
+    if not _EMAIL.match(email):
+        return _resp(400, {"error": "a valid email is required"})
+    try:
+        if method == "POST":
+            cognito.invite(email)
+        elif email == str(claims.get("username", "")).lower():
+            return _resp(400, {"error": "you cannot remove yourself"})
+        else:
+            cognito.remove(email)
+    except Exception as e:  # noqa: BLE001 — Cognito's reason is what the admin needs
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", type(e).__name__)
+        return _resp(400, {"error": code})
+    logger.info("admin %s %s %s", actor_id, "invited" if method == "POST" else "removed", email)
+    return _resp(200, {"ok": True})
+
+
 def handler(event, context):
     # Async self-invocation path
     if event.get("_async_dispatch"):
@@ -1163,6 +1202,8 @@ def handler(event, context):
         return _web_command(event, body)
     if path.endswith("/web/consent") and method == "POST":
         return _web_consent(event, body)
+    if path.endswith("/web/admin/users") and method in ("GET", "POST", "DELETE"):
+        return _web_admin(event, method, body)
 
     if not path.endswith("/webhook/lark"):
         return _resp(404, {"error": "not found"})

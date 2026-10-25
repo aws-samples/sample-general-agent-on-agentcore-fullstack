@@ -163,3 +163,46 @@ def consent_tokens(actor_id: str) -> list[str]:
     now = time.time()
     return [item[k] for k in ("current", "previous")
             if item.get(k) and float(item.get(k + "Exp", 0)) > now]
+
+
+# --- web users, for the admin page ------------------------------------------------
+# Self sign-up is off, so the pool is the web's allowlist, and these are how an admin edits
+# it without an AWS console. Lark users are the router's own and never listed or touched.
+
+ADMINS_GROUP = "admins"
+
+
+def web_users() -> list[dict]:
+    """[{email, status, admin}] for the pool's web users — every user not named `lark:…`."""
+    admins = {u["Username"] for u in _cognito.list_users_in_group(
+        UserPoolId=_USER_POOL_ID, GroupName=ADMINS_GROUP, Limit=60).get("Users", [])}
+    users, token = [], None
+    while True:
+        page = _cognito.list_users(UserPoolId=_USER_POOL_ID, Limit=60,
+                                   **({"PaginationToken": token} if token else {}))
+        users += [{"email": u["Username"], "status": u.get("UserStatus", ""),
+                   "admin": u["Username"] in admins}
+                  for u in page.get("Users", []) if not u["Username"].startswith("lark:")]
+        token = page.get("PaginationToken")
+        if not token:
+            return users
+
+
+def invite(email: str) -> None:
+    """Create a web user; Cognito emails them a temporary password. The email is the
+    username, so it is what they type at the hosted login."""
+    if email.startswith("lark:"):
+        raise ValueError("Lark users are not managed here")
+    _cognito.admin_create_user(
+        UserPoolId=_USER_POOL_ID, Username=email, DesiredDeliveryMediums=["EMAIL"],
+        UserAttributes=[{"Name": "email", "Value": email},
+                        {"Name": "email_verified", "Value": "true"}])
+
+
+def remove(email: str) -> None:
+    """Sign a web user out everywhere, then delete them. Their access token stays valid until
+    it expires; signing out first revokes the refresh token, so no page can renew it."""
+    if email.startswith("lark:"):
+        raise ValueError("Lark users are not managed here")
+    _cognito.admin_user_global_sign_out(UserPoolId=_USER_POOL_ID, Username=email)
+    _cognito.admin_delete_user(UserPoolId=_USER_POOL_ID, Username=email)

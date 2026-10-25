@@ -67,6 +67,8 @@ class SecurityStack(Stack):
         self.web_login_domain = ""
         if webui:
             page = (web_origin.rstrip("/") + "/") if web_origin else "https://localhost/"
+            # Every page that signs in comes back to itself: the chat and the admin page.
+            pages = [page, page + "index.html", page + "admin.html"]
             domain = self.user_pool.add_domain(
                 "WebLogin",
                 # Unique per region across all accounts, hence the account in it.
@@ -81,11 +83,16 @@ class SecurityStack(Stack):
                 o_auth=cognito.OAuthSettings(
                     flows=cognito.OAuthFlows(authorization_code_grant=True),
                     scopes=[cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL],
-                    callback_urls=[page], logout_urls=[page]),
+                    callback_urls=pages, logout_urls=pages),
                 supported_identity_providers=[cognito.UserPoolClientIdentityProvider.COGNITO],
                 prevent_user_existence_errors=True,
             )
             self.web_login_domain = domain.base_url()
+            # Who may open the admin page and manage web users. The first member is added at
+            # deploy from WEB_ADMIN_EMAIL (scripts/provision.sh).
+            cognito.CfnUserPoolGroup(self, "Admins", user_pool_id=self.user_pool.user_pool_id,
+                                     group_name="admins",
+                                     description="May manage web users on the admin page")
             CfnOutput(self, "WebClientId", value=self.web_client.user_pool_client_id)
             CfnOutput(self, "WebLoginDomain", value=self.web_login_domain)
 
