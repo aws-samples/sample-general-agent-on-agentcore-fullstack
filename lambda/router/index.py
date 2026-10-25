@@ -154,7 +154,7 @@ def _app_identity() -> str:
     sample's whole point is that the two are different: tools reach Lark as the
     *user* (their vaulted token), while replies, reactions and cards go out as the
     *app* (its tenant token). An appId is not a secret, so it is shown whole."""
-    return lark.get_credentials()[0] or "未配置"
+    return lark.get_credentials()[0] or ""
 
 
 # ------------------------- execution environment probe -----------------------
@@ -743,7 +743,8 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
                     .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
         return _panel(
             "运行状态",
-            [("应用身份", _app_identity()), ("用户身份", actor_id)],
+            # A deployment without a Lark app has no app to speak as.
+            [(k, v) for k, v in (("应用身份", _app_identity()), ("用户身份", actor_id)) if v],
             [("会话路由键", rt_sid or "尚未建立（发一条普通消息后创建）"),
              ("当前 microVM", _microvm_line(rt_sid, probe)),
              ("记忆线程", mem_sid),

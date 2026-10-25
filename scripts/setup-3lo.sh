@@ -4,6 +4,7 @@
 #                           with the shim's /return URL on its allowlist (exact-match).
 #   2. OAuth2 credential provider (CustomOauth2) — Lark behind the RFC-6749 shim; the
 #                           Token Vault stores/refreshes each user's Lark token here.
+#                           Only with a Lark app (LARK_APP_ID).
 #
 # Idempotent: existing resources are updated, not recreated. Run after ./deploy.sh base
 # (needs the shim stack outputs) and before the first Lark message.
@@ -19,9 +20,6 @@ set -euo pipefail
 WORKLOAD="$PREFIX-wl"
 PROVIDER="$PREFIX-3lo"
 
-: "${LARK_APP_ID:?set LARK_APP_ID in .env}"
-: "${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}"
-: "${LARK_APP_SECRET:?set LARK_APP_SECRET in .env}"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
@@ -62,6 +60,7 @@ fi
 # rejects clientAuthenticationMethod as an unknown parameter, even though the service
 # accepts it (verified). uv resolves a current botocore, so the script does not depend on
 # how fresh the operator's CLI happens to be.
+if [ "$LARK" = "true" ]; then
 log "OAuth2 credential provider ($PROVIDER)"
 PROVIDER="$PROVIDER" SHIM_ISSUER="$SHIM_ISSUER" SHIM_AUTHORIZE="$SHIM_AUTHORIZE" \
 SHIM_TOKEN="$SHIM_TOKEN" LARK_APP_ID="$LARK_APP_ID" LARK_APP_SECRET="$LARK_APP_SECRET" \
@@ -114,6 +113,9 @@ echo "  drive:drive, docx:document, offline_access"
 echo
 # The shim derives Lark's authorize host from LARK_API_DOMAIN (open.* -> accounts.*).
 echo "Lark API domain in use: $LARK_API_DOMAIN"
+else
+  echo "  lark: off (no LARK_APP_ID) — no Lark provider"
+fi
 
 
 # --- Google: the second downstream system -----------------------------------
@@ -167,12 +169,14 @@ fi
 # exists to test.
 log "IdP registry (injected into the router and agent at deploy time)"
 IDP_REGISTRY="$(PROVIDER="$PROVIDER" GOOGLE_PROVIDER="$GOOGLE_PROVIDER" \
-  HAS_GOOGLE="${GOOGLE_CLIENT_ID:+1}" python3 -c '
+  HAS_GOOGLE="${GOOGLE_CLIENT_ID:+1}" HAS_LARK="${LARK_APP_ID:+1}" python3 -c '
 import json, os
 e = os.environ
-idps = [{"key": "lark", "provider": e["PROVIDER"],
-         "scopes": ["drive:drive", "docx:document", "offline_access"],
-         "label": "Lark"}]
+idps = []
+if e.get("HAS_LARK"):
+    idps.append({"key": "lark", "provider": e["PROVIDER"],
+                 "scopes": ["drive:drive", "docx:document", "offline_access"],
+                 "label": "Lark"})
 if e.get("HAS_GOOGLE"):
     # calendar.readonly is a sensitive scope: fine for test users in Testing, but publishing
     # needs a verification review by Google. Read-only, so a demo cannot change anything.

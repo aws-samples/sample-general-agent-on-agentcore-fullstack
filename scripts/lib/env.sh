@@ -41,6 +41,10 @@ export DEPLOYMENT_NAME
 STATE_FILE=".cdk-state.$PREFIX.json"   # this deployment's ids (gitignored)
 CDK_OUT="cdk.out/$PREFIX"              # its synth output, so two deploys never share a lock
 export REGION AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION"
+# Lark is optional: without LARK_APP_ID a deployment serves the web page alone.
+LARK="$([ -n "${LARK_APP_ID:-}" ] && echo true || echo false)"
+: "${LARK_API_DOMAIN:=https://open.larksuite.com}"
+export LARK LARK_API_DOMAIN
 
 if [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then
   PROFILE=""

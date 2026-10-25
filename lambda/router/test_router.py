@@ -472,9 +472,14 @@ def test_status_shows_both_identities():
     with mock.patch.object(index.lark, "get_credentials",
                            return_value=("cli_a1b2c3d4e5f6g7h8", "s", "v", "k")):
         assert index._app_identity() == "cli_a1b2c3d4e5f6g7h8"
-    # Unconfigured must not blow up or print an empty value.
-    with mock.patch.object(index.lark, "get_credentials", return_value=("", "", "", "")):
-        assert index._app_identity() == "未配置"
+    # A deployment without a Lark app has none to name, so /status leaves the row out.
+    with mock.patch.object(index.lark, "get_credentials", return_value=("", "", "", "")), \
+         mock.patch.object(index.identity, "session_info", return_value={}), \
+         mock.patch.object(index.identity, "get_or_create_memory_session", return_value="m"), \
+         mock.patch.object(index, "probe_agent", return_value=None):
+        assert index._app_identity() == ""
+        text = index.run_command("/status", "u-1", "web:s-1")["text"]
+        assert "应用身份" not in text and "web:s-1" in text
 
 
 # --------------------------- consent resume ---------------------------------

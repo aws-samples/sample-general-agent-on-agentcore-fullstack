@@ -77,18 +77,29 @@ fi
 
 # --- config --------------------------------------------------------------
 [ -f .env ] || fail ".env is missing — start from: cp .env.example .env"
-blank=""
-for k in MODEL_ID LARK_API_DOMAIN LARK_APP_ID LARK_APP_SECRET LARK_ENCRYPT_KEY LARK_VERIFICATION_TOKEN LARK_ADMIN_OPEN_ID; do
-  [ -n "${!k:-}" ] || blank="$blank $k"
+[ -n "${MODEL_ID:-}" ] || fail "unset in .env: MODEL_ID"
+# Lark is all or nothing: half a Lark app deploys a bot that can never answer.
+lark_keys="LARK_APP_ID LARK_APP_SECRET LARK_ENCRYPT_KEY LARK_VERIFICATION_TOKEN LARK_ADMIN_OPEN_ID"
+set_keys="" blank=""
+for k in $lark_keys; do
+  if [ -n "${!k:-}" ]; then set_keys="$set_keys $k"; else blank="$blank $k"; fi
 done
-[ -z "$blank" ] || fail "unset in .env:$blank
-  Get these from the Lark developer console (README → Lark console setup)."
+if [ -n "$set_keys" ] && [ -n "$blank" ]; then
+  fail "Lark is half configured — unset in .env:$blank
+  Fill them from the Lark developer console (README → Lark console setup), or clear all five to deploy without Lark."
+fi
+if [ "$LARK" != "true" ]; then
+  # Without Lark the web page is the only way in, and someone has to be able to sign in.
+  [ "${WEBUI:-false}" = "true" ] || fail "no Lark app and WEBUI is not true — nobody could reach the agent"
+  [ -n "${WEB_ADMIN_EMAIL:-}" ] || fail "no Lark app and WEB_ADMIN_EMAIL is unset — nobody could sign in to the web page"
+  [ -z "${AGENT_DECIDE_APPROVAL_CODES:-}" ] || fail "AGENT_DECIDE_APPROVAL_CODES needs Lark (approvals are Lark's)"
+fi
 
 echo "  deploy  : $DEPLOYMENT_NAME   (state: $STATE_FILE)"
 echo "  account : $ACCOUNT"
 echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
 echo "  model   : $MODEL_ID"
-echo "  lark    : $LARK_API_DOMAIN"
+echo "  lark    : $([ "$LARK" = "true" ] && echo "$LARK_API_DOMAIN" || echo 'off  (web page only)')"
 echo "  build   : $AGENT_BUILD$([ "$AGENT_BUILD" = "local" ] && echo '  (local Docker)' || echo '  (CodeBuild, ARM64 native)')"
 echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"
 echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && echo "  (creates a VPC + S3 Files)" || true)"

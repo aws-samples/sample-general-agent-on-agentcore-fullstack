@@ -22,8 +22,6 @@ set -euo pipefail
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.86}"   # engine = official lark-cli (not lark-mcp)
-: "${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}"
-: "${LARK_APP_ID:?set LARK_APP_ID in .env}"
 
 . scripts/lib/codebuild.sh
 

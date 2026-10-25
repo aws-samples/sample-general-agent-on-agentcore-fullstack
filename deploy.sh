@@ -62,6 +62,17 @@ print_urls() {
   echo "permission scopes and the im.message.receive_v1 event subscription."
 }
 
+# Where to sign in, when the web page is deployed.
+print_web() {
+  local url
+  url="$(aws cloudformation describe-stacks --stack-name "$PREFIX-webui" \
+    --query "Stacks[0].Outputs[?OutputKey=='WebUiUrl'].OutputValue" --output text 2>/dev/null || true)"
+  [ -n "$url" ] && [ "$url" != "None" ] || return 0
+  printf '\n\033[1;32m=== Web chat ===\033[0m\n'
+  echo "  $url"
+  echo "  sign in as ${WEB_ADMIN_EMAIL:-the admin}; add users with scripts/manage-users.sh add <email>"
+}
+
 usage() { sed -n '2,16p' "$0" | cut -c3-; }
 
 case "${1:-all}" in
@@ -81,8 +92,12 @@ case "${1:-all}" in
     run_preflight
     # 3lo and gateway precede runtime: the agent is deployed with the provider,
     # workload and gateway URL baked into its environment.
-    run_base; run_mcp; run_3lo; run_gateway; run_code; run_runtime; run_lark; run_approvals; run_a2a; run_webui
-    print_urls
+    run_base; run_mcp; run_3lo; run_gateway; run_code; run_runtime
+    # Without a Lark app the web page is the whole surface: nothing to register in Lark.
+    if [ "$LARK" = "true" ]; then run_lark; run_approvals; fi
+    run_a2a; run_webui
+    if [ "$LARK" = "true" ]; then print_urls; fi
+    print_web
     ;;
   -h|--help) usage ;;
   *) echo "unknown step: $1"; echo; usage; exit 1 ;;

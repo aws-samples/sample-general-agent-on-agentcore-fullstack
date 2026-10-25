@@ -257,8 +257,13 @@ phase2_runtime() {
   # the symptom is "the bot forgot everything after a timeout", which reads as a bug.
   [ -n "$ckpt_table" ] && [ "$ckpt_table" != "None" ] || \
     echo "  WARNING: no checkpoint table output — conversations will not survive a new microVM"
-  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || {
-    echo "${PREFIX//-/_}_mcp runtime not found — run ./deploy.sh mcp first"; exit 1; }
+  if [ "$LARK" = "true" ]; then
+    [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || {
+      echo "${PREFIX//-/_}_mcp runtime not found — run ./deploy.sh mcp first"; exit 1; }
+  else
+    mcp_url=""
+    echo "  lark tools: off (no LARK_APP_ID)"
+  fi
 
   # Code execution: the Runtime stays PUBLIC. Only the Code Interpreter session joins the
   # sandbox VPC, and only the ids it needs are baked in here. See docs/architecture.md.
@@ -279,10 +284,12 @@ phase2_runtime() {
     CODE_NET="$([ -n "$ci_id" ] && [ "$NAT_GATEWAY" = "true" ] && echo true || true)" \
     GOOGLE_URL="$google_url" \
     CKPT_TABLE="$ckpt_table" CKPT_BUCKET="$ckpt_bucket" \
-    LARK_DOMAIN="$LARK_API_DOMAIN" \
+    LARK_DOMAIN="$LARK_API_DOMAIN" HAS_LARK="${LARK_APP_ID:+1}" \
     uv run python - <<'PYEOF'
 import json, os
 e = os.environ
+# Without a Lark app these stay empty, which is how the agent knows it has no Lark.
+lark = bool(e.get("HAS_LARK"))
 platform_version = "V2"
 env = {
     "BEDROCK_MODEL_ID": e["MODEL"],
@@ -303,12 +310,12 @@ env = {
     "BEDROCK_AGENTCORE_MEMORY_ID": e["MEMORY"],
     "LARK_MCP_URL": e["MCP_URL"],
     "SHIM_RETURN_URL": e["SHIM"],
-    "LARK_OAUTH_PROVIDER": e["PREFIX"] + "-3lo",
+    "LARK_OAUTH_PROVIDER": e["PREFIX"] + "-3lo" if lark else "",
     "AGENT_WORKLOAD_NAME": e["PREFIX"] + "-wl",
     # The execution role may write metrics only to this namespace (agentcore stack).
     "METRICS_NAMESPACE": e["PREFIX"] + "/agent",
-    "LARK_SCOPES": "drive:drive docx:document offline_access",
-    "LARK_SECRET_ID": e["PREFIX"] + "/channels/lark",
+    "LARK_SCOPES": "drive:drive docx:document offline_access" if lark else "",
+    "LARK_SECRET_ID": e["PREFIX"] + "/channels/lark" if lark else "",
     "LARK_API_DOMAIN": e["LARK_DOMAIN"],
     "COGNITO_USER_POOL_ID": e["POOL"],
     "COGNITO_CLIENT_ID": e["CLIENT"],
@@ -715,7 +722,7 @@ case "${1:-all}" in
   --webui)    phase_webui ;;
   --gateway)  phase3_gateway ;;
   all|"")     base_cdk_stacks; phase_memory; phase_code; phase2_runtime; phase3_gateway; phase_a2a; phase_webui
-              log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
+              [ "$LARK" != "true" ] || log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
   *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--code|--runtime|--gateway|--a2a|--webui]"; exit 1 ;;
 esac
 exit
