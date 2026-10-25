@@ -75,6 +75,9 @@ class WebUiStack(Stack):
             destination_bucket=bucket,
             distribution=self.distribution,
             distribution_paths=["/*"],
+            # Without it a browser caches the page heuristically from Last-Modified and keeps
+            # serving the old one after a deploy; revalidating costs a 304.
+            cache_control=[s3deploy.CacheControl.no_cache()],
         )
 
         self.url = f"https://{self.distribution.distribution_domain_name}"
