@@ -97,7 +97,7 @@
              gap: .5rem; }
   #pending img { max-height: 2.4rem; border-radius: .3rem; }
   .file { display: flex; flex-direction: column; gap: .3rem; font-size: 13px; }
-  .file img { max-width: min(28rem, 100%); border-radius: .4rem; border: 1px solid var(--edge); }
+  .file img, .file video { max-width: min(28rem, 100%); border-radius: .4rem; border: 1px solid var(--edge); }
   .file a { color: var(--accent); }
   /* A notice with a button, not a field: tinted and rounded, so nothing reads as an input. */
   .consent { align-self: flex-start; display: flex; gap: .8rem; align-items: center;
@@ -738,17 +738,19 @@ class Turn {
   }
 }
 
-// A file the agent sent: a picture shows, anything else downloads. A stored one comes as a
-// short-lived link (re-signed whenever the history is read), served inline only if it is a
-// raster picture; one the deployment could not store comes as bytes, gone on reload.
+// A file the agent sent: a picture shows, a video plays, anything else downloads. A stored one
+// comes as a short-lived link (re-signed whenever the history is read), served inline only if
+// it is a raster picture or a video; one the deployment could not store comes as bytes, gone
+// on reload.
 const PICTURES = {png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
                   webp: 'image/webp', bmp: 'image/bmp'};
+const VIDEOS = {mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm'};
 function sentFile({name, size, data, url}) {
   const ext = (name.split('.').pop() || '').toLowerCase();
   let href = url;
   if (!href && data) {
     const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
-    href = URL.createObjectURL(new Blob([bytes], {type: PICTURES[ext] || 'application/octet-stream'}));
+    href = URL.createObjectURL(new Blob([bytes], {type: PICTURES[ext] || VIDEOS[ext] || 'application/octet-stream'}));
   }
   const box = document.createElement('div');
   box.className = 'file';
@@ -756,6 +758,12 @@ function sentFile({name, size, data, url}) {
     const img = document.createElement('img');
     img.src = href; img.alt = name;
     box.append(img);
+  } else if (href && VIDEOS[ext]) {
+    const video = document.createElement('video');
+    video.src = href; video.controls = true; video.preload = 'metadata';
+    // An encoding the browser cannot play (opencv's mp4v, say): the link still downloads it.
+    video.onerror = () => video.replaceWith('（浏览器无法播放这个视频的编码，可下载后观看）');
+    box.append(video);
   }
   const label = `📎 ${name}（${size >= 1e6 ? (size / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(size / 1e3)) + ' kB'}）`;
   if (!href) {          // a history entry whose link could not be signed

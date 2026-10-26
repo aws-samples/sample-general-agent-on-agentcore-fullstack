@@ -110,8 +110,8 @@ class LarkDelivery(Delivery):
 
 
 class WebDelivery(Delivery):
-    """Into the web page, on the turn's own event stream: an image shows inline, anything else
-    downloads. Stored first (agent/deliveries.py), so the event carries a link and a reload of
+    """Into the web page, on the turn's own event stream: an image shows and a video plays
+    inline, anything else downloads. Stored first (agent/deliveries.py), so the event carries a link and a reload of
     the page shows it again; without a bucket the bytes ride on the event itself and are gone
     on reload. `out` collects CUSTOM events for the run's stream to write."""
 

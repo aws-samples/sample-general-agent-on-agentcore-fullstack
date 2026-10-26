@@ -352,7 +352,21 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
                 " -frames:v 1 -f image2 _cover.jpg >/dev/null 2>&1 && echo ok")})
             return box.read_bytes("_cover.jpg") if "ok" in made else None
 
-        return channel.send_file(name, box.read_bytes(path), cover)
+        def playable() -> str:
+            """An H.264 copy of a video whose codec plays nowhere — opencv's default mp4v —
+            or "" to send the file as it is. The workspace keeps the original."""
+            if name.rsplit(".", 1)[-1].lower() not in ("mp4", "m4v"):
+                return ""
+            src = json.dumps(path)
+            made = box.invoke("executeCommand", {"command": (
+                f"cd {_WORKSPACE} && FF=$(python3 -c 'import imageio_ffmpeg as f;"
+                f" print(f.get_ffmpeg_exe())') && \"$FF\" -hide_banner -i {src} 2>&1"
+                " | grep -m1 'Video:' | grep -qE 'Video: (h264|vp9|av1)' && echo keep"
+                f" || (\"$FF\" -y -i {src} -c:v libx264 -pix_fmt yuv420p -movflags +faststart"
+                " -c:a aac _playable.mp4 >/dev/null 2>&1 && echo made)")})
+            return "_playable.mp4" if "made" in made else ""
+
+        return channel.send_file(name, box.read_bytes(playable() or path), cover)
 
     def save_attachment(which: int = 1, config: RunnableConfig = None) -> str:
         """Write something the user sent into the workspace, so code can open it."""

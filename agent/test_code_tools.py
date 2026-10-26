@@ -269,6 +269,30 @@ def test_an_mp4_is_sent_as_media_so_it_plays(_lark):
     assert _lark["media"].called and not _lark["file"].called
 
 
+def test_a_video_in_a_codec_nothing_plays_is_sent_as_an_h264_copy():
+    """opencv writes mp4v by default, which no browser plays (measured: MEDIA_ERR_SRC_NOT_SUPPORTED)."""
+    class Box(_DeliverBox):
+        def __init__(self, probe):
+            super().__init__(); self.probe, self.read = probe, []
+
+        def invoke(self, name, arguments):
+            super().invoke(name, arguments)
+            return self.probe if "libx264" in arguments["command"] else "ok"
+
+        def read_bytes(self, path):
+            self.read.append(path); return super().read_bytes(path)
+    out = []
+    made = Box("made")
+    _deliver(made, delivery.WebDelivery(out, "web:s-1"), "out/ball.mp4")
+    assert made.read == ["_playable.mp4"] and out[-1]["value"]["name"] == "ball.mp4"
+    kept = Box("keep")
+    _deliver(kept, delivery.WebDelivery(out, "web:s-1"), "ball.mp4")
+    assert kept.read == ["ball.mp4"]
+    pdf = Box("made")
+    _deliver(pdf, delivery.WebDelivery(out, "web:s-1"), "report.pdf")
+    assert pdf.read == ["report.pdf"]
+
+
 def test_an_mp4_without_a_cover_is_re_uploaded_as_stream(_lark):
     """Lark refuses to send an mp4-typed upload as `file`, so the type has to change with
     the message. Measured: "The type of file upload does not match the type of message"."""

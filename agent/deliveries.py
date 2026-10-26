@@ -3,9 +3,10 @@
 Stored in the checkpoint bucket under `deliveries/`, at a key no one can guess: the role has
 no List, as for the checkpoints, so isolation is the key. The page gets a short-lived
 presigned link, re-signed whenever the history is read; the key itself rides on the tool
-message's artifact, which the model never sees. Only raster pictures are served inline: any
-other file — an SVG or an HTML page included — comes as an attachment, so nothing a tool
-made is ever rendered as a document of the page's origin or another.
+message's artifact, which the model never sees. Only raster pictures and videos are served
+inline — media, played rather than rendered: any other file — an SVG or an HTML page included
+— comes as an attachment, so nothing a tool made is ever rendered as a document of the page's
+origin or another.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ _PREFIX = "deliveries/"
 _LINK_SECONDS = 3600
 PICTURES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
             "webp": "image/webp", "bmp": "image/bmp"}
+VIDEOS = {"mp4": "video/mp4", "m4v": "video/mp4", "webm": "video/webm"}
+_INLINE = {**PICTURES, **VIDEOS}
 
 _client = None
 
@@ -47,14 +50,14 @@ def _s3():
 
 
 def _disposition(name: str) -> str:
-    inline = name.rsplit(".", 1)[-1].lower() in PICTURES if "." in name else False
+    inline = name.rsplit(".", 1)[-1].lower() in _INLINE if "." in name else False
     quoted = urllib.parse.quote(name, safe="")
     return f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quoted}"
 
 
 def _type(name: str) -> str:
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    return PICTURES.get(ext, "application/octet-stream")
+    return _INLINE.get(ext, "application/octet-stream")
 
 
 def _owned(actor_id: str) -> str:

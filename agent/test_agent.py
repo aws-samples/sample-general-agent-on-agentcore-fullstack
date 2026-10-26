@@ -2673,7 +2673,7 @@ def test_a_web_run_never_releases_a_claim_it_no_longer_holds():
         agent_core.release("sess-r")
 
 
-def test_a_delivered_file_is_stored_under_its_owner_and_only_a_picture_is_shown_inline():
+def test_a_delivered_file_is_stored_under_its_owner_and_only_media_is_shown_inline():
     import deliveries, hashlib
     s3 = mock.Mock()
     s3.generate_presigned_url.side_effect = lambda op, ExpiresIn, Params: f"https://s/{Params['Key']}"
@@ -2683,6 +2683,9 @@ def test_a_delivered_file_is_stored_under_its_owner_and_only_a_picture_is_shown_
         assert key.startswith(f"deliveries/{owner}/") and key.endswith("/chart.png")
         put = s3.put_object.call_args.kwargs
         assert put["ContentType"] == "image/png" and put["ContentDisposition"].startswith("inline")
+        deliveries.put("web:s-1", "clip.mp4", b"x")
+        mp4 = s3.put_object.call_args.kwargs
+        assert mp4["ContentType"] == "video/mp4" and mp4["ContentDisposition"].startswith("inline")
         deliveries.put("web:s-1", "page.svg", b"<svg/>")
         svg = s3.put_object.call_args.kwargs
         assert svg["ContentType"] == "application/octet-stream"
