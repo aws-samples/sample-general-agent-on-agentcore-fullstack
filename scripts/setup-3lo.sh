@@ -164,12 +164,53 @@ else
   echo "  google: off (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env)"
 fi
 
+# --- GitHub: a third downstream system, needing no server of ours ---------------------
+# Another built-in vendor; its tools come from GitHub's own remote MCP server, which takes the
+# user's token, so this provider is all a deployment adds. Skipped when unconfigured.
+GITHUB_PROVIDER="$PREFIX-github"
+GITHUB_CALLBACK=""
+if [ -n "${GITHUB_CLIENT_ID:-}" ] && [ -n "${GITHUB_CLIENT_SECRET:-}" ]; then
+  log "OAuth2 credential provider ($GITHUB_PROVIDER)"
+  GITHUB_PROVIDER="$GITHUB_PROVIDER" uv run --with 'boto3>=1.43.92' python - <<'PYEOF'
+import os
+import boto3
+
+e = os.environ
+c = boto3.client("bedrock-agentcore-control", region_name=os.environ["AWS_REGION"])
+cfg = {"githubOauth2ProviderConfig": {
+    "clientId": e["GITHUB_CLIENT_ID"],
+    "clientSecret": e["GITHUB_CLIENT_SECRET"],
+}}
+name = e["GITHUB_PROVIDER"]
+try:
+    c.get_oauth2_credential_provider(name=name)
+    c.update_oauth2_credential_provider(
+        name=name, credentialProviderVendor="GithubOauth2",
+        oauth2ProviderConfigInput=cfg)
+    print("  updated")
+except c.exceptions.ResourceNotFoundException:
+    c.create_oauth2_credential_provider(
+        name=name, credentialProviderVendor="GithubOauth2",
+        oauth2ProviderConfigInput=cfg)
+    print("  created")
+PYEOF
+  for _ in 1 2 3 4 5 6; do
+    GITHUB_CALLBACK="$(aws bedrock-agentcore-control get-oauth2-credential-provider \
+      --name "$GITHUB_PROVIDER" --query callbackUrl --output text 2>/dev/null)" && break
+    sleep 5
+  done
+  warn "GitHub → Settings → Developer settings → OAuth Apps → your app → Authorization callback URL:"
+  echo "  $GITHUB_CALLBACK"
+else
+  echo "  github: off (set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in .env)"
+fi
+
 # Registry consumed by the router/agent so /auth can be per-IdP. One entry per downstream
 # system — this is the whole cost of adding one, which is the claim the Google provider above
 # exists to test.
 log "IdP registry (injected into the router and agent at deploy time)"
-IDP_REGISTRY="$(PROVIDER="$PROVIDER" GOOGLE_PROVIDER="$GOOGLE_PROVIDER" \
-  HAS_GOOGLE="${GOOGLE_CLIENT_ID:+1}" HAS_LARK="${LARK_APP_ID:+1}" python3 -c '
+IDP_REGISTRY="$(PROVIDER="$PROVIDER" GOOGLE_PROVIDER="$GOOGLE_PROVIDER" GITHUB_PROVIDER="$GITHUB_PROVIDER" \
+  HAS_GOOGLE="${GOOGLE_CLIENT_ID:+1}" HAS_LARK="${LARK_APP_ID:+1}" HAS_GITHUB="$([ -n "${GITHUB_CLIENT_ID:-}" ] && [ -n "${GITHUB_CLIENT_SECRET:-}" ] && echo 1 || true)" python3 -c '
 import json, os
 e = os.environ
 idps = []
@@ -183,6 +224,9 @@ if e.get("HAS_GOOGLE"):
     idps.append({"key": "google", "provider": e["GOOGLE_PROVIDER"],
                  "scopes": ["openid", "email", "profile", "https://www.googleapis.com/auth/calendar.readonly"],
                  "label": "Google"})
+if e.get("HAS_GITHUB"):
+    idps.append({"key": "github", "provider": e["GITHUB_PROVIDER"],
+                 "scopes": ["repo", "read:user"], "label": "GitHub"})
 print(json.dumps(idps))')"
 echo "  $IDP_REGISTRY"
 ctx_file="$STATE_FILE"

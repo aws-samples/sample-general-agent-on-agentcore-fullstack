@@ -88,6 +88,11 @@ if [ -n "$set_keys" ] && [ -n "$blank" ]; then
   fail "Lark is half configured — unset in .env:$blank
   Fill them from the Lark developer console (README → Lark console setup), or clear all five to deploy without Lark."
 fi
+# A GitHub app is both keys or neither: one alone creates no provider and says nothing.
+if { [ -n "${GITHUB_CLIENT_ID:-}" ] && [ -z "${GITHUB_CLIENT_SECRET:-}" ]; } || \
+   { [ -z "${GITHUB_CLIENT_ID:-}" ] && [ -n "${GITHUB_CLIENT_SECRET:-}" ]; }; then
+  fail "GitHub is half configured — set both GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in .env, or neither"
+fi
 if [ "$LARK" != "true" ]; then
   # Without Lark the web page is the only way in, and someone has to be able to sign in.
   [ "${WEBUI:-false}" = "true" ] || fail "no Lark app and WEBUI is not true — nobody could reach the agent"

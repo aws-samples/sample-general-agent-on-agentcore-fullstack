@@ -1022,7 +1022,7 @@ def test_auth_revoke_clears_each_granted_system_by_starting_a_consent_it_discard
     def fake_invoke(sid, uid, actor, message, action="", **k):
         calls.append((action, message))
         if action == "auth_status":
-            return {"lark": True, "google": True, "accounts": {}}
+            return {"lark": True, "google": True, "github": True, "accounts": {}}
         return {"auth_url": "https://discarded"}
     idps = {"lark": {"key": "lark", "label": "Lark"}, "google": {"key": "google", "label": "Google"}}
     with mock.patch.object(index, "IDPS", idps), \
@@ -1035,7 +1035,12 @@ def test_auth_revoke_clears_each_granted_system_by_starting_a_consent_it_discard
         one = index.run_command("/auth revoke google", "u-1", "web:s-1")["text"]
         assert "已清除 Google" in one and "第三方应用" in one and "Lark" not in one
         assert calls[1:] == [("reauth", "google")]
-        assert "未知的 IdP" in index.run_command("/auth revoke github", "u-1", "web:s-1")["text"]
+        assert "未知的 IdP" in index.run_command("/auth revoke jira", "u-1", "web:s-1")["text"]
+    with mock.patch.object(index, "IDPS", {"github": {"key": "github", "label": "GitHub"}}), \
+         mock.patch.object(index, "invoke_agent", side_effect=fake_invoke), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_x"):
+        gh = index.run_command("/auth revoke github", "u-1", "web:s-1")["text"]
+        assert "已清除 GitHub" in gh and "Settings → Applications" in gh
 
 
 def test_only_an_admin_manages_web_users_and_never_lark_users_or_themselves():

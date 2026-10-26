@@ -314,7 +314,7 @@ $('logout').addEventListener('click', () => login.signOut());
 // After consenting, the browser comes back to this page with `#consent=<session>`, and the
 // tab that holds that session's token completes it at /web/consent and resends the message
 // the refusal interrupted — as Lark chat replays it.
-const LABELS = {lark: 'Lark', google: 'Google'};
+const LABELS = {lark: 'Lark', google: 'Google', github: 'GitHub'};
 let lastAsk = null;          // the message a refusal interrupted, to send again after consent
 
 const consent = (() => {

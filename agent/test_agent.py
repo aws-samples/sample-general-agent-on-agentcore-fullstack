@@ -3047,6 +3047,88 @@ def test_a_session_the_page_talks_on_counts_as_served_from_its_first_turn():
     assert src.index("_session_first_seen.setdefault(sid") < src.index("if is_agui:")
 
 
+def test_github_without_a_grant_offers_one_tool_that_asks_for_it():
+    """GitHub's server lists nothing without the user's token, so an ungranted session would
+    have no GitHub tool to reach and never be asked; a stand-in walls on first use instead."""
+    opened = []
+
+    async def fake_open(stack, connection):
+        opened.append(connection)
+        return [_make_tool("get_me"), _make_tool("list_branches")]
+    with mock.patch.dict(agent_core._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
+                         clear=True), \
+         mock.patch.object(agent_core.lark_3lo, "get_user_lark_token", return_value=("token", "lark")), \
+         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+                           side_effect=lambda tok, url="": {"url": url or "lark-mcp"}), \
+         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
+         mock.patch.object(agent_core.websearch, "available", return_value=False):
+        with mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value=""):
+            s = agent_core._build_session("lark:ou_x", "", "mem-gh1")
+        assert s["consent"]["github"] == "" and s["tool_idp"]["github"] == "github"
+        assert all("gh/mcp" not in c.get("url", "") for c in opened)   # nothing to list yet
+        assert agent_core._walled_idp(s, "github") == "github"
+        opened.clear()
+        with mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value="gho_tok"), \
+             mock.patch.dict(agent_core._VENDOR_MCP, {"github": (agent_core._github_connection,
+                                                                 lambda tok: False)}):
+            s = agent_core._build_session("lark:ou_x", "", "mem-gh2")
+        gh = [c for c in opened if c.get("url") == "https://gh/mcp/"][0]
+        assert gh["headers"]["Authorization"] == "Bearer gho_tok"
+        assert gh["headers"]["X-MCP-Readonly"] == "true" and "repos" in gh["headers"]["X-MCP-Toolsets"]
+        assert "github" not in s["consent"] and s["tool_idp"]["get_me"] == "github"
+        assert "github" not in s["tool_idp"]                              # the stand-in is gone
+
+
+def test_a_github_grant_github_refuses_is_asked_for_again_past_the_vault():
+    """Revoked on GitHub's side, the vault still holds it: an ordinary consent would answer
+    "already granted" for ever, so the new link is forced."""
+    with mock.patch.dict(agent_core._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
+                         clear=True), \
+         mock.patch.dict(agent_core._VENDOR_MCP, {"github": (agent_core._github_connection,
+                                                             lambda tok: True)}), \
+         mock.patch.object(agent_core.lark_3lo, "configured", return_value=False), \
+         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value="gho_dead"), \
+         mock.patch.object(agent_core, "_aopen_tools", side_effect=AssertionError("opened")), \
+         mock.patch.object(agent_core.websearch, "available", return_value=False):
+        s = agent_core._build_session("web:s-1", "", "mem-gh3")
+        assert s["tool_idp"]["github"] == "github" and s["consent"]["github"] == ""
+        with mock.patch.object(agent_core.lark_3lo, "get_user_token_for",
+                               return_value=("auth_url", "https://consent")) as get:
+            assert agent_core._consent_link(s, "github") == "https://consent"
+        assert get.call_args.kwargs["force"] is True
+
+
+def test_auth_status_counts_a_grant_github_refuses_as_none():
+    with mock.patch.dict(agent_core._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
+                         clear=True), \
+         mock.patch.object(agent_core.lark_3lo, "configured", return_value=False), \
+         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value="gho_tok"), \
+         mock.patch.dict(agent_core._ACCOUNT_OF, {"github": lambda tok: "aleck31"}):
+        with mock.patch.dict(agent_core._VENDOR_MCP, {"github": (None, lambda tok: True)}):
+            assert agent_core.auth_status("web:s-1") == {"github": False, "accounts": {}}
+        with mock.patch.dict(agent_core._VENDOR_MCP, {"github": (None, lambda tok: False)}):
+            assert agent_core.auth_status("web:s-1") == {"github": True,
+                                                         "accounts": {"github": "aleck31"}}
+
+
+def test_github_refuses_only_a_401():
+    with mock.patch("httpx.get", return_value=mock.Mock(status_code=401)):
+        assert agent_core._github_refuses("t") is True
+    with mock.patch("httpx.get", return_value=mock.Mock(status_code=503)):
+        assert agent_core._github_refuses("t") is False
+    with mock.patch("httpx.get", side_effect=OSError):
+        assert agent_core._github_refuses("t") is False
+
+
+def test_auth_shows_the_github_login_that_granted_it():
+    resp = mock.Mock()
+    resp.json.return_value = {"login": "aleck31"}
+    with mock.patch("httpx.get", return_value=resp) as get:
+        assert agent_core._github_account("gho_tok") == "aleck31"
+    assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer gho_tok"
+    assert agent_core._label("github") == "GitHub"
+
+
 def test_consent_is_asked_for_the_system_the_tool_acts_on():
     """A Google grant without a Lark one was walled with the Lark card for google_whoami:
     the wall keyed on Lark alone. Each tool now walls only on its own system's grant."""

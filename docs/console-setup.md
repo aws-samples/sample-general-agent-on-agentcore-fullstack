@@ -1,4 +1,4 @@
-# Console setup — Lark and Google
+# Console setup — Lark, Google and GitHub
 
 What to configure in the vendors' consoles; the deploy itself is in the [README](../README.md#deploy).
 
@@ -78,7 +78,7 @@ Off unless `GOOGLE_CLIENT_ID` is set. It exists to show the identity chain is no
 In [Google Auth Platform](https://console.cloud.google.com/auth/overview) for your project:
 
 1. **APIs & Services → Library**: enable **Google Calendar API**.
-2. **Audience**: *Internal* (Google Workspace — no verification needed, any account in your organisation can consent). *External* also works, but while in testing only the listed test users can consent.
+2. **Audience**: *Internal* (Google Workspace — no verification needed, any account in your organisation can consent; any other account gets `403 org_internal`). *External* admits any Google account, but while in testing only the listed test users can consent — the choice for a workshop whose attendees bring their own accounts.
 3. **Data Access**: add `openid`, `.../auth/userinfo.email`, `.../auth/userinfo.profile`, `.../auth/calendar.readonly` — the scopes `GOOGLE_SCOPES` requests.
 4. **Clients → Create client → Web application**. Put the ID and secret in `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, then run `./deploy.sh` (idempotent; it creates the `agentcore-fullstack-google` provider, the `google` MCP Runtime, and adds `google` to the router's `/auth` list).
 5. Back on the client: **Authorized redirect URIs** = the `callbackUrl` that `./deploy.sh 3lo` prints for the Google provider (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>` — a different uuid from Lark's). Saving it adds `amazonaws.com` to **Branding → Authorized domains** automatically.
@@ -86,3 +86,13 @@ In [Google Auth Platform](https://console.cloud.google.com/auth/overview) for yo
 Then `/auth google` in the bot chat. Google shows two screens — sign-in (name and picture), then the Calendar permission — both are expected.
 
 > If consent ends in Google's `400 error.` page, retry with only one Google account signed in (or in an incognito window).
+
+## Optional: GitHub, needing no admin
+
+Off unless `GITHUB_CLIENT_ID` is set. Lark and Google both need an admin console — a Lark tenant's app review, a Workspace's OAuth client — while a GitHub OAuth App is a personal setting any account can create in a minute, so this is the downstream system a workshop can turn on without asking anyone. Nothing is deployed for it: the agent calls [GitHub's own MCP server](https://github.com/github/github-mcp-server) (`https://api.githubcopilot.com/mcp/`) with the user's token, read-only and limited to the `context,repos,issues,pull_requests,users` toolsets by default (`GITHUB_MCP_READONLY`, `GITHUB_MCP_TOOLSETS`).
+
+1. GitHub → **Settings → Developer settings → OAuth Apps → New OAuth App**. Homepage URL: anything (the web page's URL will do); **Authorization callback URL**: a placeholder for now. Leave Device Flow off.
+2. **Generate a new client secret**. Put the Client ID and the secret in `.env` as `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`, then run `./deploy.sh 3lo` and `./deploy.sh runtime` (or a full `./deploy.sh`): it creates the `agentcore-fullstack-github` provider and adds `github` to the router's `/auth` list.
+3. Back on the app: **Authorization callback URL** = the `callbackUrl` that `./deploy.sh 3lo` prints for the GitHub provider.
+
+Then ask the agent about your repositories, or `/auth github`. The consent asks for `repo read:user` (`GITHUB_SCOPES`); `repo` is GitHub's only scope that reaches private repositories, and read-only is enforced by the MCP server, not by the scope. Repositories of an organisation that restricts OAuth Apps stay invisible until an owner approves the app for it. Revoking on GitHub's side is **Settings → Applications → Authorized OAuth Apps**.

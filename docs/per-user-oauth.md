@@ -16,7 +16,7 @@ Lark is the system this repo wires up, but the pattern isn't Lark-specific: **on
 
 ## Steps
 
-1. **Create the OAuth client at the IdP** (for Google, see [console-setup.md](console-setup.md#optional-google-as-a-second-downstream-system)). Leave the redirect URI as a placeholder; you fill it in at step 3.
+1. **Create the OAuth client at the IdP** (for Google and GitHub, see [console-setup.md](console-setup.md#optional-google-as-a-second-downstream-system)). Leave the redirect URI as a placeholder; you fill it in at step 3.
 2. **Register the credential provider.**
    ```bash
    aws bedrock-agentcore-control create-oauth2-credential-provider \
@@ -37,6 +37,8 @@ Lark is the system this repo wires up, but the pattern isn't Lark-specific: **on
    ```
 5. **Register it on both sides.** Append an `IDP_REGISTRY` entry in `scripts/setup-3lo.sh` (`{key, provider, scopes, label}`) — the router's `/auth` reads it, so `/auth` reports the system and `/auth <key>` consents to it with no router change. The agent needs one line too: an entry in `_DOWNSTREAMS` (`agent/agent_core.py`, `key → (MCP url, provider, scopes)`), fed by env vars that `scripts/provision.sh` sets when it finds the server's Runtime. That entry is what wires the tools, the per-system consent wall, `/auth` status and `/auth <key>`; nothing else in the agent names a system.
 6. **Add the MCP server** as a directory under `mcp-servers/` (`./deploy.sh mcp` builds every one). It reads the user's token from the custom passthrough header, lists its tools without one, and refuses a call without one with exactly `no user token (authorize first)` — that string is how the agent recognises a consent wall. `mcp-servers/google/` is the minimal reference: no CLI to wrap, and no credential of its own.
+
+   Or use the vendor's own MCP server, if it takes the user's token as a bearer: add the key to `_VENDOR_MCP` (`agent/agent_core.py`), a function that builds the connection with the token where the vendor wants it, and deploy nothing. GitHub is the reference. Such a server lists no tools without a token, so until the user consents the agent offers one stand-in tool named for the system, which hits the consent wall on first use.
 
 ## What does not carry over: the ownership check
 

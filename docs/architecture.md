@@ -47,6 +47,7 @@ The ten layers this is built from, and what each is implemented with, are in [RE
 | Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-servers/lark-cli/` |
 | Google MCP server | The second downstream system, and the test of whether one costs what the ADRs claimed. One tool (`google_whoami`), no CLI to wrap, and no credential of its own — the caller's own Google token is all it ever acts with | `mcp-servers/google/` |
+| GitHub MCP server | GitHub's own remote server (`api.githubcopilot.com/mcp/`), called by the agent with the user's GitHub token — nothing of ours runs for it, and the OAuth App behind it needs no admin | external |
 | Approval MCP server | Lark approvals on AgentCore Runtime — the case where the user's identity *cannot* be forwarded. Limits enforced in code, not by the model | `mcp-servers/approval/` |
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `agentcore-fullstack-3lo`, workload `agentcore-fullstack-wl` |
 | Checkpoint table | Per-user conversation state, partition key derived from `thread_id` | `agentcore-fullstack-checkpoints` (+ an S3 bucket for state over ~350 KB) |

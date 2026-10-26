@@ -285,6 +285,7 @@ phase2_runtime() {
     GOOGLE_URL="$google_url" \
     CKPT_TABLE="$ckpt_table" CKPT_BUCKET="$ckpt_bucket" \
     LARK_DOMAIN="$LARK_API_DOMAIN" HAS_LARK="${LARK_APP_ID:+1}" \
+    HAS_GITHUB="$([ -n "${GITHUB_CLIENT_ID:-}" ] && [ -n "${GITHUB_CLIENT_SECRET:-}" ] && echo 1 || true)" \
     uv run python - <<'PYEOF'
 import json, os
 e = os.environ
@@ -326,6 +327,10 @@ env = {
     "GOOGLE_MCP_URL": e["GOOGLE_URL"],
     "GOOGLE_OAUTH_PROVIDER": (e["PREFIX"] + "-google") if e["GOOGLE_URL"] else "",
     "GOOGLE_SCOPES": os.environ.get("GOOGLE_SCOPES", ""),
+    # GitHub's tools are GitHub's own remote MCP server: a provider is all it takes.
+    "GITHUB_OAUTH_PROVIDER": (e["PREFIX"] + "-github") if e.get("HAS_GITHUB") else "",
+    "GITHUB_MCP_TOOLSETS": os.environ.get("GITHUB_MCP_TOOLSETS", ""),
+    "GITHUB_MCP_READONLY": os.environ.get("GITHUB_MCP_READONLY", ""),
     # Empty unless code execution is on; the agent treats that as "no code tools".
     "CODE_INTERPRETER_ID": e["CI_ID"],
     "FILES_FS_ARN": e["FS_ARN"],

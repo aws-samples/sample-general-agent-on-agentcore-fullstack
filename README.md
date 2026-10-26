@@ -17,7 +17,7 @@
 
 A general-purpose agent on **Amazon Bedrock AgentCore**, reachable from **Lark (Feishu) chat**, a web page with its own sign-in, and peer agents over A2A. Lark is optional: without it the web page is the whole product.
 
-The point of the sample is one property: **every tool acts as the person who asked.** A message resolves to one user — a Lark user, or a web user signed in at the page's hosted login — and any tool touching their data calls the downstream service — Lark, Google — with *that user's own OAuth token*, vaulted by AgentCore Identity. The service adjudicates access, so there is no second permission system to keep in sync.
+The point of the sample is one property: **every tool acts as the person who asked.** A message resolves to one user — a Lark user, or a web user signed in at the page's hosted login — and any tool touching their data calls the downstream service — Lark, Google, GitHub — with *that user's own OAuth token*, vaulted by AgentCore Identity. The service adjudicates access, so there is no second permission system to keep in sync.
 
 > **Disclaimer.** This is sample code, for non-production usage. You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment. See [docs/security.md](docs/security.md) for what it does and does not defend against.
 
@@ -69,7 +69,7 @@ Two AgentCore primitives are deliberately **not** used: Browser (nothing here ne
 
 Four layers ship switched off, because each adds cost or console work: `WEB_SEARCH`, `WEBUI`, `A2A`, and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
 
-Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and the deploy serves the web page alone: users sign in at its hosted login, the admin invites them on its 管理 view, and Lark and Google are downstream systems each user authorizes from the chat when a tool first needs one → [docs/deploy.md](docs/deploy.md#without-lark).
+Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and the deploy serves the web page alone: users sign in at its hosted login, the admin invites them on its 管理 view, and Lark, Google and GitHub are downstream systems each user authorizes from the chat when a tool first needs one → [docs/deploy.md](docs/deploy.md#without-lark).
 
 ## Layout
 
@@ -102,7 +102,7 @@ tests/run.sh            # unit suites, no AWS needed
 
 Three things to know before the first run:
 
-- **The Lark app needs scopes, events and redirect URLs set by hand** → [docs/console-setup.md](docs/console-setup.md). Google is optional and on the same page.
+- **The Lark app needs scopes, events and redirect URLs set by hand** → [docs/console-setup.md](docs/console-setup.md). Google and GitHub are optional and on the same page; GitHub needs no admin, so it is the one a workshop can turn on by itself.
 - **Individual steps are idempotent** (`./deploy.sh base|mcp|3lo|runtime|lark|…`), and the order matters in one place → [docs/deploy.md](docs/deploy.md).
 - **Tear down with `scripts/destroy.sh`.** Deleting the OAuth provider purges every user's vaulted token and mints a new callback URL to register.
 
@@ -132,7 +132,7 @@ Everything always-on is consumption-priced, so an idle single-user demo runs on 
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | The full flow, per-hop auth, the consent-wait sequence, the ten layers, repo layout |
 | [docs/deploy.md](docs/deploy.md) | Every deploy step, the optional features, teardown, cost, extension points |
-| [docs/console-setup.md](docs/console-setup.md) | Lark and Google console configuration |
+| [docs/console-setup.md](docs/console-setup.md) | Lark, Google and GitHub console configuration |
 | [docs/security.md](docs/security.md) | Security posture and known limits |
 | [docs/agentcore-behavior.md](docs/agentcore-behavior.md) | Measured AgentCore behaviour — **read this before debugging anything platform-level** |
 | [docs/per-user-oauth.md](docs/per-user-oauth.md) | How a tool acts as the user in another app, and how to add one |

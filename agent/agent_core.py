@@ -81,11 +81,68 @@ _GOOGLE_MCP_URL = os.environ.get("GOOGLE_MCP_URL", "")
 _GOOGLE_PROVIDER = os.environ.get("GOOGLE_OAUTH_PROVIDER", "")
 _GOOGLE_SCOPES = os.environ.get(
     "GOOGLE_SCOPES", "openid email profile https://www.googleapis.com/auth/calendar.readonly").split()
+# GitHub, through GitHub's own remote MCP server rather than one of ours: it takes the user's
+# OAuth-App token as a bearer (measured 2026-10-26), so there is no Runtime to run. Read-only
+# and a few toolsets by default — a workshop needs to read code, not to push it.
+_GITHUB_PROVIDER = os.environ.get("GITHUB_OAUTH_PROVIDER", "")
+_GITHUB_MCP_URL = os.environ.get("GITHUB_MCP_URL", "https://api.githubcopilot.com/mcp/")
+_GITHUB_SCOPES = os.environ.get("GITHUB_SCOPES", "repo read:user").split()
+_GITHUB_TOOLSETS = os.environ.get("GITHUB_MCP_TOOLSETS", "context,repos,issues,pull_requests,users")
+_GITHUB_READONLY = os.environ.get("GITHUB_MCP_READONLY", "true").lower() != "false"
 # Systems besides Lark, keyed like the router's IDP_REGISTRY → (MCP url, provider, scopes).
 # Only configured ones appear, so the rest of the code never asks "is Google set up?".
 _DOWNSTREAMS = {k: v for k, v in {
     "google": (_GOOGLE_MCP_URL, _GOOGLE_PROVIDER, _GOOGLE_SCOPES),
+    "github": (_GITHUB_MCP_URL, _GITHUB_PROVIDER, _GITHUB_SCOPES),
 }.items() if v[0] and v[1]}
+
+
+def _github_connection(token: str, url: str) -> dict:
+    """GitHub's remote MCP server, called with the user's own token."""
+    from datetime import timedelta
+    headers = {"Authorization": f"Bearer {token}", "X-MCP-Toolsets": _GITHUB_TOOLSETS}
+    if _GITHUB_READONLY:
+        headers["X-MCP-Readonly"] = "true"
+    return {"transport": "streamable_http", "url": url, "headers": headers,
+            "timeout": timedelta(seconds=60)}
+
+
+def _github_refuses(token: str) -> bool:
+    """Whether GitHub turns this token away (401: revoked on GitHub's side, or expired). An
+    outage is not a refusal — that grant still stands."""
+    import httpx
+    try:
+        return httpx.get("https://api.github.com/user", timeout=5,
+                         headers={"Authorization": f"Bearer {token}"}).status_code == 401
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# A vendor's own server, reached with the user's token → (connection for a token, whether the
+# vendor refuses a token). It lists nothing without a good token, so until there is one the
+# session carries a stand-in that walls on first use instead.
+_VENDOR_MCP = {"github": (_github_connection, _github_refuses)}
+# How each system is named to the user; capitalize() would say "Github".
+_LABELS = {"lark": "Lark", "google": "Google", "github": "GitHub"}
+
+
+def _label(idp: str) -> str:
+    return _LABELS.get(idp, idp.capitalize())
+
+
+def _needs_grant_tool(idp: str):
+    """The one tool a system whose server lists nothing without a grant contributes until the
+    user grants it. Calling it stops the turn at the consent wall, like any of that system's
+    tools; once granted, the session is rebuilt with the server's real tools."""
+    from langchain_core.tools import StructuredTool
+    label = _label(idp)
+    return StructuredTool.from_function(
+        func=lambda: _NEEDS_TOKEN_MARKER, name=idp,
+        description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
+            f"Work with the user's {label}: repositories, files, commits, issues, pull "
+            f"requests, releases. Call it before anything {label} — the user has not "
+            f"authorised {label} yet, so this asks them to; afterwards the {label} tools "
+            "themselves are here."))
 # Short on purpose. Operational facts a model cannot infer — the workspace persists, whether
 # there is internet — live in each tool's description, next to what they constrain, instead of
 # being paid for on every turn. Debugging heuristics do not belong here at all: they encode
@@ -917,6 +974,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # a call is walled only when *that* system has no grant. Untagged tools never wall.
     tool_idp: dict[str, str] = {}
     consent: dict[str, str] = {}   # idp → consent link; "" until a tool of it is reached
+    refused: set[str] = set()      # systems whose vaulted grant the vendor turns away
     # Where each tool came from, for /tools. Tagged where a group is added rather than per
     # tool, so a server gaining or losing a tool needs no change here. Not the same as
     # tool_idp: the approval tools are gated by the Lark grant but are their own group.
@@ -998,9 +1056,22 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         try:
             d_token = await asyncio.to_thread(
                 lark_3lo.peek_user_token_for, actor_id, provider, scopes, workload_token)
+            vendor = _VENDOR_MCP.get(idp)
+            if vendor and d_token and await asyncio.to_thread(vendor[1], d_token):
+                # The vault still holds a grant the vendor no longer honours: ask again, and
+                # force past it — an ordinary consent would find it and say "already granted".
+                d_token = ""
+                refused.add(idp)
             if not d_token:
                 consent[idp] = ""
-            tools += await _open(lark_3lo.mcp_connection_for(d_token, url=url), idp)
+            if vendor and not d_token:
+                stand_in = _needs_grant_tool(idp)
+                tool_idp[stand_in.name] = idp
+                tools += _tag([stand_in], idp)
+            elif vendor:
+                tools += await _open(vendor[0](d_token, url), idp)
+            else:
+                tools += await _open(lark_3lo.mcp_connection_for(d_token, url=url), idp)
         except Exception:  # noqa: BLE001 — optional, like search
             log.exception("%s tools unavailable for %s", idp, actor_id)
 
@@ -1054,7 +1125,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         # auth_url is Lark's link and doubles as "identity unverified" for the web surfaces;
         # consent/tool_idp drive the per-system wall.
         "auth_url": auth_url, "identity_error": identity_error,
-        "consent": consent, "tool_idp": tool_idp, "tool_source": tool_source,
+        "consent": consent, "refused": refused, "tool_idp": tool_idp, "tool_source": tool_source,
         # Tool results seen during the current turn, for the auth-wall scan.
         "tool_texts": [],
     }
@@ -1129,7 +1200,8 @@ def _consent_link(session: dict, idp: str, workload_token: str = "") -> str:
         return link or ""
     _, provider, scopes = _DOWNSTREAMS[idp]
     kind, value = lark_3lo.get_user_token_for(
-        session["actor_id"], provider, scopes, workload_token)
+        session["actor_id"], provider, scopes, workload_token,
+        force=idp in session.get("refused", ()))
     if kind != "auth_url":
         return ""
     session["consent"][idp] = value
@@ -1231,7 +1303,7 @@ def chat_result(actor_id: str, message: str, email: str = "",
     idp = _hit_auth_wall(s)
     link = _consent_link(s, idp, workload_token) if idp else ""
     if link:
-        return {"reply": _AUTH_PROMPT.format(label=idp.capitalize(), url=link),
+        return {"reply": _AUTH_PROMPT.format(label=_label(idp), url=link),
                 "needs_auth": True, "auth_url": link, "idp": idp}
     return {"reply": reply, "needs_auth": False}
 
@@ -1324,11 +1396,11 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
                         # The message was parked before this turn, so the shim's /return
                         # replays it once consent lands — no re-send.
                         lark_notify.send_link(
-                            chat_id, f"需要访问你的 {idp.capitalize()} 账号，授权后我会自动继续：",
+                            chat_id, f"需要访问你的 {_label(idp)} 账号，授权后我会自动继续：",
                             "点击授权", link)
                     else:
                         _drop_sessions(actor_id)
-                        lark_notify.send_text(chat_id, f"{idp.capitalize()} 已授权，请再发一次。")
+                        lark_notify.send_text(chat_id, f"{_label(idp)} 已授权，请再发一次。")
             except Exception as e:  # noqa: BLE001 — the caller is already gone
                 log.exception("async turn failed for %s", actor_id)
                 # This session stays cached, so a turn that died mid tool call would make
@@ -1706,7 +1778,7 @@ def _stream_to_chat(session: dict, message, chat_id: str,
         # leave it on the card.
         if session.get("walled_tool"):
             idp = _walled_idp(session, session["walled_tool"]) or "lark"
-            text = f"🔐 这一步需要访问你的 {idp.capitalize()} 账号"
+            text = f"🔐 这一步需要访问你的 {_label(idp)} 账号"
 
         _deliver(text, last=True)
         return "".join(earlier) + text
@@ -1911,9 +1983,14 @@ def auth_status(actor_id: str, workload_token: str = "") -> dict:
     # Asked of each vendor at once: a round trip apiece, and /auth waits for the slowest.
     from concurrent.futures import ThreadPoolExecutor
     held = {idp: token for idp, token in tokens.items() if token and idp in _ACCOUNT_OF}
-    with ThreadPoolExecutor(max_workers=max(1, len(held))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, 2 * len(held))) as pool:
         found = {idp: pool.submit(_ACCOUNT_OF[idp], token) for idp, token in held.items()}
-    status["accounts"] = {idp: f.result() for idp, f in found.items() if f.result()}
+        # A grant the vendor turns away is not one: /auth <idp> must offer a consent for it.
+        refused = {idp: pool.submit(_VENDOR_MCP[idp][1], token)
+                   for idp, token in held.items() if idp in _VENDOR_MCP}
+    status.update((idp, False) for idp, f in refused.items() if f.result())
+    status["accounts"] = {idp: f.result() for idp, f in found.items()
+                          if f.result() and status.get(idp)}
     return status
 
 
@@ -1965,8 +2042,21 @@ def _google_account(token: str) -> str:
         return ""
 
 
+def _github_account(token: str) -> str:
+    """The login of the GitHub account that granted this token; "" if it can't be read."""
+    import httpx
+    try:
+        r = httpx.get("https://api.github.com/user", timeout=5,
+                      headers={"Authorization": f"Bearer {token}",
+                               "Accept": "application/vnd.github+json"})
+        return (r.json() or {}).get("login") or ""
+    except Exception as e:  # noqa: BLE001 — a missing name must not cost the status
+        log.warning("could not read the GitHub account: %s", type(e).__name__)
+        return ""
+
+
 # Who signed in to grant each system's token, read with that token: shown by /auth.
-_ACCOUNT_OF = {"lark": lark_3lo.account_of, "google": _google_account}
+_ACCOUNT_OF = {"lark": lark_3lo.account_of, "google": _google_account, "github": _github_account}
 
 
 def _drop_sessions(actor_id: str) -> None:
@@ -1990,9 +2080,9 @@ def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
         return {"reply": "这个部署没有接入 Lark。", "needs_auth": False}
     if idp != "lark" and idp not in _DOWNSTREAMS:
         # The router lists what it has registered; the agent may lack the server or provider.
-        known = idp == "google"
-        return {"reply": f"{idp.capitalize()} 未配置（需要 OAuth provider 与已部署的 MCP server）"
-                if known else f"IdP 尚未接入：{idp}", "needs_auth": False}
+        need = {"google": "OAuth provider 与已部署的 MCP server", "github": "OAuth provider，并重新部署 runtime"}
+        return {"reply": f"{_label(idp)} 未配置（需要 {need[idp]}）"
+                if idp in need else f"IdP 尚未接入：{idp}", "needs_auth": False}
     _drop_sessions(actor_id)
     if idp == "lark" and lark_user:
         kind, value = lark_3lo.get_user_lark_token(actor_id, force=True,
@@ -2006,6 +2096,6 @@ def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
         kind, value = lark_3lo.get_user_token_for(actor_id, provider, scopes, workload_token,
                                                   force=True)
     if kind == "auth_url":
-        return {"reply": _AUTH_PROMPT.format(label=idp.capitalize(), url=value),
+        return {"reply": _AUTH_PROMPT.format(label=_label(idp), url=value),
                 "needs_auth": True, "auth_url": value}
     return {"reply": "Already authorized.", "needs_auth": False}

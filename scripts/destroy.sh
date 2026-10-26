@@ -46,7 +46,7 @@ for sfx in "${MCP_SUFFIXES[@]}"; do RUNTIMES+=("${U}_$sfx"); done
 INTERPRETER="${U}_code"
 MEMORY="${U}_ltm"
 GATEWAY="$PREFIX-websearch-gw"
-PROVIDERS=("$PREFIX-3lo" "$PREFIX-google")
+PROVIDERS=("$PREFIX-3lo" "$PREFIX-google" "$PREFIX-github")
 REPOS=("$PREFIX-agent")
 for d in "${MCP_DIRS[@]}"; do REPOS+=("$PREFIX-mcp-$d"); done
 

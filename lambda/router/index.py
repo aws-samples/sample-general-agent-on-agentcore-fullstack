@@ -421,7 +421,8 @@ def user_authorized(session_id: str, user_id: str, actor_id: str,
 
 
 # Where a user removes the grant on the vendor's side, which clearing it here does not do.
-_VENDOR_GRANTS = {"google": "Google 账号的「第三方应用」", "lark": "Lark 的「应用授权管理」"}
+_VENDOR_GRANTS = {"google": "Google 账号的「第三方应用」", "lark": "Lark 的「应用授权管理」",
+                  "github": "GitHub 的 Settings → Applications"}
 
 
 def _revoke(which: str, user_id: str, actor_id: str) -> dict:
