@@ -558,28 +558,55 @@ print(json.dumps(p))')" >/dev/null
 }
 
 
-# The first web user, from WEB_ADMIN_EMAIL, so a deployment can be signed in to at once —
-# self sign-up is off. Created only when absent, with a temporary password printed here once
-# (Cognito also emails it); the first sign-in replaces it.
+# An admin the deployment can be signed in to at once — self sign-up is off — so nobody has
+# to set up Cognito before trying the agent: admin@agentcore.local, with a generated password
+# kept in Secrets Manager (<name>/web/admin) and printed at the end of the deploy and by
+# ./deploy.sh urls. A .local address receives no mail, so the user is created without an
+# invitation and with a permanent password. WEB_ADMIN_EMAIL, when set, is invited as a second
+# admin, by email with a temporary password.
+WEB_ADMIN_USER="admin@agentcore.local"
+
 web_admin() {
-  [ -n "${WEB_ADMIN_EMAIL:-}" ] || { echo "  no WEB_ADMIN_EMAIL in .env — add a web user with scripts/manage-users.sh add <email>"; return 0; }
-  local pool tmp
+  local pool secret pw
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
+  secret="$PREFIX/web/admin"
+  pw="$(aws secretsmanager get-secret-value --secret-id "$secret" --query SecretString \
+        --output text 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])' 2>/dev/null || true)"
+  if [ -z "$pw" ]; then
+    # The pool asks for 8+ characters with lowercase letters and digits.
+    pw="ac$(openssl rand -hex 8)7"
+    if aws secretsmanager describe-secret --secret-id "$secret" >/dev/null 2>&1; then
+      aws secretsmanager put-secret-value --secret-id "$secret" \
+        --secret-string "{\"username\":\"$WEB_ADMIN_USER\",\"password\":\"$pw\"}" >/dev/null
+    else
+      aws secretsmanager create-secret --name "$secret" --description "Web page admin sign-in" \
+        --secret-string "{\"username\":\"$WEB_ADMIN_USER\",\"password\":\"$pw\"}" >/dev/null
+    fi
+  fi
+  if ! aws cognito-idp admin-get-user --user-pool-id "$pool" --username "$WEB_ADMIN_USER" >/dev/null 2>&1; then
+    aws cognito-idp admin-create-user --user-pool-id "$pool" --username "$WEB_ADMIN_USER" \
+      --message-action SUPPRESS \
+      --user-attributes Name=email,Value="$WEB_ADMIN_USER" Name=email_verified,Value=true >/dev/null
+  fi
+  # Set every run, so the password in the secret is always the one that signs in.
+  aws cognito-idp admin-set-user-password --user-pool-id "$pool" --username "$WEB_ADMIN_USER" \
+    --password "$pw" --permanent
+  aws cognito-idp admin-add-user-to-group --user-pool-id "$pool" --username "$WEB_ADMIN_USER" \
+    --group-name admins
+  echo "  admin: $WEB_ADMIN_USER (password in Secrets Manager: $secret)"
+
+  [ -n "${WEB_ADMIN_EMAIL:-}" ] || return 0
   if aws cognito-idp admin-get-user --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" >/dev/null 2>&1; then
     echo "  web user $WEB_ADMIN_EMAIL exists"
   else
-    tmp="Tmp$(openssl rand -hex 6)9"
     aws cognito-idp admin-create-user --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" \
-      --temporary-password "$tmp" --desired-delivery-mediums EMAIL \
+      --desired-delivery-mediums EMAIL \
       --user-attributes Name=email,Value="$WEB_ADMIN_EMAIL" Name=email_verified,Value=true >/dev/null
-    printf '\033[1;32m  sign in as %s with the temporary password %s\033[0m\n' "$WEB_ADMIN_EMAIL" "$tmp"
+    echo "  invited $WEB_ADMIN_EMAIL: a temporary password is on its way by email"
   fi
-  # The admin page is for the admins group; this is how its first member gets in.
   aws cognito-idp admin-add-user-to-group --user-pool-id "$pool" --username "$WEB_ADMIN_EMAIL" \
     --group-name admins
-  echo "  $WEB_ADMIN_EMAIL manages web users at admin.html"
 }
-
 
 phase_webui() {
   log "WebUI — static web chat on S3 + CloudFront"

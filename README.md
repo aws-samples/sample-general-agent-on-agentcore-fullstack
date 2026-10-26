@@ -69,7 +69,7 @@ Two AgentCore primitives are deliberately **not** used: Browser (nothing here ne
 
 Four layers ship switched off, because each adds cost or console work: `WEB_SEARCH`, `WEBUI`, `A2A`, and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
 
-Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true` and `WEB_ADMIN_EMAIL`, and the deploy serves the web page alone: users sign in at its hosted login, the admin invites them on its 管理 view, and Lark and Google are downstream systems each user authorizes from the chat when a tool first needs one → [docs/deploy.md](docs/deploy.md#without-lark).
+Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and the deploy serves the web page alone: users sign in at its hosted login, the admin invites them on its 管理 view, and Lark and Google are downstream systems each user authorizes from the chat when a tool first needs one → [docs/deploy.md](docs/deploy.md#without-lark).
 
 ## Layout
 
@@ -98,7 +98,7 @@ cp .env.example .env    # deployment target, plus a Lark app or the web page (or
 tests/run.sh            # unit suites, no AWS needed
 ```
 
-`./deploy.sh` never stops to ask you anything. With a Lark app, it ends by printing two URLs to paste into the Lark console — they don't block the deploy, they gate the bot at runtime (`./deploy.sh urls` reprints them). With the web page, it prints the page's URL and the admin's temporary password.
+`./deploy.sh` never stops to ask you anything. With a Lark app, it ends by printing two URLs to paste into the Lark console — they don't block the deploy, they gate the bot at runtime (`./deploy.sh urls` reprints them). With the web page, it prints the page's URL and an admin sign-in, `admin@agentcore.local` with its password (`./deploy.sh urls` reprints it).
 
 Three things to know before the first run:
 

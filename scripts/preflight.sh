@@ -91,7 +91,6 @@ fi
 if [ "$LARK" != "true" ]; then
   # Without Lark the web page is the only way in, and someone has to be able to sign in.
   [ "${WEBUI:-false}" = "true" ] || fail "no Lark app and WEBUI is not true — nobody could reach the agent"
-  [ -n "${WEB_ADMIN_EMAIL:-}" ] || fail "no Lark app and WEB_ADMIN_EMAIL is unset — nobody could sign in to the web page"
   [ -z "${AGENT_DECIDE_APPROVAL_CODES:-}" ] || fail "AGENT_DECIDE_APPROVAL_CODES needs Lark (approvals are Lark's)"
 fi
 

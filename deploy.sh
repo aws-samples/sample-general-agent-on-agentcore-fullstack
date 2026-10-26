@@ -5,7 +5,7 @@
 #   ./deploy.sh <step>       one step: base | mcp | 3lo | gateway | runtime | lark
 #                            | approvals (subscribe to Lark approval events)
 #   ./deploy.sh mcp [name...] only those MCP servers (default: all of mcp-servers/)
-#   ./deploy.sh urls         reprint the two URLs you must register in Lark
+#   ./deploy.sh urls         reprint what to register in Lark, and the web page's sign-in
 #   ./deploy.sh preflight    check tools, credentials and .env without deploying
 #
 # Target comes from .env (PROFILE / REGION / MODEL_ID); command-line env vars win:
@@ -62,15 +62,21 @@ print_urls() {
   echo "permission scopes and the im.message.receive_v1 event subscription."
 }
 
-# Where to sign in, when the web page is deployed.
+# Where to sign in, and as whom, when the web page is deployed.
 print_web() {
-  local url
+  local url admin
   url="$(aws cloudformation describe-stacks --stack-name "$PREFIX-webui" \
     --query "Stacks[0].Outputs[?OutputKey=='WebUiUrl'].OutputValue" --output text 2>/dev/null || true)"
   [ -n "$url" ] && [ "$url" != "None" ] || return 0
+  admin="$(aws secretsmanager get-secret-value --secret-id "$PREFIX/web/admin" --query SecretString \
+    --output text 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["username"], d["password"])' 2>/dev/null || true)"
   printf '\n\033[1;32m=== Web chat ===\033[0m\n'
   echo "  $url"
-  echo "  sign in as ${WEB_ADMIN_EMAIL:-the admin}; add users with scripts/manage-users.sh add <email>"
+  if [ -n "$admin" ]; then
+    echo "  username: ${admin% *}"
+    echo "  password: ${admin#* }"
+  fi
+  echo "  invite others on the page's 管理 view (admin.html)"
 }
 
 usage() { sed -n '2,16p' "$0" | cut -c3-; }
@@ -86,7 +92,7 @@ case "${1:-all}" in
   code)    run_code ;;
   a2a)     run_a2a ;;
   webui)   run_webui ;;
-  urls)    print_urls ;;
+  urls)    if [ "$LARK" = "true" ]; then print_urls; fi; print_web ;;
   preflight) run_preflight ;;
   all|"")
     run_preflight

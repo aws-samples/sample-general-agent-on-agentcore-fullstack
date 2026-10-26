@@ -267,6 +267,9 @@ fi
 # until the recovery window ends — so a redeploy would fail creating it. Purged here, and
 # only those: --include-planned-deletion lists live secrets too, and a stack kept for a
 # re-run still owns its own.
+# The web admin's password is not a stack's, so nothing else removes it.
+aws secretsmanager delete-secret --secret-id "$PREFIX/web/admin" --force-delete-without-recovery \
+  >/dev/null 2>&1 && echo "  deleted $PREFIX/web/admin" || true
 log "Secrets — purge $PREFIX/* scheduled for deletion"
 for sid in $(aws secretsmanager list-secrets --include-planned-deletion \
                --query "SecretList[?starts_with(Name,'$PREFIX/') && DeletedDate].ARN" --output text 2>/dev/null || true); do
