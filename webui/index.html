@@ -769,10 +769,11 @@ function sentFile({name, size, data, url}) {
 }
 
 function render(ev) {
-  if (ev.type !== 'RUN_STARTED') firstEventArrived();
   // Marks about the conversation, not content: none of them opens a card.
   const mark = ev.type === 'CUSTOM' && ['steered', 'queued', 'unanswered'].includes(ev.name);
   if (!turn && ev.type !== 'RUN_ERROR' && !mark) turn = new Turn();
+  // The card has its own 思考中; the placeholder only covers the wait for it.
+  if (turn || ev.type !== 'RUN_STARTED') firstEventArrived();
   switch (ev.type) {
     // The stream ends by itself, so this only matters as the signal that it ended
     // cleanly — a dropped connection looks identical without it.

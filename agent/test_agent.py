@@ -2410,6 +2410,24 @@ def test_agui_requests_are_told_apart_from_the_router_protocol():
     assert agui.is_agui_request({}) is False
 
 
+def test_the_page_is_sent_only_what_it_renders():
+    """Snapshots repeat the whole thread and raw events the whole LangGraph payload: a few
+    large tool results made one turn's stream 12 MB, which the browser dropped."""
+    import agui, json as _j
+    from ag_ui.core.events import (EventType, MessagesSnapshotEvent, StateSnapshotEvent,
+                                   TextMessageContentEvent, ToolCallResultEvent)
+    big = "x" * 100_000
+    assert agui._sse(StateSnapshotEvent(type=EventType.STATE_SNAPSHOT, snapshot={"m": big})) == b""
+    assert agui._sse(MessagesSnapshotEvent(type=EventType.MESSAGES_SNAPSHOT, messages=[])) == b""
+    text = agui._sse(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id="m",
+                                             delta="hi", raw_event={"state": big}))
+    assert _j.loads(text[len(b"data: "):]) == {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m",
+                                               "delta": "hi"}
+    result = agui._sse(ToolCallResultEvent(type=EventType.TOOL_CALL_RESULT, message_id="m",
+                                           tool_call_id="c", content=big))
+    assert b"TOOL_CALL_RESULT" in result and len(result) < 200
+
+
 def test_the_pages_run_input_is_accepted_with_the_sessions_thread():
     """The shape webui/index.html sends, through the real RunAgentInput: a field it carries
     and we also set must be replaced, not passed twice (TypeError on every web turn)."""

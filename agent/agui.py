@@ -31,10 +31,24 @@ def is_agui_request(payload: dict) -> bool:
     return "action" not in payload and any(k in payload for k in _AGUI_KEYS)
 
 
+# What the page renders. The rest — state and message snapshots of the whole thread, each
+# event's raw LangGraph payload, tool output — grows with the thread and the tools (one turn of
+# a few large tool results: 12 MB, and the browser dropped the stream), and nothing reads it.
+_PAGE_EVENTS = {"RUN_STARTED", "RUN_FINISHED", "RUN_ERROR", "TEXT_MESSAGE_START",
+                "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END", "TEXT_MESSAGE_CHUNK",
+                "TOOL_CALL_START", "TOOL_CALL_END", "TOOL_CALL_RESULT", "CUSTOM"}
+
+
 def _sse(event) -> bytes:
-    """One AG-UI event as an SSE frame. Pydantic models serialise by alias, which is what
-    the protocol's camelCase field names require."""
-    body = event.model_dump_json(by_alias=True, exclude_none=True)
+    """One AG-UI event as an SSE frame, or b"" for one the page has no use for. Pydantic models
+    serialise by alias, which is what the protocol's camelCase field names require."""
+    kind = getattr(event, "type", "")
+    kind = getattr(kind, "value", kind)
+    if kind not in _PAGE_EVENTS:
+        return b""
+    if kind == "TOOL_CALL_RESULT":   # that it came is the page's signal; what it says is not
+        event = event.model_copy(update={"content": ""})
+    body = event.model_dump_json(by_alias=True, exclude_none=True, exclude={"raw_event"})
     return f"data: {body}\n\n".encode()
 
 
@@ -358,7 +372,9 @@ async def handle(request: web.Request, payload: dict,
                 prompt = _consent(session)
                 if prompt:
                     await resp.write(prompt)
-            await resp.write(_sse(event))
+            frame = _sse(event)
+            if frame:
+                await resp.write(frame)
         # Stopped at a tool that needs a grant: the run never finished by itself.
         if session.get("walled_tool"):
             finished = {"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_input.run_id}
