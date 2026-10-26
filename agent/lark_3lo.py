@@ -239,7 +239,7 @@ def _workload_token_for(actor_id: str, workload_token: str = "") -> str:
 
 
 def get_user_token_for(actor_id: str, provider: str, scopes: list,
-                       workload_token: str = "") -> tuple[str, str]:
+                       workload_token: str = "", force: bool = False) -> tuple[str, str]:
     """A vaulted token for any provider → ("token", …) or ("auth_url", …).
 
     The Lark path stays separate (`get_user_lark_token`) because it does one thing this
@@ -254,7 +254,8 @@ def get_user_token_for(actor_id: str, provider: str, scopes: list,
     binds to the `state` the return url was told — which is why a tool acting on a second
     system should still report whose account it reached, as `google_whoami` does."""
     wat = _workload_token_for(actor_id, workload_token)
-    resp = _fetch_vaulted(wat, actor_id, provider=provider, scopes=scopes)
+    # force: a new consent even with a grant vaulted — how a user switches accounts.
+    resp = {} if force else _fetch_vaulted(wat, actor_id, provider=provider, scopes=scopes)
     token = resp.get("accessToken")
     if token:
         return "token", token

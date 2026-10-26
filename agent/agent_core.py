@@ -1703,7 +1703,8 @@ def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
                                                    workload_token=workload_token)
     else:
         _, provider, scopes = _DOWNSTREAMS[idp]
-        kind, value = lark_3lo.get_user_token_for(actor_id, provider, scopes, workload_token)
+        kind, value = lark_3lo.get_user_token_for(actor_id, provider, scopes, workload_token,
+                                                  force=True)
     if kind == "auth_url":
         return {"reply": _AUTH_PROMPT.format(label=idp.capitalize(), url=value),
                 "needs_auth": True, "auth_url": value}

@@ -1643,6 +1643,23 @@ def test_the_summariser_does_not_pay_for_prompt_caching():
     assert summariser.model.cache_ttl == ""
 
 
+def test_reauthorising_a_system_already_granted_starts_a_new_consent():
+    """How a user switches accounts: /auth google answered "Already authorized." while a grant
+    was vaulted, so there was no way to consent as anybody else."""
+    fetched = []
+
+    def fake_fetch(wat, actor, force=False, provider="", scopes=None):
+        fetched.append(force)
+        return {"authorizationUrl": "https://new-consent"} if force else {"accessToken": "old"}
+    with mock.patch.dict(agent_core._DOWNSTREAMS, {"google": ("https://g", "p", ["openid"])}), \
+         mock.patch.object(agent_core.lark_3lo, "_workload_token_for", return_value="wat"), \
+         mock.patch.object(agent_core.lark_3lo, "_fetch_vaulted", side_effect=fake_fetch):
+        r = agent_core.reauth("web:s-1", "google")
+        assert r["auth_url"] == "https://new-consent" and fetched == [True]
+        # An ordinary fetch still hands back the vaulted grant.
+        assert agent_core.lark_3lo.get_user_token_for("web:s-1", "p", ["openid"]) == ("token", "old")
+
+
 def test_summarisation_can_be_disabled_outright():
     """Steering and image attachment stay either way — one keeps a mid-turn message from
     being lost, the other is what lets the model see a screenshot at all."""
