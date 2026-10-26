@@ -2025,7 +2025,7 @@ def _whoami_tool(actor_id: str, workload_token: str):
         func=whoami, name="whoami",
         description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
             "Who the person you are talking to is: how they signed in, their account, and "
-            "which systems (Lark, Google) they have authorised and with which account. Call "
+            "which systems (Lark, Google, GitHub) they have authorised and with which account. Call "
             "it instead of guessing who they are; a system they have not authorised is "
             "authorised from the chat when a tool needs it."))
 

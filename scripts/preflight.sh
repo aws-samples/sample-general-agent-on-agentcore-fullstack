@@ -16,11 +16,11 @@ fail() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- tools ---------------------------------------------------------------
 missing=""
-for t in uv agentcore aws npx python3 $([ "$AGENT_BUILD" = "local" ] && echo docker); do
+for t in uv aws npx python3 $([ "$AGENT_BUILD" = "local" ] && echo docker); do
   command -v "$t" >/dev/null || missing="$missing $t"
 done
 [ -z "$missing" ] || fail "missing tools:$missing
-  uv: https://docs.astral.sh/uv/   agentcore: npm i -g @aws/agentcore"
+  uv: https://docs.astral.sh/uv/"
 
 # Images build in CodeBuild unless AGENT_BUILD=local, which builds the agent with this
 # host's Docker — then a stopped daemon would fail the deploy minutes in rather than here.

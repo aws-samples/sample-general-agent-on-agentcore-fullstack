@@ -214,6 +214,16 @@ fi
 # --- 2. CDK stacks --------------------------------------------------------
 # Every optional stack switched on, so whatever was deployed is in the app; a stack that was
 # never deployed is skipped, and CDK orders the deletions by dependency.
+# CDK's custom-resource Lambdas (bucket auto-delete, bucket deployment) log to
+# /aws/lambda/<function>, a group their stack does not own. CDK truncates the stack name in
+# those function names, so they are read from the stacks before the stacks go, not guessed.
+CDK_FUNCS=()
+for s in security agentcore shim sandbox router webui gateway observability; do
+  # shellcheck disable=SC2207 # function names have no spaces
+  CDK_FUNCS+=($(aws cloudformation list-stack-resources --stack-name "$PREFIX-$s" \
+    --query "StackResourceSummaries[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
+    --output text 2>/dev/null || true))
+done
 CDK_CTX=(-c "deployment_name=$PREFIX" -c files_storage=true -c webui=true
          -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}" --output "$CDK_OUT")
 # While AgentCore still holds interfaces in the sandbox subnets, the sandbox stack cannot
@@ -285,6 +295,9 @@ log "Log groups — runtime / CodeBuild / Memory leftovers"
 lg_query="starts_with(logGroupName,'/$PREFIX/') || logGroupName=='/aws/codebuild/$CB_PROJECT'"
 for n in "${RUNTIMES[@]}" "$INTERPRETER" "$MEMORY"; do
   lg_query="$lg_query || contains(logGroupName,'/$n-')"
+done
+for f in ${CDK_FUNCS[@]+"${CDK_FUNCS[@]}"}; do   # empty-safe under set -u on bash 3.2
+  lg_query="$lg_query || logGroupName=='/aws/lambda/$f'"
 done
 for g in $(aws logs describe-log-groups --query "logGroups[?$lg_query].logGroupName" \
              --output text 2>/dev/null || true); do

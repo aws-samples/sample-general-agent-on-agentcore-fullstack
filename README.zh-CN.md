@@ -87,7 +87,7 @@
 
 ## 快速开始
 
-需要 `uv`、AgentCore CLI(`npm i -g @aws/agentcore`),以及 AWS 凭证。镜像在 CodeBuild 里以 ARM64 原生构建;只有设置 `AGENT_BUILD=local` 时才需要 Docker。
+需要 `uv`、Node.js(提供 `npx` 与 CDK),以及 AWS 凭证。镜像在 CodeBuild 里以 ARM64 原生构建;只有设置 `AGENT_BUILD=local` 时才需要 Docker。
 
 ```bash
 cp .env.example .env    # 部署目标 + Lark 应用凭证 + 你自己的 open_id
@@ -128,7 +128,7 @@ tests/run.sh            # 单元测试,不需要 AWS
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 完整流程、每一跳的鉴权、授权等待的时序、十个层次、仓库结构 |
 | [docs/deploy.md](docs/deploy.md) | 每个部署步骤、可选功能、销毁方式、成本、扩展点 |
-| [docs/console-setup.md](docs/console-setup.md) | Lark 与 Google 控制台配置 |
+| [docs/console-setup.md](docs/console-setup.md) | Lark、Google 与 GitHub 控制台配置 |
 | [docs/security.md](docs/security.md) | 安全态势与已知边界 |
 | [docs/agentcore-behavior.md](docs/agentcore-behavior.md) | 实测得到的 AgentCore 行为——**排查任何平台层问题前请先读这篇** |
 | [docs/per-user-oauth.md](docs/per-user-oauth.md) | 工具如何以用户身份访问另一个应用,以及如何新增一个下游系统 |

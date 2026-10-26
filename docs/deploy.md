@@ -4,7 +4,7 @@ The README has the short version. This page is the detail: every step, every opt
 
 ## Steps
 
-Prereqs: `uv` (Docker only with `AGENT_BUILD=local`), the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `agentcore-fullstack` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
+Prereqs: `uv`, Node.js (for `npx` and the CDK; Docker only with `AGENT_BUILD=local`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `agentcore-fullstack` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
 
 ```bash
 cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID), plus a Lark app, the web page, or both

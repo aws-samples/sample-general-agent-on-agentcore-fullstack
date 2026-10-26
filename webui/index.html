@@ -376,7 +376,13 @@ const consent = (() => {
         // Opened before the request so a popup blocker sees a click, not a callback.
         const w = window.open('', '_blank');
         // The link takes a second or two to mint; an empty window reads as a broken one.
-        if (w) { w.document.title = `授权 ${label}`; w.document.body.textContent = `正在打开 ${label} 授权页…`; }
+        if (w) {
+          w.document.title = `授权 ${label}`;
+          // about:blank has no styles of its own: without these it shows 16px Times.
+          w.document.body.style.cssText = 'margin:0;height:100vh;display:grid;place-items:center;'
+            + 'font:14px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;color:#5f6b7a';
+          w.document.body.textContent = `正在打开 ${label} 授权页…`;
+        }
         try {
           const token = inLark() ? '' : await login.token();
           const body = inLark()
