@@ -690,8 +690,8 @@ def _words_and_attachments(msg_type: str, content: dict) -> tuple[str, list[str]
 _HELP = "\n".join([
     "可用命令：",
     "  /auth        查看各 IdP 的授权状态",
-    "  /auth <idp>  对该 IdP 授权或重新授权（可换成另一个账号）",
-    "  /auth revoke [idp]  清除授权，下次用到时重新授权",
+    "  /auth <idp>  对该 IdP 授权（已授权则显示授权的账号）",
+    "  /auth revoke [idp]  清除授权，换账号时先用它",
     "  /status      当前身份、会话与服务你的 microVM",
     "  /context     对话轮数、上下文大小、系统提示词、压缩与缓存命中",
     "  /model       当前模型、平台与 prompt cache 方式",
@@ -751,7 +751,7 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
                         "——对话状态存放在 DynamoDB，不随容器生命周期消失。"}
 
     # Authorization is per-IdP (one OAuth provider per downstream system). Bare /auth lists
-    # each IdP; /auth <idp> starts a fresh 3LO flow for one (idempotent — a new link each run).
+    # each IdP; /auth <idp> consents to one not yet granted. Another account: revoke first.
     if cmd == "/auth" or cmd.startswith("/auth "):
         arg = message[5:].strip().lower()
         if not arg:
@@ -771,12 +771,17 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
         if arg not in IDPS:
             return {"text": f"未知的 IdP：{arg}。可用：{', '.join(IDPS) or '（未配置）'}"}
         session_id = identity.get_or_create_session(user_id)
+        label = IDPS[arg].get("label", arg)
+        status = auth_status(session_id, user_id, actor_id)
+        if status.get(arg):
+            who = (status.get("accounts") or {}).get(arg)
+            return {"text": f"已授权 {label}{f'（{who}）' if who else ''}。"
+                            f"要换账号，先发送 /auth revoke {arg}。"}
         result = invoke_agent(session_id, user_id, actor_id, arg, action="reauth")
         auth_url = result.get("auth_url")
         if not auth_url:
             return {"text": result.get("reply") or result.get("error", "无法发起授权")}
-        label = IDPS[arg].get("label", arg)
-        logger.info("forced re-auth for %s (idp=%s)", actor_id, arg)
+        logger.info("consent started for %s (idp=%s)", actor_id, arg)
         return {"text": f"请授权访问你的 {label} 账号：",
                 "link": {"text": "点击授权", "url": auth_url}}
 

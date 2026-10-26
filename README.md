@@ -110,7 +110,8 @@ Then message the bot, or sign in to the web page. `/help` lists the commands, th
 
 | Command | What it does |
 |---|---|
-| `/auth`, `/auth <idp>` | Authorization status per downstream system; authorize or re-authorize one |
+| `/auth`, `/auth <idp>` | Authorization status per downstream system, with the account each was granted by; authorize one not yet granted |
+| `/auth revoke [idp]` | Clear one grant or all, e.g. to grant another account next |
 | `/status` | Who you are, both session ids, the microVM serving you, last activity, and which command shows each of the rest |
 | `/context` | Turns and tool calls, the context size the last request was billed for, the system prompt, when the thread is summarized, and the prompt cache hit rate |
 | `/model` | The model, region and prompt cache mode of the container serving you |

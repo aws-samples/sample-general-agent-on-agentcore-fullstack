@@ -855,6 +855,27 @@ def test_an_auth_link_travels_as_data_so_each_channel_renders_it_its_own_way():
     assert r["link"] == {"text": "点击授权", "url": "https://c/x"}
 
 
+def test_auth_idp_says_who_granted_it_rather_than_asking_again():
+    """A new consent is for a system not granted; switching accounts is /auth revoke first."""
+    import index, identity
+    calls = []
+
+    def fake_invoke(sid, uid, actor, message, action="", **k):
+        calls.append(action)
+        return {"google": True, "accounts": {"google": "me@example.com"}} if action == "auth_status" \
+            else {"auth_url": "https://c/x"}
+    with mock.patch.dict(index.IDPS, {"google": {"label": "Google"}, "lark": {"label": "Lark"}},
+                         clear=True), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
+         mock.patch.object(index, "invoke_agent", side_effect=fake_invoke):
+        r = index.run_command("/auth google", "u1", "web:s-1")
+        assert "已授权 Google（me@example.com）" in r["text"] and "/auth revoke google" in r["text"]
+        assert "link" not in r and calls == ["auth_status"]
+        calls.clear()
+        r = index.run_command("/auth lark", "u1", "web:s-1")
+        assert r["link"]["url"] == "https://c/x" and calls == ["auth_status", "reauth"]
+
+
 def test_web_command_refuses_anything_that_is_not_a_command():
     """The command endpoint must not become a second way to talk to the agent — that path
     goes straight to the Runtime and is the only one carrying the user's JWT."""
