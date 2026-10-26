@@ -206,3 +206,32 @@ def test_an_api_domain_it_cannot_map_is_refused():
     for bad in ("https://accounts.larksuite.com", "open.feishu.cn", "https://example.com"):
         with pytest.raises(ValueError):
             index._authorize_domain(bad)
+
+
+def test_the_done_page_links_back_to_the_bot_chat_in_the_lark_client():
+    """Lark opened this tab, so it cannot close itself; one tap gets the user back."""
+    import base64
+    st = base64.urlsafe_b64encode(b"lark:ou_x").decode().rstrip("=")
+    payload = mock.Mock()
+    payload.read.return_value = b'{"ok": true}'
+    secrets = mock.Mock()
+    secrets.get_secret_value.return_value = {"SecretString": json.dumps({"appId": "cli_a1"})}
+    for domain, link in (("https://open.larksuite.com", "https://applink.larksuite.com/client/bot/open?appId=cli_a1"),
+                         ("https://open.feishu.cn", "https://applink.feishu.cn/client/bot/open?appId=cli_a1")):
+        with mock.patch.object(index, "_ROUTER_FUNCTION", "router-fn"), \
+             mock.patch.object(index, "_lambda") as lam, \
+             mock.patch.object(index, "_secrets", secrets), \
+             mock.patch.object(index, "_LARK_SECRET_ID", "sec"), \
+             mock.patch.object(index, "_TOKEN_DOMAIN", domain), \
+             mock.patch.object(index, "_app_id", None):
+            lam.invoke.return_value = {"Payload": payload}
+            r = index.handler(_evt("GET", "/return", qs={"session_id": "s", "state": st}), None)
+        assert f'href="{link.replace("&", "&amp;")}"' in r["body"] and "Back to Lark" in r["body"]
+    # No app id to link to: the page still says it worked, just without the link.
+    with mock.patch.object(index, "_ROUTER_FUNCTION", "router-fn"), \
+         mock.patch.object(index, "_lambda") as lam, \
+         mock.patch.object(index, "_LARK_SECRET_ID", ""), \
+         mock.patch.object(index, "_app_id", None):
+        lam.invoke.return_value = {"Payload": payload}
+        r = index.handler(_evt("GET", "/return", qs={"session_id": "s", "state": st}), None)
+    assert "Authorized" in r["body"] and "<a " not in r["body"]

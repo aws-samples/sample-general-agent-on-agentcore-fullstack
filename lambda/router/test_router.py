@@ -527,8 +527,10 @@ def test_resume_replays_the_parked_message():
                            return_value={"message": "查待审批", "chatId": "oc_1"}), \
          mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
          mock.patch.object(identity, "get_or_create_memory_session", return_value="mem_x"), \
+         mock.patch.object(index.lark, "send_message") as said, \
          mock.patch.object(index, "invoke_agent") as inv:
         index.resume_consented_turn("lark:ou_abc")
+    said.assert_called_once_with("oc_1", "✅ 授权成功，正在继续处理刚才的消息…")
     assert inv.call_count == 1
     kw = inv.call_args.kwargs
     assert kw["action"] == "chat_async"
@@ -541,9 +543,12 @@ def test_resume_is_a_noop_when_nothing_parked():
     import index, identity
     with mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
          mock.patch.object(identity, "take_pending_auth", return_value=None), \
+         mock.patch.object(index.lark, "send_message") as said, \
          mock.patch.object(index, "invoke_agent") as inv:
         index.resume_consented_turn("lark:ou_abc")
     assert inv.call_count == 0
+    # Nothing to continue, so nothing is promised.
+    said.assert_called_once_with("ou_abc", "✅ 授权成功")
 
 
 def test_resume_ignores_malformed_actor():

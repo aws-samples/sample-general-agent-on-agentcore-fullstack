@@ -217,16 +217,15 @@ def handle_return(qs: dict) -> dict:
     err = _complete_via_router(user_id, session_id)
     if err:
         return _page(502, "Authorization failed", err)
-    # Tell the user in chat — the browser only sees this static page, and the
-    # router can't reliably detect completion by polling (a re-auth keeps the old
-    # token until the new one lands). This is the precise signal.
-    # Callback-driven resume: tell the router the user has consented, so it can
-    # replay whatever message hit the auth wall. Best-effort and asynchronous — if
-    # it fails or nothing was parked, the user simply sends again. Done before the
-    # notify so a resumed answer, not a "you can ask now", is what they see.
-    _resume_router(user_id)
-    _notify_chat(user_id, "✅ 授权成功，正在继续处理…")
-    return _page(200, "Authorized", "You can close this tab and return to the chat.")
+    # Callback-driven resume: tell the router the user has consented, so it replays
+    # whatever message hit the auth wall and tells the chat — it alone knows whether a
+    # message was waiting. Asynchronous; without a router to ask, the chat is told here.
+    if _ROUTER_FUNCTION:
+        _resume_router(user_id)
+    else:
+        _notify_chat(user_id, "✅ 授权成功")
+    return _page(200, "Authorized", "You can close this tab and return to the chat.",
+                 _back_to_lark())
 
 
 # The error text can carry what the query string brought in, so it is escaped, and the page
@@ -236,9 +235,33 @@ _PAGE_HEADERS = {"Content-Type": "text/html; charset=utf-8",
                  "X-Content-Type-Options": "nosniff"}
 
 
-def _page(status: int, title: str, text: str) -> dict:
-    return {"statusCode": status, "headers": _PAGE_HEADERS,
-            "body": f"<h3>{html.escape(title)}</h3><p>{html.escape(str(text))}</p>"}
+def _page(status: int, title: str, text: str, link: tuple[str, str] | None = None) -> dict:
+    body = f"<h3>{html.escape(title)}</h3><p>{html.escape(str(text))}</p>"
+    if link:
+        body += f'<p><a href="{html.escape(link[1], quote=True)}">{html.escape(link[0])}</a></p>'
+    return {"statusCode": status, "headers": _PAGE_HEADERS, "body": body}
+
+
+_app_id: str | None = None
+
+
+def _back_to_lark() -> tuple[str, str] | None:
+    """A link that opens the bot's chat in the Lark client. This tab was opened by Lark, not
+    by script, so it cannot close itself; the applink is how a user gets back in one tap.
+    Its host follows the API domain: open.larksuite.com → applink.larksuite.com."""
+    global _app_id
+    if _app_id is None:
+        try:
+            _app_id = json.loads(_secrets.get_secret_value(
+                SecretId=_LARK_SECRET_ID)["SecretString"]).get("appId", "") if _LARK_SECRET_ID else ""
+        except Exception:  # noqa: BLE001 — the page still says it worked
+            logger.warning("no app id for the back-to-Lark link", exc_info=True)
+            return None
+    host = urllib.parse.urlsplit(_TOKEN_DOMAIN).netloc
+    if not _app_id or not host.startswith("open."):
+        return None
+    return ("Back to Lark", f"https://applink.{host[len('open.'):]}/client/bot/open?"
+                            + urllib.parse.urlencode({"appId": _app_id}))
 
 
 def _post_json(url: str, body: dict, bearer: str = "") -> dict:

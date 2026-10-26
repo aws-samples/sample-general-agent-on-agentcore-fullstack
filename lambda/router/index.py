@@ -448,6 +448,14 @@ def complete_consent(actor_id: str, session_uri: str) -> None:
 
 # ----------------------------- consent resume -------------------------------
 
+def _tell(receive_id: str, text: str) -> None:
+    """A best-effort message: the consent itself has already succeeded."""
+    try:
+        lark.send_message(receive_id, text)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not tell %s", receive_id, exc_info=True)
+
+
 def resume_consented_turn(actor_id: str) -> None:
     """Replay the message that hit an auth wall, now that the user has consented.
     Invoked by the shim's /return after 3LO completes — this is the callback-driven
@@ -464,11 +472,15 @@ def resume_consented_turn(actor_id: str) -> None:
         logger.info("resume: no user for %s", actor_id)
         return
     parked = identity.take_pending_auth(user_id)
+    # Said here rather than by the shim, which cannot know whether a message was waiting:
+    # "continuing" with nothing to continue reads as if something were still coming.
     if not parked:
         logger.info("resume: nothing parked for %s", actor_id)
+        _tell(open_id, "✅ 授权成功")
         return
     message, chat_id = parked["message"], parked["chatId"]
     logger.info("resume: replaying for %s: %r", actor_id, message[:80])
+    _tell(chat_id, "✅ 授权成功，正在继续处理刚才的消息…")
     session_id = identity.get_or_create_session(user_id)
     mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
     # A fresh reaction on the resumed turn is not possible (the original message id
