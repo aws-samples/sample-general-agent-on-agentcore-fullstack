@@ -1,6 +1,6 @@
 # 2. 部署
 
-约 25–30 分钟，大部分时间在等待。一条命令完成全部部署，中途不需要任何输入。部署期间不要让电脑休眠：休眠时部署会暂停。
+约 35 分钟，大部分时间在等待。一条命令完成全部部署，中途不需要任何输入。部署期间不要让电脑休眠：休眠时部署会暂停。
 
 ## 2.1 运行部署
 
@@ -13,14 +13,14 @@
 | 步骤 | 实际执行的操作 | 本实验中 |
 |---|---|---|
 | `preflight` | 常规[预检](01-prepare.md#14-预检) | 几秒 |
-| `base — CDK stacks` | 部署 7 个 CDK 栈：`security`（Cognito、Secrets Manager）、`agentcore`（执行角色、对话记录表和桶、用户文件桶）、`shim`、`router`、`gateway`、`observability`，以及 `sandbox`（代码沙箱的 VPC、NAT gateway、S3 Files 文件系统和挂载点）。首次部署到一个区域时会先自动执行 `cdk bootstrap` | 约 10 分钟，S3 Files 挂载点最慢（约 5 分钟） |
+| `base — CDK stacks` | 部署 7 个 CDK 栈：`security`（Cognito、Secrets Manager）、`agentcore`（执行角色、对话记录表和桶、用户文件桶）、`shim`、`router`、`gateway`、`observability`，以及 `sandbox`（代码沙箱的 VPC、NAT gateway、S3 Files 文件系统和挂载点）。首次部署到一个区域时会先自动执行 `cdk bootstrap` | 约 12 分钟，S3 Files 挂载点最慢（约 5 分钟） |
 | `mcp — MCP servers` | 构建并部署 `mcp-servers/` 下的 MCP server | 全部跳过：GitHub 用的是 GitHub 官方的远程 MCP server |
 | `3lo — Identity + OAuth provider` | 创建 workload identity `<name>-wl`（返回地址指向 Shim），创建 GitHub 的 OAuth credential provider `<name>-github` 并打印它的回调地址，生成 IdP 注册表供 Router 和 Agent 使用 | 1 分钟内 |
 | `gateway — Web Search (optional)` | 在 `us-east-1` 创建 AgentCore Gateway，接入内置的 Web 搜索连接器 | 1 分钟左右 |
-| `code — Code Interpreter for generated code` | 创建 Code Interpreter，接入沙箱 VPC，等它变成 READY | 几分钟 |
-| `runtime — agent` | 创建 AgentCore Memory；在 CodeBuild 里构建 ARM64 的 Agent 镜像并推送到 ECR；创建 Agent Runtime 并等待 READY；用真实的 Runtime ARN 重新部署 Router；清掉旧的会话 id | 约 5 分钟 |
+| `code — Code Interpreter for generated code` | 创建 Code Interpreter，接入沙箱 VPC，等它变成 READY | 约 5 分钟 |
+| `runtime — agent` | 创建 AgentCore Memory；在 CodeBuild 里构建 ARM64 的 Agent 镜像并推送到 ECR；创建 Agent Runtime 并等待 READY；用真实的 Runtime ARN 重新部署 Router；清掉旧的会话 id | 约 10 分钟 |
 | `a2a — expose to peer agents` | 供其他 Agent 调用的 A2A Runtime | 跳过（`A2A=false`） |
-| `webui — static web chat` | 部署页面的 S3 桶和 CloudFront 分配；把 CloudFront 域名回填，重新部署依赖它的 `security`（登录回调地址）、`router`（CORS）、`shim`（授权完成后跳回的页面）；创建管理员 `admin@agentcore.local`，密码存进 Secrets Manager | 约 6 分钟，CloudFront 最慢 |
+| `webui — static web chat` | 部署页面的 S3 桶和 CloudFront 分配；把 CloudFront 域名回填，重新部署依赖它的 `security`（登录回调地址）、`router`（CORS）、`shim`（授权完成后跳回的页面）；创建管理员 `admin@agentcore.local`，密码存进 Secrets Manager | 约 8 分钟，CloudFront 最慢 |
 
 ![部署过程中的终端输出](images/02-deploy-progress.png)
 
