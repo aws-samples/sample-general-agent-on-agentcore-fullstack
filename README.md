@@ -130,6 +130,7 @@ Everything always-on is consumption-priced, so an idle single-user demo runs on 
 
 | Doc | What's in it |
 |---|---|
+| [workshop/](workshop/README.md) | Workshop handbook (Chinese): deploy with the web page and GitHub, then verify each capability in 60 minutes |
 | [docs/architecture.md](docs/architecture.md) | The full flow, per-hop auth, the consent-wait sequence, the ten layers, repo layout |
 | [docs/deploy.md](docs/deploy.md) | Every deploy step, the optional features, teardown, cost, extension points |
 | [docs/console-setup.md](docs/console-setup.md) | Lark, Google and GitHub console configuration |

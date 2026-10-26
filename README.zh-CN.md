@@ -126,6 +126,7 @@ tests/run.sh            # 单元测试,不需要 AWS
 
 | 文档 | 内容 |
 |---|---|
+| [workshop/](workshop/README.md) | Workshop 学员手册：部署 Web 页面与 GitHub，60 分钟内逐项验证各项能力 |
 | [docs/architecture.md](docs/architecture.md) | 完整流程、每一跳的鉴权、授权等待的时序、十个层次、仓库结构 |
 | [docs/deploy.md](docs/deploy.md) | 每个部署步骤、可选功能、销毁方式、成本、扩展点 |
 | [docs/console-setup.md](docs/console-setup.md) | Lark、Google 与 GitHub 控制台配置 |

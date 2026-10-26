@@ -1,0 +1,11 @@
+[book]
+title = "在 Amazon Bedrock AgentCore 上构建企业级通用 Agent"
+language = "zh"
+src = "."
+
+[output.html]
+git-repository-url = "https://github.com/aws-samples/sample-general-agent-on-agentcore-fullstack"
+edit-url-template = "https://github.com/aws-samples/sample-general-agent-on-agentcore-fullstack/edit/main/workshop/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+no-section-label = true
