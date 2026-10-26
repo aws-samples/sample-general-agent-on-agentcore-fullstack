@@ -105,7 +105,7 @@ def _bind_caller(request: web.Request, payload: dict) -> web.Response | None:
     another actor, or a thread that is not this actor's, is refused rather than corrected:
     either is somebody asking for what is not theirs. The router's own `userId` is an
     internal key, not an actor, so only `actorId` is compared."""
-    actor = caller.actor(request.headers.getall("Authorization", []))
+    actor, account = caller.identify(request.headers.getall("Authorization", []))
     reason = ""
     if not actor:
         reason = "unverified"
@@ -122,6 +122,8 @@ def _bind_caller(request: web.Request, payload: dict) -> web.Response | None:
         return web.json_response({"error": "forbidden"},
                                  status=401 if reason == "unverified" else 403)
     payload["actorId"] = actor
+    # From the verified token too, never from the page: what whoami tells the agent.
+    payload["actorAccount"] = account
     return None
 
 

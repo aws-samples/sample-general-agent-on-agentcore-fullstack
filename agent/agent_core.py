@@ -49,6 +49,8 @@ from botocore.config import Config
 from langchain.agents import create_agent
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+# At module level: the tool's `config: RunnableConfig` is resolved here for injection.
+from langchain_core.runnables import RunnableConfig
 from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
 
@@ -1012,6 +1014,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
             log.exception("web search unavailable for %s", actor_id)
 
     tools += _tag(_long_term_tools(actor_id), "memory")
+    tools += _tag([_whoami_tool(actor_id, workload_token)], "identity")
 
     # Code execution, when an interpreter is deployed. The sandbox is created here rather
     # than per call so one conversation keeps one workspace session — and it is kept on the
@@ -1414,7 +1417,8 @@ _STREAM_END = object()
 _EVENT = object()
 
 
-def _run_config(session: dict, channel: delivery.Delivery, received_ms: int | None = None) -> dict:
+def _run_config(session: dict, channel: delivery.Delivery, received_ms: int | None = None,
+                account: str = "") -> dict:
     """The session's config plus where this run may deliver a file.
 
     A fresh dict every run: the session is cached per actor and thread and is served to
@@ -1425,7 +1429,9 @@ def _run_config(session: dict, channel: delivery.Delivery, received_ms: int | No
     configurable = session["config"]["configurable"]
     return {**session["config"], "recursion_limit": _STEP_LIMIT,
             "configurable": {**configurable, "delivery": channel,
-                             "received_ms": received_ms or int(time.time() * 1000)}}
+                             "received_ms": received_ms or int(time.time() * 1000),
+                             # What the person signed in as, from their verified token.
+                             "account": account}}
 
 
 def _received_ms() -> int | None:
@@ -1909,6 +1915,42 @@ def auth_status(actor_id: str, workload_token: str = "") -> dict:
         found = {idp: pool.submit(_ACCOUNT_OF[idp], token) for idp, token in held.items()}
     status["accounts"] = {idp: f.result() for idp, f in found.items() if f.result()}
     return status
+
+
+def _whoami_tool(actor_id: str, workload_token: str):
+    """Who the person in this conversation is, for the model to answer from rather than
+    guess: how they signed in, as whom, and which systems they have authorised as whom. The
+    account comes from the run (the verified token's), not the session: a session may have
+    been built by a request that carried none."""
+    from langchain_core.tools import StructuredTool
+
+    def whoami(config: RunnableConfig = None) -> str:
+        account = ((config or {}).get("configurable") or {}).get("account") or ""
+        web = actor_id.startswith("web:")
+        try:
+            status = auth_status(actor_id, workload_token)
+        except Exception:  # noqa: BLE001 — who they are still answers without the grants
+            log.warning("whoami could not read the grants", exc_info=True)
+            status = {}
+        accounts = status.get("accounts") or {}
+        systems = [k for k in status if k != "accounts"]
+        lark_name = accounts.get("lark", "") if not web else ""
+        return json.dumps({
+            "signed_in_with": "the web page (its own sign-in)" if web else "Lark",
+            "account": account if web else (lark_name or actor_id.removeprefix("lark:")),
+            "user_id": actor_id,
+            "authorised": {k: accounts.get(k) or "yes, account unknown"
+                           for k in systems if status.get(k)},
+            "not_authorised": [k for k in systems if not status.get(k)],
+        }, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        func=whoami, name="whoami",
+        description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
+            "Who the person you are talking to is: how they signed in, their account, and "
+            "which systems (Lark, Google) they have authorised and with which account. Call "
+            "it instead of guessing who they are; a system they have not authorised is "
+            "authorised from the chat when a tool needs it."))
 
 
 def _google_account(token: str) -> str:

@@ -2860,6 +2860,32 @@ def _signer():
         yield mint
 
 
+def test_a_web_users_account_comes_from_the_verified_token_and_nothing_else(_signer):
+    import caller, server
+    web = _signer(client_id="web-client", username="carol@example.com", sub="s-carol")
+    assert caller.identify([web]) == ("web:s-carol", "carol@example.com")
+    assert caller.identify([_signer()]) == ("lark:ou_alice", "")     # Lark's comes from Lark
+    payload = {"actorAccount": "mallory@example.com"}
+    req = mock.Mock()
+    req.headers.getall.return_value = [web]
+    assert server._bind_caller(req, payload) is None
+    assert payload["actorAccount"] == "carol@example.com"
+
+
+def test_whoami_says_how_they_signed_in_as_whom_and_what_they_granted():
+    with mock.patch.object(agent_core, "auth_status", return_value={
+            "lark": True, "google": False, "accounts": {"lark": "XUESONG"}}):
+        tool = agent_core._whoami_tool("web:s-carol", "wat")
+        out = json.loads(tool.invoke({}, config={"configurable": {"account": "carol@example.com"}}))
+        assert out == {"signed_in_with": "the web page (its own sign-in)",
+                       "account": "carol@example.com", "user_id": "web:s-carol",
+                       "authorised": {"lark": "XUESONG"}, "not_authorised": ["google"]}
+        lark = json.loads(agent_core._whoami_tool("lark:ou_alice", "wat").invoke({}))
+        assert lark["signed_in_with"] == "Lark" and lark["account"] == "XUESONG"
+    # The account is never a parameter the model could fill in.
+    assert "account" not in (tool.args or {})
+
+
 def test_the_actor_is_the_username_of_a_verified_access_token(_signer):
     import caller, time as _t
     from cryptography.hazmat.primitives.asymmetric import rsa

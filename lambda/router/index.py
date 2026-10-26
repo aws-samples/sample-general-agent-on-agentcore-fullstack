@@ -277,7 +277,7 @@ def _model_panel(data: dict | None) -> dict:
 # Where a tool group came from → how it is named in chat. Sources, not tools: a server
 # gaining or losing a tool needs no change here. A downstream system uses its IdP label.
 _TOOL_SOURCES = {"approval": "审批", "web_search": "网络搜索", "memory": "长期记忆",
-                 "code": "代码执行"}
+                 "code": "代码执行", "identity": "身份"}
 
 
 def _tools_panel(data: dict | None) -> dict:

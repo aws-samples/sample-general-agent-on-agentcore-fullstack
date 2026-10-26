@@ -253,7 +253,7 @@ async def handle(request: web.Request, payload: dict,
             return LangGraphAgent(name="agentcore-fullstack", graph=session["graph"],
                                   config=agent_core._run_config(
                                       session, agent_core.delivery.WebDelivery(out, actor_id),
-                                      arrived_ms))
+                                      arrived_ms, account=payload.get("actorAccount") or ""))
 
         async def turns():
             """The turn, then a continuation for whatever was steered in after its last

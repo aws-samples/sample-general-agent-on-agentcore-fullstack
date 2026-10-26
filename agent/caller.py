@@ -41,9 +41,16 @@ def actor(authorization: list[str]) -> str:
     """The actor named by the request's Authorization headers, or "" when there is not
     exactly one, or its token does not verify as an access token this pool issued to one of
     this deployment's clients."""
+    return identify(authorization)[0]
+
+
+def identify(authorization: list[str]) -> tuple[str, str]:
+    """(actor, account) for a verified bearer, else ("", ""). The account is what the person
+    signed in as — a web user's username, which is their email — for the agent to tell them;
+    a Lark user's is read from Lark, with their grant."""
     scheme, _, token = (authorization[0] if len(authorization) == 1 else "").partition(" ")
     if scheme.lower() != "bearer" or not token.strip() or not _ISSUER:
-        return ""
+        return "", ""
     token = token.strip()
     try:
         key = _keys().get_signing_key_from_jwt(token).key
@@ -54,21 +61,21 @@ def actor(authorization: list[str]) -> str:
                                                  "sub"]})
     except Exception as e:  # noqa: BLE001 — any failure is an unverified caller
         log.warning("bearer did not verify: %s", type(e).__name__)
-        return ""
+        return "", ""
     if claims["token_use"] != "access":
         log.warning("bearer is not an access token")
-        return ""
+        return "", ""
+    username = claims.get("username") or ""
     if claims["client_id"] == _CLIENT:
         # Only the router mints for this client, and only for Lark users; anything else
         # holding one of its tokens is no actor at all.
-        username = claims.get("username") or ""
-        return username if username.startswith("lark:") else ""
+        return (username, "") if username.startswith("lark:") else ("", "")
     if _WEB_CLIENT and claims["client_id"] == _WEB_CLIENT:
         # A Lark user's Cognito account signing in at the hosted login would carry their sub,
         # and with it whatever grants are keyed by it. Lark users come in through Lark.
-        if (claims.get("username") or "").startswith("lark:"):
+        if username.startswith("lark:"):
             log.warning("a Lark user's account signed in through the web client")
-            return ""
-        return f"web:{claims['sub']}"
+            return "", ""
+        return f"web:{claims['sub']}", username
     log.warning("bearer is not from this deployment's clients")
-    return ""
+    return "", ""
