@@ -1877,28 +1877,54 @@ def clear_history(actor_id: str, mem_sid: str = "") -> dict:
 
 
 def auth_status(actor_id: str, workload_token: str = "") -> dict:
-    """Which IdPs this user has authorised → {"lark": bool, "google": bool, …}.
+    """Which IdPs this user has authorised → {"lark": bool, "google": bool, …, "accounts":
+    {idp: who signed in to grant it}} — the account so a user can tell which of theirs it is.
 
     Only the agent can answer this. A consent is vaulted against the workload identity the
     Runtime derives from the inbound JWT, and re-deriving one from a fresh JWT for the same
     user reads a different namespace — see docs/agentcore-behavior.md."""
-    status = {}
+    status, tokens = {}, {}
     # Lark only for a Lark user of a deployment that has it; a failed lookup is "not
     # authorised", and must not keep the other systems from being reported.
     if actor_id.startswith("lark:") and lark_3lo.configured():
         try:
-            kind, _ = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
+            kind, value = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
         except Exception:  # noqa: BLE001
             log.warning("Lark status lookup failed for %s", actor_id, exc_info=True)
-            kind = "error"
+            kind, value = "error", ""
+        if kind == "token":
+            tokens["lark"] = value
         status["lark"] = kind == "token"
     elif lark_3lo.configured():
         provider, scopes = lark_3lo.lark_provider()
-        status["lark"] = bool(lark_3lo.peek_user_token_for(actor_id, provider, scopes,
-                                                          workload_token))
+        tokens["lark"] = lark_3lo.peek_user_token_for(actor_id, provider, scopes, workload_token)
+        status["lark"] = bool(tokens["lark"])
     for idp, (_, provider, scopes) in _DOWNSTREAMS.items():
-        status[idp] = bool(lark_3lo.peek_user_token_for(actor_id, provider, scopes, workload_token))
+        tokens[idp] = lark_3lo.peek_user_token_for(actor_id, provider, scopes, workload_token)
+        status[idp] = bool(tokens[idp])
+    # Asked of each vendor at once: a round trip apiece, and /auth waits for the slowest.
+    from concurrent.futures import ThreadPoolExecutor
+    held = {idp: token for idp, token in tokens.items() if token and idp in _ACCOUNT_OF}
+    with ThreadPoolExecutor(max_workers=max(1, len(held))) as pool:
+        found = {idp: pool.submit(_ACCOUNT_OF[idp], token) for idp, token in held.items()}
+    status["accounts"] = {idp: f.result() for idp, f in found.items() if f.result()}
     return status
+
+
+def _google_account(token: str) -> str:
+    """The email of the Google account that granted this token; "" if it can't be read."""
+    import httpx
+    try:
+        r = httpx.get("https://openidconnect.googleapis.com/v1/userinfo",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=5)
+        return (r.json() or {}).get("email") or ""
+    except Exception as e:  # noqa: BLE001 — a missing name must not cost the status
+        log.warning("could not read the Google account: %s", type(e).__name__)
+        return ""
+
+
+# Who signed in to grant each system's token, read with that token: shown by /auth.
+_ACCOUNT_OF = {"lark": lark_3lo.account_of, "google": _google_account}
 
 
 def _drop_sessions(actor_id: str) -> None:

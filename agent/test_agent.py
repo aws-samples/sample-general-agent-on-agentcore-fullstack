@@ -1700,6 +1700,26 @@ def test_a_message_whose_turn_stopped_before_a_reply_still_gets_its_time():
     assert by_id["h2"] == 4242 and [m.id for m in msgs if isinstance(m, HumanMessage)] == ["h1", "h2", "h3"]
 
 
+def test_auth_status_names_the_account_each_grant_came_from():
+    """Read with the grant itself, so a user can tell which of their accounts it is; a lookup
+    that fails costs the name, never the status."""
+    tokens = {"lark-prov": "lark-tok", "google-prov": "g-tok"}
+    with mock.patch.object(agent_core.lark_3lo, "configured", return_value=True), \
+         mock.patch.object(agent_core.lark_3lo, "lark_provider", return_value=("lark-prov", [])), \
+         mock.patch.object(agent_core, "_DOWNSTREAMS", {"google": ("u", "google-prov", [])}), \
+         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for",
+                           side_effect=lambda actor, prov, scopes, wt: tokens.get(prov, "")), \
+         mock.patch.dict(agent_core._ACCOUNT_OF, {"lark": lambda t: "XUESONG · me@myners.net",
+                                                  "google": lambda t: "me@myners.net"}):
+        st = agent_core.auth_status("web:s-1")
+        assert st["lark"] is True and st["google"] is True
+        assert st["accounts"] == {"lark": "XUESONG · me@myners.net", "google": "me@myners.net"}
+        tokens.pop("google-prov")
+        with mock.patch.dict(agent_core._ACCOUNT_OF, {"lark": lambda t: ""}):
+            st = agent_core.auth_status("web:s-1")
+        assert st["lark"] is True and st["google"] is False and st["accounts"] == {}
+
+
 def test_reauthorising_a_system_already_granted_starts_a_new_consent():
     """How a user switches accounts: /auth google answered "Already authorized." while a grant
     was vaulted, so there was no way to consent as anybody else."""

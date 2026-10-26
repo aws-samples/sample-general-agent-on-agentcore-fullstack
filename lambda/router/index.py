@@ -398,6 +398,18 @@ def _load_idps() -> dict:
 IDPS = _load_idps()
 
 
+def auth_status(session_id: str, user_id: str, actor_id: str) -> dict:
+    """Every system's grant at once, answered by the agent, with the account that granted
+    it: {"lark": bool, …, "accounts": {idp: name}}. {} when the agent cannot be asked."""
+    if not session_id:
+        return {}
+    try:
+        return invoke_agent(session_id, user_id, actor_id, "", action="auth_status") or {}
+    except Exception:  # noqa: BLE001 — an unknown state reads as "not authorised"
+        logger.warning("auth_status failed for %s", actor_id, exc_info=True)
+        return {}
+
+
 def user_authorized(session_id: str, user_id: str, actor_id: str,
                     idp_key: str = "lark") -> bool:
     """Whether this user has authorised `idp_key`, answered by the agent.
@@ -405,14 +417,45 @@ def user_authorized(session_id: str, user_id: str, actor_id: str,
     The router cannot answer it: a consent is vaulted against the workload identity the
     Runtime derives from the inbound JWT, and re-deriving one here reads a different
     namespace and always reports "no" (see docs/agentcore-behavior.md)."""
-    if not session_id:
-        return False
-    try:
-        r = invoke_agent(session_id, user_id, actor_id, "", action="auth_status")
-    except Exception:  # noqa: BLE001 — an unknown state reads as "not authorised"
-        logger.warning("auth_status failed for %s", actor_id, exc_info=True)
-        return False
-    return bool(r.get(idp_key))
+    return bool(auth_status(session_id, user_id, actor_id).get(idp_key))
+
+
+# Where a user removes the grant on the vendor's side, which clearing it here does not do.
+_VENDOR_GRANTS = {"google": "Google 账号的「第三方应用」", "lark": "Lark 的「应用授权管理」"}
+
+
+def _revoke(which: str, user_id: str, actor_id: str) -> dict:
+    """Clear this user's grants — all, or one system's — so the next use asks again and
+    another account can be chosen. AgentCore has no call that deletes one user's vaulted
+    token, but starting a forced consent drops the token the vault held (measured), so each
+    is cleared by starting one and discarding its link. The vendor still lists the grant
+    until the user removes it there."""
+    if which and which not in IDPS:
+        return {"text": f"未知的 IdP：{which}。可用：{', '.join(IDPS) or '（未配置）'}"}
+    session_id = identity.get_or_create_session(user_id)
+    status = auth_status(session_id, user_id, actor_id)
+    targets = [which] if which else [k for k in IDPS if status.get(k)]
+    if not targets or (which and not status.get(which)):
+        return {"text": "没有需要清除的授权。"}
+    cleared, failed = [], []
+    for key in targets:
+        try:
+            invoke_agent(session_id, user_id, actor_id, key, action="reauth")
+            cleared.append(IDPS[key].get("label", key))
+        except Exception:  # noqa: BLE001 — report it, keep clearing the rest
+            logger.warning("revoke of %s failed for %s", key, actor_id, exc_info=True)
+            failed.append(IDPS[key].get("label", key))
+    logger.info("revoked %s for %s", cleared, actor_id)
+    lines = []
+    if cleared:
+        lines.append(f"已清除 {'、'.join(cleared)} 的授权。下次用到时会重新请你授权，可以换一个账号。")
+        where = [_VENDOR_GRANTS[k] for k in targets if k in _VENDOR_GRANTS
+                 and IDPS[k].get("label", k) in cleared]
+        if where:
+            lines.append(f"对方系统里的授权记录仍在，可到{'、'.join(where)}里删除。")
+    if failed:
+        lines.append(f"{'、'.join(failed)} 没能清除，请稍后再发一次 /auth revoke。")
+    return {"text": "\n".join(lines)}
 
 
 # --------------------------- consent completion -----------------------------
@@ -647,7 +690,8 @@ def _words_and_attachments(msg_type: str, content: dict) -> tuple[str, list[str]
 _HELP = "\n".join([
     "可用命令：",
     "  /auth        查看各 IdP 的授权状态",
-    "  /auth <idp>  对该 IdP 授权或重新授权",
+    "  /auth <idp>  对该 IdP 授权或重新授权（可换成另一个账号）",
+    "  /auth revoke [idp]  清除授权，下次用到时重新授权",
     "  /status      当前身份、会话与服务你的 microVM",
     "  /context     对话轮数、上下文大小、系统提示词、压缩与缓存命中",
     "  /model       当前模型、平台与 prompt cache 方式",
@@ -711,13 +755,19 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
     if cmd == "/auth" or cmd.startswith("/auth "):
         arg = message[5:].strip().lower()
         if not arg:
-            lines = ["各 IdP 的授权状态："]
-            session_id = identity.get_or_create_session(user_id)
+            lines = ["各系统的授权状态："]
+            status = auth_status(identity.get_or_create_session(user_id), user_id, actor_id)
+            accounts = status.get("accounts") or {}
             for key, idp in IDPS.items():
-                ok = user_authorized(session_id, user_id, actor_id, key)
-                lines.append(f"  {'✅' if ok else '❌'} {key} ({idp.get('label', key)})"
-                             f"{'' if ok else ' — 发送 /auth ' + key + ' 授权'}")
+                label = idp.get("label", key)
+                if status.get(key):
+                    who = accounts.get(key)
+                    lines.append(f"  ✅ {label}{f'（{who}）' if who else ''}")
+                else:
+                    lines.append(f"  ❌ {label} — 发送 /auth {key} 授权")
             return {"text": "\n".join(lines)}
+        if arg == "revoke" or arg.startswith("revoke "):
+            return _revoke(arg[6:].strip(), user_id, actor_id)
         if arg not in IDPS:
             return {"text": f"未知的 IdP：{arg}。可用：{', '.join(IDPS) or '（未配置）'}"}
         session_id = identity.get_or_create_session(user_id)

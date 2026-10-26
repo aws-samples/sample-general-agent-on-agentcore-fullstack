@@ -77,6 +77,19 @@ _VERIFIED: dict[str, str] = {}
 _VERIFIED_MAX = 256
 
 
+def account_of(token: str) -> str:
+    """Who signed in to grant this Lark token, for /auth to show: name, and email if the app
+    may read it; "" when it can't be read."""
+    try:
+        r = httpx.get(f"{_API_DOMAIN}/open-apis/authen/v1/user_info",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=5)
+        data = r.json().get("data") or {}
+    except Exception as e:  # noqa: BLE001 — a missing name must not cost the status
+        log.warning("could not read the Lark account: %s", type(e).__name__)
+        return ""
+    return " · ".join(v for v in (data.get("name"), data.get("enterprise_email") or data.get("email")) if v)
+
+
 def _token_owner(token: str) -> str:
     """The open_id this Lark token actually belongs to, or "" if it can't be read.
     Needs no extra scope — the lark-cli server reads the same endpoint for whoami."""

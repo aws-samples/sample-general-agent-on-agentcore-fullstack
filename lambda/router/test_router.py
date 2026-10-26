@@ -976,6 +976,47 @@ def test_a_web_caller_is_web_sub_and_only_from_the_web_client():
         assert identity.is_user_allowed("web", "s-1") is True
 
 
+def test_auth_lists_each_system_with_the_account_it_was_granted_by_in_one_call():
+    import index, identity
+    calls = []
+
+    def fake_invoke(*a, **k):
+        calls.append(k.get("action"))
+        return {"lark": True, "google": False, "accounts": {"lark": "XUESONG · me@myners.net"}}
+    idps = {"lark": {"key": "lark", "label": "Lark"}, "google": {"key": "google", "label": "Google"}}
+    with mock.patch.object(index, "IDPS", idps), \
+         mock.patch.object(index, "invoke_agent", side_effect=fake_invoke), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_x"):
+        text = index.run_command("/auth", "u-1", "web:s-1")["text"]
+    assert calls == ["auth_status"]
+    assert "✅ Lark（XUESONG · me@myners.net）" in text and "lark (Lark)" not in text
+    assert "❌ Google — 发送 /auth google 授权" in text
+
+
+def test_auth_revoke_clears_each_granted_system_by_starting_a_consent_it_discards():
+    """AgentCore cannot delete one user's token; a forced consent drops it (measured)."""
+    import index, identity
+    calls = []
+
+    def fake_invoke(sid, uid, actor, message, action="", **k):
+        calls.append((action, message))
+        if action == "auth_status":
+            return {"lark": True, "google": True, "accounts": {}}
+        return {"auth_url": "https://discarded"}
+    idps = {"lark": {"key": "lark", "label": "Lark"}, "google": {"key": "google", "label": "Google"}}
+    with mock.patch.object(index, "IDPS", idps), \
+         mock.patch.object(index, "invoke_agent", side_effect=fake_invoke), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_x"):
+        out = index.run_command("/auth revoke", "u-1", "web:s-1")
+        assert calls[1:] == [("reauth", "lark"), ("reauth", "google")]
+        assert "已清除 Lark、Google 的授权" in out["text"] and "link" not in out
+        calls.clear()
+        one = index.run_command("/auth revoke google", "u-1", "web:s-1")["text"]
+        assert "已清除 Google" in one and "第三方应用" in one and "Lark" not in one
+        assert calls[1:] == [("reauth", "google")]
+        assert "未知的 IdP" in index.run_command("/auth revoke github", "u-1", "web:s-1")["text"]
+
+
 def test_only_an_admin_manages_web_users_and_never_lark_users_or_themselves():
     """The admin page is gated on the admins group of the verified token, not on the page
     hiding a link; Lark users are the router's own, and an admin cannot lock everyone out."""
