@@ -8,13 +8,16 @@
 
 macOS 或 Linux 均可，Windows 用户在 WSL2 里操作。已经装好的可以跳过：
 
-| 工具 | 安装 | 确认 |
-|---|---|---|
-| `git` | 系统自带，或见 [git-scm.com](https://git-scm.com/downloads) | `git --version` |
-| AWS CLI v2 | [AWS CLI 安装指南](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | `aws --version` 显示 `aws-cli/2.…` |
-| Node.js 22 或 24 LTS | [nodejs.org](https://nodejs.org/) | `node --version` |
-| Python 3 | 系统自带，或见 [python.org](https://www.python.org/downloads/) | `python3 --version` |
-| uv | [uv 安装指南](https://docs.astral.sh/uv/getting-started/installation/) | `uv --version` |
+| 工具 | 版本要求 | 安装 | 确认 |
+|---|---|---|---|
+| `git` | 任意 | 系统自带，或见 [git-scm.com](https://git-scm.com/downloads) | `git --version` |
+| AWS CLI | v2，越新越好 | [AWS CLI 安装指南](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | `aws --version` 显示 `aws-cli/2.…` |
+| Node.js | 22 或 24 LTS | [nodejs.org](https://nodejs.org/) | `node --version` |
+| Python 3 | 3.8 或更高，系统自带的即可 | 系统自带，或见 [python.org](https://www.python.org/downloads/) | `python3 --version` |
+| uv | 0.5 或更高 | [uv 安装指南](https://docs.astral.sh/uv/getting-started/installation/) | `uv --version` |
+| `zip`、`openssl` | 任意 | macOS 自带；Ubuntu / WSL2 缺 `zip` 时运行 `sudo apt install zip` | `zip -v`、`openssl version` |
+
+部署用的 Python 3.13 不用自己装：第一次运行预检时，uv 会自动下载。
 
 取得代码：
 
@@ -106,9 +109,17 @@ GITHUB_CLIENT_SECRET=<1.2 生成的 secret>
 ./deploy.sh preflight
 ```
 
-预检只读、不部署，它检查四件事：本机工具、AWS 凭证、对各服务的读权限（包括 `us-east-1` 的 AgentCore），以及 `.env` 的配置。通过时会打印部署目标，`lark` 一行应为 `off  (web page only)`。用 profile 时，`region` 一行后面还会显示 `profile: <名字>`：
+预检不部署任何资源，它检查五件事：本机工具及其版本、部署要用的 Python 环境和 CDK CLI、AWS 凭证、对各服务的读权限（包括 `us-east-1` 的 AgentCore），以及 `.env` 的配置。
+
+**第一次运行要下载约 300 MB**：Python 3.13+ 和项目依赖，以及 CDK CLI，会显示下载进度，网络慢时需要几分钟。之后再运行只要半分钟左右。下载很慢或卡住时，见[常见问题](05-troubleshooting.md#预检下载很慢或卡住)。
+
+通过时会打印部署目标，`lark` 一行应为 `off  (web page only)`。用 profile 时，`region` 一行后面还会显示 `profile: <名字>`：
 
 ```text
+  tools   : uv 0.12.21 · aws-cli 2.37.7 · node 24.11.0 · python3 3.9.6
+  python  : Python 3.14.7 (project environment)
+  cdk     : aws-cdk 2.1146.1
+  checking AWS credentials and permissions…
   deploy  : agentcore-fullstack   (state: .cdk-state.agentcore-fullstack.json)
   account : <你的账号 ID>
   region  : us-west-2

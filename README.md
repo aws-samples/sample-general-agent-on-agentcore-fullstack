@@ -90,7 +90,7 @@ Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and th
 
 ## Quick start
 
-Needs `uv`, Node.js (for `npx` and the CDK), and AWS credentials. Images build natively on ARM64 in CodeBuild; Docker is needed only with `AGENT_BUILD=local`.
+Needs `uv` ≥ 0.5, Node.js 22 or 24 (for `npx` and the CDK), AWS CLI v2, `python3` ≥ 3.8, `zip`, `openssl`, and AWS credentials; `./deploy.sh preflight` checks them, and its first run downloads Python 3.13+ and the project's packages through uv. Images build natively on ARM64 in CodeBuild; Docker is needed only with `AGENT_BUILD=local`.
 
 ```bash
 cp .env.example .env    # deployment target, plus a Lark app or the web page (or both)

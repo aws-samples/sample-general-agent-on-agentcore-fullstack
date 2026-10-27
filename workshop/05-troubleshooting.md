@@ -6,17 +6,34 @@
 
 | 提示 | 原因与处理 |
 |---|---|
-| `missing tools: …` | 列出的工具没装或不在 `PATH` 里。`npx` 来自 Node.js |
+| `missing tools: …` | 列出的工具没装或不在 `PATH` 里，提示里附了安装地址。`npx` 来自 Node.js |
+| `tools too old: …` | 列出的工具版本太低，按提示升级，版本要求见 [1.1](01-prepare.md#11-本机工具与-aws-凭证) |
+| `AWS CLI … has no command for: …` | AWS CLI 太旧，还不认识 AgentCore 等新服务，升级到最新的 AWS CLI v2 |
+| `uv could not set up the Python environment…` 或 `could not fetch the CDK CLI from npm…` | 下载失败，见下面的[预检下载很慢或卡住](#预检下载很慢或卡住) |
 | `AWS credentials not usable…` | 环境变量里的临时凭证过期了（重新从 Workshop Studio 复制），或者 `.env` 里的 `PROFILE` 不存在。用 `aws sts get-caller-identity` 确认凭证可用 |
 | `Lark is half configured — unset in .env: LARK_ADMIN_OPEN_ID` | `.env` 里 Lark 的示例值没清空。把 `LARK_APP_ID`、`LARK_APP_SECRET`、`LARK_ENCRYPT_KEY`、`LARK_VERIFICATION_TOKEN` 全部清空，见 [1.3](01-prepare.md#13-填写-env) |
 | `no Lark app and WEBUI is not true — nobody could reach the agent` | 不接 Lark 时 Web 页面是唯一入口，把 `WEBUI` 设为 `true` |
 | `GitHub is half configured — set both GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET in .env, or neither` | 两项要同时填写 |
 | `DEPLOYMENT_NAME '…' must be 3-23 chars of a-z, 0-9 and '-', starting with a letter` | 按规则改名 |
 
-还有两条只是警告，预检不会停下：
+还有三条只是警告，预检不会停下：
+
+- `warning: Node.js … is not one the CDK supports (22, 24)`：其他版本一般也能部署，但 CDK 会打印一大段警告；部署出现异常时换成 22 或 24 LTS。
 
 - `warning: can't confirm <MODEL_ID> in <REGION> — enable model access if the agent 403s`：在 Bedrock 控制台为该区域开通模型访问。不开通的话部署能完成，但 Agent 回答时会报 403。默认的 Kimi K3 是第三方模型，第一次调用可能要在 AWS Marketplace 订阅；账号不允许订阅时，在 `.env` 里把 `MODEL_ID` 换成账号可用的其他模型。
 - `warning: no read access to: …`：当前凭证读不了列出的服务。部署要写这些服务，大概率会失败，先换一个权限足够的凭证。
+
+## 预检下载很慢或卡住
+
+第一次预检要下载 Python 和约 300 MB 的依赖（`python  : first run — downloading…` 之后的进度），然后从 npm 取 CDK CLI（`cdk     :` 那一行）。网络慢或访问 PyPI、GitHub、npm 受限时，按 Ctrl-C 停下，在同一个终端设置镜像后重新运行 `./deploy.sh preflight`：
+
+```bash
+export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
+export UV_PYTHON_INSTALL_MIRROR=https://registry.npmmirror.com/-/binary/python-build-standalone/
+export npm_config_registry=https://registry.npmmirror.com
+```
+
+用了 PyPI 镜像后 `uv.lock` 会被改写成镜像地址，不影响部署。
 
 ## 部署失败
 

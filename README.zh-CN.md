@@ -87,7 +87,7 @@
 
 ## 快速开始
 
-需要 `uv`、Node.js(提供 `npx` 与 CDK),以及 AWS 凭证。镜像在 CodeBuild 里以 ARM64 原生构建;只有设置 `AGENT_BUILD=local` 时才需要 Docker。
+需要 `uv` ≥ 0.5、Node.js 22 或 24(提供 `npx` 与 CDK)、AWS CLI v2、`python3` ≥ 3.8、`zip`、`openssl`,以及 AWS 凭证;`./deploy.sh preflight` 会逐项检查,第一次运行时由 uv 下载 Python 3.13+ 和项目依赖。镜像在 CodeBuild 里以 ARM64 原生构建;只有设置 `AGENT_BUILD=local` 时才需要 Docker。
 
 ```bash
 cp .env.example .env    # 部署目标 + Lark 应用凭证 + 你自己的 open_id
