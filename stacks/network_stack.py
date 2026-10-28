@@ -65,10 +65,13 @@ class NetworkStack(Stack):
                                       subnets=agent_only)
 
         # Egress-only: nothing in this VPC listens, and everything the agent calls is HTTPS.
+        # NTP too: the microVM syncs its clock against public servers (seen in the flow logs,
+        # rejected without this), and SigV4 and JWT checks need the time right.
         self.agent_sg = ec2.SecurityGroup(
             self, "AgentSg", vpc=self.vpc, allow_all_outbound=False,
             description="Agent Runtime: HTTPS out, nothing in")
         self.agent_sg.add_egress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(443), "HTTPS out")
+        self.agent_sg.add_egress_rule(ec2.Peer.any_ipv4(), ec2.Port.udp(123), "NTP out")
 
         # Every connection in or out, at IP level: the record a compliance review asks for.
         self.vpc.add_flow_log("FlowLog", destination=ec2.FlowLogDestination.to_cloud_watch_logs(
