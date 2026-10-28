@@ -46,6 +46,8 @@ Optional web search: set `WEB_SEARCH=true` in `.env` before deploying (or run `.
 
 Optional web browser: set `BROWSER=true` and run `./deploy.sh runtime`. The agent uses AWS's managed `aws.browser.v1`, so nothing is created; the execution role's grant on it is always there, so switching the flag needs no stack update. Read the trade-off in [architecture.md](architecture.md#the-web-browser) first.
 
+Optional agent VPC: set `AGENT_NETWORK=vpc` before the **first** deploy. Without `AGENT_SUBNET_IDS` the deploy creates a VPC with one NAT (the agent's fixed outbound IP, printed as the network stack's `NatPublicIp`) and flow logs; with `AGENT_SUBNET_IDS` and `AGENT_SECURITY_GROUP_IDS` the agent goes into your own private subnets, and your network decides its egress. Preflight checks the subnets: private, in two AgentCore-supported AZs, with an S3 gateway endpoint. The setting is fixed for the deployment's life — switching means `scripts/destroy.sh` and a fresh deploy, and the scripts refuse a `.env` that disagrees with what was deployed. What it covers is in [architecture.md](architecture.md#the-agents-network).
+
 ### Tear down
 
 ```bash
@@ -83,6 +85,7 @@ This deploys billable AWS resources. All the always-on pieces are consumption- o
 - **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. No dynamic per-user secrets.
 - **Web search (optional)** — only when `WEB_SEARCH=true`: an AgentCore Gateway plus per-query connector charges. The gateway sits in us-east-1, so its traffic is cross-region.
 - **Code execution (optional, `FILES_STORAGE=true`)** — **no NAT.** A mount needs a VPC, but only the Code Interpreter session goes in there, and it only has to reach S3, which a free gateway endpoint does. So the fixed cost is a VPC (free), an S3 gateway endpoint (free) and mount targets (free); what is metered is sandbox session time and the S3 storage the workspace uses. Off by default because it still adds resources you should not create by accident.
+- **Agent VPC (optional, `AGENT_NETWORK=vpc`)** — a created VPC is one NAT gateway (a fixed hourly charge plus per-GB processing; shared with the code sandbox when both are on) and flow logs in CloudWatch Logs. Your own subnets cost nothing here.
 - **Web browser (optional, `BROWSER=true`)** — per second of CPU and memory while a browser session runs. A conversation's browser stops after 15 minutes unused, and in any case at its 1-hour session timeout.
 - **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume.
 

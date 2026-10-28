@@ -218,27 +218,32 @@ fi
 # /aws/lambda/<function>, a group their stack does not own. CDK truncates the stack name in
 # those function names, so they are read from the stacks before the stacks go, not guessed.
 CDK_FUNCS=()
-for s in security agentcore shim sandbox router webui gateway observability; do
+for s in security agentcore shim network sandbox router webui gateway observability; do
   # shellcheck disable=SC2207 # function names have no spaces
   CDK_FUNCS+=($(aws cloudformation list-stack-resources --stack-name "$PREFIX-$s" \
     --query "StackResourceSummaries[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
     --output text 2>/dev/null || true))
 done
+# agent_network=vpc puts the network stack in the app too. The state file's own value wins
+# when it is still there; the AZs only need to be valid names for a synth that lists stacks.
 CDK_CTX=(-c "deployment_name=$PREFIX" -c files_storage=true -c webui=true
+         -c agent_network=vpc -c "network_azs=${REGION}a,${REGION}c"
          -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}" --output "$CDK_OUT")
-# While AgentCore still holds interfaces in the sandbox subnets, the sandbox stack cannot
-# delete them (DependencyViolation), and agentcore and security, which it imports from,
-# cannot go before it. Trying anyway leaves all three DELETE_FAILED; leaving them for a
-# re-run does not.
-vpc="$(aws ec2 describe-vpcs --filters "Name=tag:aws:cloudformation:stack-name,Values=$PREFIX-sandbox" \
-         --query 'Vpcs[0].VpcId' --output text 2>/dev/null || true)"
+# While AgentCore still holds interfaces in a VPC of ours — the sandbox's, or the network
+# stack's that the agent and the sandbox share — the stacks owning those subnets and security
+# groups cannot delete them (DependencyViolation), and agentcore and security, which the
+# sandbox imports from, cannot go before it. Trying anyway leaves them DELETE_FAILED; leaving
+# them for a re-run does not.
+vpc="$(aws ec2 describe-vpcs --filters \
+         "Name=tag:aws:cloudformation:stack-name,Values=$PREFIX-sandbox,$PREFIX-network" \
+         --query 'Vpcs[].VpcId' --output text 2>/dev/null || true)"
 held=""
 if [ -n "$vpc" ] && [ "$vpc" != "None" ]; then
-  held="$(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$vpc" \
+  held="$(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=${vpc//[[:space:]]/,}" \
             "Name=interface-type,Values=agentic_ai" --query 'NetworkInterfaces[].NetworkInterfaceId' \
             --output text 2>/dev/null || true)"
 fi
-KEPT=("$PREFIX-sandbox" "$PREFIX-agentcore" "$PREFIX-security")
+KEPT=("$PREFIX-network" "$PREFIX-sandbox" "$PREFIX-agentcore" "$PREFIX-security")
 if [ -z "$held" ]; then
   log "CDK — destroy every stack of this app"
   $CDK destroy --all "${CDK_CTX[@]}" --force

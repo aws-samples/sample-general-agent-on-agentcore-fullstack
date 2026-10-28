@@ -28,6 +28,11 @@ WEB_SEARCH="${WEB_SEARCH:-false}"
 FILES_STORAGE="${FILES_STORAGE:-false}"
 NAT_GATEWAY="${NAT_GATEWAY:-false}"
 [ "$FILES_STORAGE" = "true" ] || NAT_GATEWAY=false
+# The agent Runtime's network, fixed for the deployment's life. vpc without AGENT_SUBNET_IDS
+# creates the network stack; with them the agent goes into the operator's subnets.
+. scripts/lib/network.sh
+network_check_lock
+NETWORK_STACK="$([ "$AGENT_NETWORK" = "vpc" ] && [ -z "${AGENT_SUBNET_IDS:-}" ] && echo true || echo false)"
 # Where the agent image is built: CodeBuild (ARM64 native, no local Docker) unless .env
 # asks for the host's Docker.
 AGENT_BUILD="${AGENT_BUILD:-codebuild}"
@@ -44,7 +49,9 @@ CDK="npx --yes aws-cdk@2"
 CDK_CTX=(-c "deployment_name=$PREFIX" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY"
          -c "agent_build=$AGENT_BUILD" -c "lark_api_domain=$LARK_API_DOMAIN"
          -c "webui=${WEBUI:-false}" -c "lark=$([ -n "${LARK_APP_ID:-}" ] && echo true || echo false)"
-         --output "$CDK_OUT")
+         -c "agent_network=$AGENT_NETWORK" --output "$CDK_OUT")
+[ -z "${AGENT_SUBNET_IDS:-}" ] || CDK_CTX+=(-c "agent_subnet_ids=$AGENT_SUBNET_IDS")
+[ -z "${EIP_ALLOCATION_ID:-}" ] || CDK_CTX+=(-c "eip_allocation_id=$EIP_ALLOCATION_ID")
 . scripts/lib/codebuild.sh
 
 # Control-plane calls whose parameters are newer than the AWS CLI's bundled service model.
@@ -139,6 +146,21 @@ base_cdk_stacks() {
   log "Base — CDK stacks"
   local stacks=("$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router"
                 "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability")
+  ctx_set agent_network "$AGENT_NETWORK"
+  if [ "$NETWORK_STACK" = "true" ]; then
+    # Resolved once: re-resolving on a later deploy could pick other AZs and move the subnets.
+    if [ -z "$(ctx_get network_azs)" ]; then
+      local azs
+      azs="$(supported_az_names)"
+      [ "$(echo "$azs" | tr ',' '\n' | grep -c .)" -ge 2 ] || {
+        echo "no two AgentCore-supported AZs in $REGION for this account — see docs/deploy.md"; exit 1; }
+      ctx_set network_azs "$azs"
+    fi
+    stacks+=("$PREFIX-network")
+    echo "  agent network: VPC ($(ctx_get network_azs); NAT + flow logs)"
+  elif [ "$AGENT_NETWORK" = "vpc" ]; then
+    echo "  agent network: VPC (your subnets $AGENT_SUBNET_IDS)"
+  fi
   # The sandbox stack only exists when the flag is on (app.py skips it otherwise), so
   # naming it unconditionally would fail the deploy rather than skip it.
   if [ "$FILES_STORAGE" = "true" ]; then
@@ -263,8 +285,8 @@ phase2_runtime() {
     echo "  lark tools: off (no LARK_APP_ID)"
   fi
 
-  # Code execution: the Runtime stays PUBLIC. Only the Code Interpreter session joins the
-  # sandbox VPC, and only the ids it needs are baked in here. See docs/architecture.md.
+  # Code execution: the Code Interpreter session joins the sandbox subnets, and only the ids
+  # it needs are baked in here. See docs/architecture.md.
   local fs_arn="" ci_id=""
   if [ "$FILES_STORAGE" = "true" ]; then
     fs_arn="$(cfn_out "$PREFIX-sandbox" FileSystemArn)"
@@ -273,8 +295,18 @@ phase2_runtime() {
     echo "  code execution: on (interpreter $ci_id)"
   fi
 
+  local net_subnets="" net_sgs=""
+  if [ "$AGENT_NETWORK" = "vpc" ]; then
+    net_subnets="${AGENT_SUBNET_IDS:-$(cfn_out "$PREFIX-network" AgentSubnetIds)}"
+    net_sgs="${AGENT_SECURITY_GROUP_IDS:-$(cfn_out "$PREFIX-network" AgentSecurityGroupId)}"
+    [ -n "$net_subnets" ] && [ "$net_subnets" != "None" ] && [ -n "$net_sgs" ] && [ "$net_sgs" != "None" ] || {
+      echo "no subnets or security group for the agent — run --base first"; exit 1; }
+    echo "  network: VPC (subnets $net_subnets)"
+  fi
+
   local rname="${PREFIX//-/_}_agent" params rid
   params="$(RNAME="$rname" IMAGE="$image" ROLE="$role" ISSUER="$issuer" CLIENT="$client" \
+    NET_SUBNETS="$net_subnets" NET_SGS="$net_sgs" \
     WEBCLIENT="$webclient" \
     MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
     SHIM="$shim" POOL="$pool" WS_URL="$ws_url" \
@@ -338,9 +370,14 @@ env = {
     # The browser tools; the role's grant on aws.browser.v1 is unconditional.
     "BROWSER_ENABLED": os.environ.get("BROWSER", ""),
 }
-# The Runtime is never in the VPC: it must keep reaching Bedrock, Lark and a cross-region
-# Gateway, and that is what used to force a NAT. Only the sandbox goes in.
+# PUBLIC unless AGENT_NETWORK=vpc. In a VPC every call the agent makes leaves through those
+# subnets, so they must route to the internet: Lark, Google and the us-east-1 Gateway are
+# outside it. No requireServiceS3Endpoint: refused at creation (see the update path below).
 net = {"networkMode": "PUBLIC"}
+if e.get("NET_SUBNETS"):
+    net = {"networkMode": "VPC", "networkModeConfig": {
+        "subnets": [x for x in e["NET_SUBNETS"].split(",") if x],
+        "securityGroups": [x for x in e["NET_SGS"].split(",") if x]}}
 print(json.dumps({
     "agentRuntimeName": e["RNAME"],
     # V2 here demonstrates the platform version; what it costs and gains against V1 is measured

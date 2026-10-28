@@ -25,6 +25,7 @@ from stacks.router_stack import RouterStack
 from stacks.gateway_stack import GatewayStack
 from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
+from stacks.network_stack import NetworkStack
 from stacks.sandbox_stack import SandboxStack
 from stacks.webui_stack import WebUiStack
 
@@ -97,6 +98,22 @@ shim = ShimStack(
 # reaches S3 through a free gateway endpoint; nat_gateway=true adds a NAT for internet —
 # see docs/architecture.md. Declared before the router so its ids are available to the
 # phases that need them.
+# --- Network: the agent Runtime's VPC when agent_network=vpc and no subnets are given ---
+# Only the agent moves; with files_storage the sandbox shares the VPC in subnets of its own.
+# The AZs are resolved from AgentCore's supported AZ IDs at the first deploy and kept in
+# state, so they never move. See docs/architecture.md.
+network = None
+if ctx("agent_network") == "vpc" and not ctx("agent_subnet_ids"):
+    network = NetworkStack(
+        app,
+        f"{prefix}-network",
+        availability_zones=str(ctx("network_azs") or "").split(","),
+        sandbox=_flag("files_storage"),
+        nat_gateway=_flag("nat_gateway"),
+        eip_allocation_id=ctx("eip_allocation_id") or "",
+        env=env,
+    )
+
 sandbox = None
 if _flag("files_storage"):
     sandbox = SandboxStack(
@@ -104,6 +121,7 @@ if _flag("files_storage"):
         f"{prefix}-sandbox",
         user_files_bucket=agentcore.user_files_bucket,
         nat_gateway=_flag("nat_gateway"),
+        vpc=network.vpc if network else None,
         env=env,
     )
 

@@ -134,6 +134,58 @@ fi
 [ -z "$denied" ] || printf '\033[1;33m%s\033[0m\n' "  warning: no read access to:$denied
   The deploy writes to these — expect it to fail unless that is just a read-only denial."
 
+# --- network -------------------------------------------------------------
+# The agent Runtime's network. A mismatch with what the deployment was created with, an
+# unsupported AZ or a subnet that is not private fails at Runtime creation, minutes in.
+. scripts/lib/network.sh
+network_check_lock
+if [ "$AGENT_NETWORK" = "vpc" ]; then
+  [ -n "$(supported_az_ids "$REGION")" ] || fail "AgentCore lists no VPC-capable AZs for $REGION — use AGENT_NETWORK=public"
+  if [ -z "${AGENT_SUBNET_IDS:-}" ]; then
+    [ "$(supported_az_names | tr ',' '\n' | grep -c .)" -ge 2 ] \
+      || fail "this account has fewer than two AgentCore-supported AZs in $REGION ($(supported_az_ids "$REGION"))"
+  else
+    [ -n "${AGENT_SECURITY_GROUP_IDS:-}" ] || fail "AGENT_SUBNET_IDS needs AGENT_SECURITY_GROUP_IDS as well"
+    IFS=, read -r -a subnet_ids <<< "$AGENT_SUBNET_IDS"
+    subnets_json="$(aws ec2 describe-subnets --subnet-ids "${subnet_ids[@]}" --output json 2>&1)" \
+      || fail "cannot read AGENT_SUBNET_IDS: $subnets_json"
+    vpc_id="$(printf '%s' "$subnets_json" | python3 -c 'import json,sys; print(" ".join(sorted({s["VpcId"] for s in json.load(sys.stdin)["Subnets"]})))')"
+    [ "$(echo "$vpc_id" | wc -w)" -eq 1 ] || fail "AGENT_SUBNET_IDS span more than one VPC ($vpc_id)"
+    # Private: no route to an internet gateway, whether the table is associated or the main one.
+    routes_json="$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" --output json)"
+    endpoints="$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$vpc_id" \
+      "Name=service-name,Values=com.amazonaws.$REGION.s3" "Name=vpc-endpoint-type,Values=Gateway" \
+      --query 'length(VpcEndpoints)' --output text)"
+    dns="$(for a in enableDnsSupport enableDnsHostnames; do
+      aws ec2 describe-vpc-attribute --vpc-id "$vpc_id" --attribute "$a" --query "*.Value | [0]" --output text; done | tr '\n' ' ')"
+    problems="$(SUBNETS="$subnets_json" ROUTES="$routes_json" OK_IDS="$(supported_az_ids "$REGION")" \
+      ENDPOINTS="$endpoints" DNS="$dns" python3 - <<'PYEOF'
+import json, os
+subnets = json.loads(os.environ["SUBNETS"])["Subnets"]
+tables = json.loads(os.environ["ROUTES"])["RouteTables"]
+ok = set(os.environ["OK_IDS"].split())
+main = next((t for t in tables if any(a.get("Main") for a in t.get("Associations", []))), None)
+out = []
+for s in subnets:
+    if s["AvailabilityZoneId"] not in ok:
+        out.append(f'{s["SubnetId"]} is in {s["AvailabilityZoneId"]}, not one AgentCore supports ({" ".join(sorted(ok))})')
+    t = next((t for t in tables if any(a.get("SubnetId") == s["SubnetId"] for a in t.get("Associations", []))), main)
+    if t and any(r.get("GatewayId", "").startswith("igw-") for r in t.get("Routes", [])):
+        out.append(f'{s["SubnetId"]} routes to an internet gateway; AgentCore needs private subnets')
+if len({s["AvailabilityZoneId"] for s in subnets if s["AvailabilityZoneId"] in ok}) < 2:
+    out.append("AGENT_SUBNET_IDS need at least two supported AZs")
+if os.environ["ENDPOINTS"] in ("0", "None", ""):
+    out.append("the VPC has no S3 gateway endpoint; a new Runtime pulls its image layers through one")
+if "False" in os.environ["DNS"]:
+    out.append("the VPC needs DNS support and DNS hostnames enabled")
+print("\n".join(f"  {p}" for p in out))
+PYEOF
+)"
+    [ -z "$problems" ] || fail "AGENT_SUBNET_IDS cannot host the agent:
+$problems"
+  fi
+fi
+
 # --- config --------------------------------------------------------------
 [ -f .env ] || fail ".env is missing — start from: cp .env.example .env"
 [ -n "${MODEL_ID:-}" ] || fail "unset in .env: MODEL_ID"
@@ -164,6 +216,11 @@ echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
 echo "  model   : $MODEL_ID"
 echo "  lark    : $([ "$LARK" = "true" ] && echo "$LARK_API_DOMAIN" || echo 'off  (web page only)')"
 echo "  build   : $AGENT_BUILD$([ "$AGENT_BUILD" = "local" ] && echo '  (local Docker)' || echo '  (CodeBuild, ARM64 native)')"
+case "$AGENT_NETWORK:${AGENT_SUBNET_IDS:+byo}" in
+  public:*) echo "  network : agent PUBLIC" ;;
+  vpc:byo)  echo "  network : agent in VPC $vpc_id (your subnets; your network decides its egress)" ;;
+  vpc:)     echo "  network : agent in a created VPC (one NAT with a fixed IP, a fixed hourly cost; flow logs)" ;;
+esac
 echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"
 echo "  browser : ${BROWSER:-false}$([ "${BROWSER:-false}" = "true" ] && echo '  (AgentCore Browser, per second while one runs)' || true)"
 echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && echo "  (creates a VPC + S3 Files)" || true)"
