@@ -93,27 +93,26 @@ shim = ShimStack(
     env=env,
 )
 
-# --- Sandbox: the code sandbox's VPC, role and per-user S3 Files workspace (opt-in) ---
-# Off unless files_storage=true. Only the Code Interpreter session sits in this VPC and it
-# reaches S3 through a free gateway endpoint; nat_gateway=true adds a NAT for internet —
-# see docs/architecture.md. Declared before the router so its ids are available to the
-# phases that need them.
-# --- Network: the agent Runtime's VPC when agent_network=vpc and no subnets are given ---
+# --- Network: the agent Runtime's VPC when agent_network=vpc (vpc:byo means your subnets) ---
 # Only the agent moves; with files_storage the sandbox shares the VPC in subnets of its own.
 # The AZs are resolved from AgentCore's supported AZ IDs at the first deploy and kept in
 # state, so they never move. See docs/architecture.md.
 network = None
-if ctx("agent_network") == "vpc" and not ctx("agent_subnet_ids"):
+if ctx("agent_network") == "vpc":
     network = NetworkStack(
         app,
         f"{prefix}-network",
         availability_zones=str(ctx("network_azs") or "").split(","),
-        sandbox=_flag("files_storage"),
         nat_gateway=_flag("nat_gateway"),
         eip_allocation_id=ctx("eip_allocation_id") or "",
         env=env,
     )
 
+# --- Sandbox: the code sandbox's VPC, role and per-user S3 Files workspace (opt-in) ---
+# Off unless files_storage=true. Only the Code Interpreter session sits in this VPC and it
+# reaches S3 through a free gateway endpoint; nat_gateway=true adds a NAT for internet —
+# see docs/architecture.md. Declared before the router so its ids are available to the
+# phases that need them.
 sandbox = None
 if _flag("files_storage"):
     sandbox = SandboxStack(

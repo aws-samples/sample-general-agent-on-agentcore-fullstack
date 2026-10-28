@@ -6,7 +6,9 @@ endpoint of its own; nothing here accepts a connection, so model-written code th
 reach the agent. See docs/architecture.md.
 
   agent    private, routed to the NAT — the agent's fixed outbound IP
-  sandbox  private; routed to the NAT only with nat_gateway=true
+  sandbox  private; routed to the NAT only with nat_gateway=true. Created whether or not
+           FILES_STORAGE is on: subnets cost nothing, and a group that came and went with
+           the flag would drop exports the sandbox stack still imports.
   public   holds the NAT
 """
 from __future__ import annotations
@@ -26,8 +28,8 @@ SANDBOX_SUBNETS = "sandbox"
 
 class NetworkStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, *,
-                 availability_zones: list[str], sandbox: bool = False,
-                 nat_gateway: bool = False, eip_allocation_id: str = "",
+                 availability_zones: list[str], nat_gateway: bool = False,
+                 eip_allocation_id: str = "",
                  **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
@@ -36,12 +38,10 @@ class NetworkStack(Stack):
                                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
             ec2.SubnetConfiguration(name="public", cidr_mask=24,
                                     subnet_type=ec2.SubnetType.PUBLIC),
+            ec2.SubnetConfiguration(name=SANDBOX_SUBNETS, cidr_mask=24,
+                                    subnet_type=(ec2.SubnetType.PRIVATE_WITH_EGRESS if nat_gateway
+                                                 else ec2.SubnetType.PRIVATE_ISOLATED)),
         ]
-        if sandbox:
-            groups.append(ec2.SubnetConfiguration(
-                name=SANDBOX_SUBNETS, cidr_mask=24,
-                subnet_type=(ec2.SubnetType.PRIVATE_WITH_EGRESS if nat_gateway
-                             else ec2.SubnetType.PRIVATE_ISOLATED)))
         # AZs by name, resolved from AgentCore's supported AZ IDs at the first deploy and kept
         # in state: names map to different IDs per account, and re-resolving would move subnets.
         # One NAT, not one per AZ: a single fixed IP and a single hourly charge.

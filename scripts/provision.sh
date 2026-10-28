@@ -32,7 +32,7 @@ NAT_GATEWAY="${NAT_GATEWAY:-false}"
 # creates the network stack; with them the agent goes into the operator's subnets.
 . scripts/lib/network.sh
 network_check_lock
-NETWORK_STACK="$([ "$AGENT_NETWORK" = "vpc" ] && [ -z "${AGENT_SUBNET_IDS:-}" ] && echo true || echo false)"
+NETWORK_STACK="$([ "$NETWORK_KIND" = "vpc" ] && echo true || echo false)"
 # Where the agent image is built: CodeBuild (ARM64 native, no local Docker) unless .env
 # asks for the host's Docker.
 AGENT_BUILD="${AGENT_BUILD:-codebuild}"
@@ -49,9 +49,7 @@ CDK="npx --yes aws-cdk@2"
 CDK_CTX=(-c "deployment_name=$PREFIX" -c "files_storage=$FILES_STORAGE" -c "nat_gateway=$NAT_GATEWAY"
          -c "agent_build=$AGENT_BUILD" -c "lark_api_domain=$LARK_API_DOMAIN"
          -c "webui=${WEBUI:-false}" -c "lark=$([ -n "${LARK_APP_ID:-}" ] && echo true || echo false)"
-         -c "agent_network=$AGENT_NETWORK" --output "$CDK_OUT")
-[ -z "${AGENT_SUBNET_IDS:-}" ] || CDK_CTX+=(-c "agent_subnet_ids=$AGENT_SUBNET_IDS")
-[ -z "${EIP_ALLOCATION_ID:-}" ] || CDK_CTX+=(-c "eip_allocation_id=$EIP_ALLOCATION_ID")
+         -c "agent_network=$NETWORK_KIND" --output "$CDK_OUT")
 . scripts/lib/codebuild.sh
 
 # Control-plane calls whose parameters are newer than the AWS CLI's bundled service model.
@@ -146,7 +144,9 @@ base_cdk_stacks() {
   log "Base — CDK stacks"
   local stacks=("$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router"
                 "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability")
-  ctx_set agent_network "$AGENT_NETWORK"
+  ctx_set agent_network "$NETWORK_KIND"
+  # Kept, so dropping it from .env later does not quietly move the NAT to a new address.
+  [ -z "${EIP_ALLOCATION_ID:-}" ] || ctx_set eip_allocation_id "$EIP_ALLOCATION_ID"
   if [ "$NETWORK_STACK" = "true" ]; then
     # Resolved once: re-resolving on a later deploy could pick other AZs and move the subnets.
     if [ -z "$(ctx_get network_azs)" ]; then
@@ -297,8 +297,12 @@ phase2_runtime() {
 
   local net_subnets="" net_sgs=""
   if [ "$AGENT_NETWORK" = "vpc" ]; then
-    net_subnets="${AGENT_SUBNET_IDS:-$(cfn_out "$PREFIX-network" AgentSubnetIds)}"
-    net_sgs="${AGENT_SECURITY_GROUP_IDS:-$(cfn_out "$PREFIX-network" AgentSecurityGroupId)}"
+    if [ "$NETWORK_KIND" = "vpc:byo" ]; then
+      net_subnets="$AGENT_SUBNET_IDS" net_sgs="$AGENT_SECURITY_GROUP_IDS"
+    else
+      net_subnets="$(cfn_out "$PREFIX-network" AgentSubnetIds)"
+      net_sgs="$(cfn_out "$PREFIX-network" AgentSecurityGroupId)"
+    fi
     [ -n "$net_subnets" ] && [ "$net_subnets" != "None" ] && [ -n "$net_sgs" ] && [ "$net_sgs" != "None" ] || {
       echo "no subnets or security group for the agent — run --base first"; exit 1; }
     echo "  network: VPC (subnets $net_subnets)"

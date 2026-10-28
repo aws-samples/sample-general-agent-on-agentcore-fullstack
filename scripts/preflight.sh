@@ -141,46 +141,55 @@ fi
 network_check_lock
 if [ "$AGENT_NETWORK" = "vpc" ]; then
   [ -n "$(supported_az_ids "$REGION")" ] || fail "AgentCore lists no VPC-capable AZs for $REGION — use AGENT_NETWORK=public"
-  if [ -z "${AGENT_SUBNET_IDS:-}" ]; then
+  if [ "$NETWORK_KIND" = "vpc" ]; then
     [ "$(supported_az_names | tr ',' '\n' | grep -c .)" -ge 2 ] \
       || fail "this account has fewer than two AgentCore-supported AZs in $REGION ($(supported_az_ids "$REGION"))"
   else
-    [ -n "${AGENT_SECURITY_GROUP_IDS:-}" ] || fail "AGENT_SUBNET_IDS needs AGENT_SECURITY_GROUP_IDS as well"
     IFS=, read -r -a subnet_ids <<< "$AGENT_SUBNET_IDS"
     subnets_json="$(aws ec2 describe-subnets --subnet-ids "${subnet_ids[@]}" --output json 2>&1)" \
       || fail "cannot read AGENT_SUBNET_IDS: $subnets_json"
     vpc_id="$(printf '%s' "$subnets_json" | python3 -c 'import json,sys; print(" ".join(sorted({s["VpcId"] for s in json.load(sys.stdin)["Subnets"]})))')"
     [ "$(echo "$vpc_id" | wc -w)" -eq 1 ] || fail "AGENT_SUBNET_IDS span more than one VPC ($vpc_id)"
     # Private: no route to an internet gateway, whether the table is associated or the main one.
-    routes_json="$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" --output json)"
-    endpoints="$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$vpc_id" \
+    routes_json="$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" --output json 2>&1)" \
+      || fail "cannot read the route tables of $vpc_id: $routes_json"
+    endpoints_json="$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$vpc_id" \
       "Name=service-name,Values=com.amazonaws.$REGION.s3" "Name=vpc-endpoint-type,Values=Gateway" \
-      --query 'length(VpcEndpoints)' --output text)"
+      --output json 2>&1)" || fail "cannot read the VPC endpoints of $vpc_id: $endpoints_json"
     dns="$(for a in enableDnsSupport enableDnsHostnames; do
-      aws ec2 describe-vpc-attribute --vpc-id "$vpc_id" --attribute "$a" --query "*.Value | [0]" --output text; done | tr '\n' ' ')"
+      aws ec2 describe-vpc-attribute --vpc-id "$vpc_id" --attribute "$a" --query "*.Value | [0]" --output text 2>/dev/null \
+        || echo unreadable; done | tr '\n' ' ')"
     problems="$(SUBNETS="$subnets_json" ROUTES="$routes_json" OK_IDS="$(supported_az_ids "$REGION")" \
-      ENDPOINTS="$endpoints" DNS="$dns" python3 - <<'PYEOF'
+      ENDPOINTS="$endpoints_json" DNS="$dns" python3 - <<'PYEOF'
 import json, os
 subnets = json.loads(os.environ["SUBNETS"])["Subnets"]
 tables = json.loads(os.environ["ROUTES"])["RouteTables"]
 ok = set(os.environ["OK_IDS"].split())
+s3_tables = {t for e in json.loads(os.environ["ENDPOINTS"])["VpcEndpoints"] for t in e.get("RouteTableIds", [])}
 main = next((t for t in tables if any(a.get("Main") for a in t.get("Associations", []))), None)
 out = []
 for s in subnets:
     if s["AvailabilityZoneId"] not in ok:
         out.append(f'{s["SubnetId"]} is in {s["AvailabilityZoneId"]}, not one AgentCore supports ({" ".join(sorted(ok))})')
+    # A subnet without its own association uses the main table.
     t = next((t for t in tables if any(a.get("SubnetId") == s["SubnetId"] for a in t.get("Associations", []))), main)
-    if t and any(r.get("GatewayId", "").startswith("igw-") for r in t.get("Routes", [])):
+    if not t:
+        continue
+    if any(r.get("GatewayId", "").startswith("igw-") for r in t.get("Routes", [])):
         out.append(f'{s["SubnetId"]} routes to an internet gateway; AgentCore needs private subnets')
+    if t["RouteTableId"] not in s3_tables:
+        out.append(f'{s["SubnetId"]}: no S3 gateway endpoint on its route table {t["RouteTableId"]}; a new Runtime pulls its image layers through one')
+    if not any(r.get("DestinationCidrBlock") == "0.0.0.0/0" for r in t.get("Routes", [])):
+        print(f'WARN {s["SubnetId"]} has no default route: Lark, Google and the us-east-1 Gateway will be unreachable unless a proxy or endpoint serves them')
 if len({s["AvailabilityZoneId"] for s in subnets if s["AvailabilityZoneId"] in ok}) < 2:
     out.append("AGENT_SUBNET_IDS need at least two supported AZs")
-if os.environ["ENDPOINTS"] in ("0", "None", ""):
-    out.append("the VPC has no S3 gateway endpoint; a new Runtime pulls its image layers through one")
-if "False" in os.environ["DNS"]:
-    out.append("the VPC needs DNS support and DNS hostnames enabled")
+if "False" in os.environ["DNS"] or "unreadable" in os.environ["DNS"]:
+    out.append("the VPC needs DNS support and DNS hostnames enabled (or they could not be read)")
 print("\n".join(f"  {p}" for p in out))
 PYEOF
 )"
+    while IFS= read -r line; do warn "  warning:${line#WARN}"; done < <(printf '%s\n' "$problems" | grep '^WARN' || true)
+    problems="$(printf '%s\n' "$problems" | grep -v '^WARN' || true)"
     [ -z "$problems" ] || fail "AGENT_SUBNET_IDS cannot host the agent:
 $problems"
   fi
@@ -216,14 +225,14 @@ echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
 echo "  model   : $MODEL_ID"
 echo "  lark    : $([ "$LARK" = "true" ] && echo "$LARK_API_DOMAIN" || echo 'off  (web page only)')"
 echo "  build   : $AGENT_BUILD$([ "$AGENT_BUILD" = "local" ] && echo '  (local Docker)' || echo '  (CodeBuild, ARM64 native)')"
-case "$AGENT_NETWORK:${AGENT_SUBNET_IDS:+byo}" in
-  public:*) echo "  network : agent PUBLIC" ;;
-  vpc:byo)  echo "  network : agent in VPC $vpc_id (your subnets; your network decides its egress)" ;;
-  vpc:)     echo "  network : agent in a created VPC (one NAT with a fixed IP, a fixed hourly cost; flow logs)" ;;
+case "$NETWORK_KIND" in
+  public)  echo "  network : agent PUBLIC" ;;
+  vpc:byo) echo "  network : agent in VPC $vpc_id (your subnets; your network decides its egress)" ;;
+  vpc)     echo "  network : agent in a created VPC (one NAT with a fixed IP, a fixed hourly cost; flow logs)" ;;
 esac
 echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"
 echo "  browser : ${BROWSER:-false}$([ "${BROWSER:-false}" = "true" ] && echo '  (AgentCore Browser, per second while one runs)' || true)"
-echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && echo "  (creates a VPC + S3 Files)" || true)"
+echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && { [ "$NETWORK_KIND" = "vpc" ] && echo "  (S3 Files, in the agent's VPC)" || echo "  (creates a VPC + S3 Files)"; } || true)"
 if [ "${FILES_STORAGE:-false}" = "true" ]; then
   echo "  nat     : ${NAT_GATEWAY:-false}$([ "${NAT_GATEWAY:-false}" = "true" ] && echo '  (code sandbox gets internet; NAT is a fixed hourly cost)' || true)"
 fi

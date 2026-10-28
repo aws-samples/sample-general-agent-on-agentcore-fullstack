@@ -6,6 +6,18 @@ AGENT_NETWORK="${AGENT_NETWORK:-public}"
 case "$AGENT_NETWORK" in public|vpc) ;; *)
   echo "AGENT_NETWORK must be public or vpc, not '$AGENT_NETWORK'" >&2; exit 1 ;;
 esac
+# Comma-separated, spaces tolerated.
+AGENT_SUBNET_IDS="${AGENT_SUBNET_IDS:-}"; AGENT_SUBNET_IDS="${AGENT_SUBNET_IDS// /}"
+AGENT_SECURITY_GROUP_IDS="${AGENT_SECURITY_GROUP_IDS:-}"; AGENT_SECURITY_GROUP_IDS="${AGENT_SECURITY_GROUP_IDS// /}"
+if [ -n "$AGENT_SUBNET_IDS$AGENT_SECURITY_GROUP_IDS" ]; then
+  [ "$AGENT_NETWORK" = "vpc" ] || { echo "AGENT_SUBNET_IDS / AGENT_SECURITY_GROUP_IDS only apply with AGENT_NETWORK=vpc" >&2; exit 1; }
+  [ -n "$AGENT_SUBNET_IDS" ] && [ -n "$AGENT_SECURITY_GROUP_IDS" ] || {
+    echo "AGENT_SUBNET_IDS and AGENT_SECURITY_GROUP_IDS go together: your subnets, your security groups" >&2; exit 1; }
+fi
+# What the deployment's network is: public, vpc (a VPC this deploy creates) or vpc:byo (yours).
+# The three cannot turn into one another in place, so this — not AGENT_NETWORK alone — is locked.
+NETWORK_KIND="$AGENT_NETWORK"
+[ -z "$AGENT_SUBNET_IDS" ] || NETWORK_KIND="vpc:byo"
 
 # The AZ IDs AgentCore accepts a VPC subnet in, per region (devguide "agentcore-vpc", read
 # 2026-10-29). A subnet anywhere else fails at Runtime creation.
@@ -43,8 +55,8 @@ network_check_lock() {
   [ -f "$STATE_FILE" ] || return 0
   local recorded
   recorded="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_network") or "public")' "$STATE_FILE")"
-  [ "$recorded" = "$AGENT_NETWORK" ] || {
-    echo "$DEPLOYMENT_NAME was deployed with AGENT_NETWORK=$recorded; .env now says $AGENT_NETWORK." >&2
+  [ "$recorded" = "$NETWORK_KIND" ] || {
+    echo "$DEPLOYMENT_NAME was deployed with network '$recorded'; .env now asks for '$NETWORK_KIND' (vpc:byo = AGENT_SUBNET_IDS set)." >&2
     echo "The network is fixed for a deployment's life: set it back, or destroy and redeploy (scripts/destroy.sh)." >&2
     exit 1; }
 }

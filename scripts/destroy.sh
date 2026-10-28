@@ -224,11 +224,16 @@ for s in security agentcore shim network sandbox router webui gateway observabil
     --query "StackResourceSummaries[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
     --output text 2>/dev/null || true))
 done
-# agent_network=vpc puts the network stack in the app too. The state file's own value wins
-# when it is still there; the AZs only need to be valid names for a synth that lists stacks.
 CDK_CTX=(-c "deployment_name=$PREFIX" -c files_storage=true -c webui=true
-         -c agent_network=vpc -c "network_azs=${REGION}a,${REGION}c"
          -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}" --output "$CDK_OUT")
+# The network stack joins the app only when it exists, whatever .env or the state file say now
+# (a re-run finds the state file gone). Its AZs only have to be real names in this account
+# for a synth that lists stacks; a state file still present supplies the deployed ones.
+if aws cloudformation describe-stacks --stack-name "$PREFIX-network" >/dev/null 2>&1; then
+  CDK_CTX+=(-c agent_network=vpc -c "network_azs=$(aws ec2 describe-availability-zones \
+    --filters Name=zone-type,Values=availability-zone --query 'AvailabilityZones[].ZoneName' \
+    --output text | tr '\t' '\n' | sort | head -2 | paste -sd, -)")
+fi
 # While AgentCore still holds interfaces in a VPC of ours — the sandbox's, or the network
 # stack's that the agent and the sandbox share — the stacks owning those subnets and security
 # groups cannot delete them (DependencyViolation), and agentcore and security, which the

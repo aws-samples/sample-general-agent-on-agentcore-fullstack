@@ -2,8 +2,8 @@
 mounted into it.
 
 Only deployed when the `files_storage` context flag is true. What sits in this VPC is the
-Code Interpreter session; it reaches S3 through a free gateway endpoint, and the agent
-Runtime stays PUBLIC outside it. By default there is **no NAT**, so the sandbox has no
+Code Interpreter session; it reaches S3 through a free gateway endpoint, and by default the
+agent Runtime is PUBLIC outside it. By default there is **no NAT**, so the sandbox has no
 internet; `nat_gateway=true` adds one NAT gateway so it can install packages and call
 external APIs. With the agent in a created VPC (AGENT_NETWORK=vpc), the sandbox takes its
 `sandbox` subnets instead of creating a VPC of its own (stacks/network_stack.py).
