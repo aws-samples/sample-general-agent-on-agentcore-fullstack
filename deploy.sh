@@ -36,7 +36,7 @@ run_gateway() { step "gateway — Web Search (optional)";  scripts/provision.sh 
 run_code()    { step "code — Code Interpreter for generated code"; scripts/provision.sh --code; }
 run_a2a()     { step "a2a — expose to peer agents";       scripts/provision.sh --a2a; }
 run_webui()   { step "webui — static web chat";            scripts/provision.sh --webui; }
-run_runtime() { step "runtime — agent";                  scripts/provision.sh --runtime; }
+run_runtime() { step "runtime — agent (and A2A)";        scripts/provision.sh --runtime; }
 run_lark()    { step "lark — credentials + allowlist";   scripts/setup-lark.sh; }
 # No-ops unless AGENT_DECIDE_APPROVAL_CODES is set, so it costs nothing in the common
 # case — and without it Lark silently never delivers the events.
@@ -101,7 +101,7 @@ case "${1:-all}" in
     run_base; run_mcp; run_3lo; run_gateway; run_code; run_runtime
     # Without a Lark app the web page is the whole surface: nothing to register in Lark.
     if [ "$LARK" = "true" ]; then run_lark; run_approvals; fi
-    run_a2a; run_webui
+    run_webui
     if [ "$LARK" = "true" ]; then print_urls; fi
     print_web
     ;;

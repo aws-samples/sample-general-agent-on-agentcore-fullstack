@@ -24,7 +24,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
 | `./deploy.sh 3lo` | workload identity + the OAuth credential providers: `<name>-3lo` for Lark (only with a Lark app), `<name>-google` and `<name>-github` when those are configured |
 | `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
-| `./deploy.sh runtime` | point the agent Runtime at the image `base` published — agent code changes need `base` first |
+| `./deploy.sh runtime` | point the agent Runtime at the image `base` published — agent code changes need `base` first — and, with `A2A=true`, the A2A Runtime too, which runs the same image |
 | `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` — skipped by a full deploy without a Lark app |
 | `./deploy.sh approvals` | subscribe to Lark approval events for each `AGENT_DECIDE_APPROVAL_CODES` definition — no-op when that is empty. Ticking the event in the console is **not** sufficient; Lark delivers approval events only for definitions also subscribed through the API |
 

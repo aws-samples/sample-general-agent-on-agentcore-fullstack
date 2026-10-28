@@ -749,8 +749,10 @@ case "${1:-all}" in
   --base|--phase1) base_cdk_stacks ;;  # --phase1 kept as a back-compat alias
   --memory)   phase_memory ;;
   # Memory first: the runtime is created with BEDROCK_AGENTCORE_MEMORY_ID baked into its
-  # environment, and UpdateAgentRuntime replaces rather than patches.
-  --runtime)  phase_memory; phase_code; phase2_runtime ;;
+  # environment, and UpdateAgentRuntime replaces rather than patches. The A2A runtime runs the
+  # same image with the agent's env, so it follows; left behind, it pointed at an image tag the
+  # repository had since pruned and failed every call.
+  --runtime)  phase_memory; phase_code; phase2_runtime; phase_a2a ;;
   --code)     phase_code ;;
   --a2a)      phase_a2a ;;
   --webui)    phase_webui ;;
