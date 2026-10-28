@@ -15,11 +15,9 @@ lambda_py() { uv run --no-project --python 3.13 --with boto3 --with pytest "$@";
 
 echo "== agent =="
 # The LangGraph stack is pure Python, so the turn loop is tested through a real compiled
-# graph rather than a copy of its source.
-agent_py python -m pytest tests/agent/test_agent.py -q
-
-echo "== code interpreter =="
-agent_py python -m pytest tests/agent/test_code_interpreter.py -q
+# graph rather than a copy of its source. The A2A adapter stubs the agent loop out, so it
+# gets a process of its own.
+agent_py python -m pytest tests/agent -q --ignore=tests/agent/test_a2a.py
 
 echo "== a2a adapter =="
 agent_py python -m pytest tests/agent/test_a2a.py -q
