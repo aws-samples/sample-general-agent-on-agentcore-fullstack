@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 function loadGuards(env = {}, fetchImpl = undefined) {
-  const src = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../../mcp-servers/approval/server.js', import.meta.url), 'utf8');
   // Anchored on declarations, not on comment text — an earlier version keyed off a
   // comment and broke the moment that comment was reworded.
   const start = src.indexOf('const AGENT_DECIDE_MAX_AMOUNT');
@@ -112,7 +112,7 @@ test('an instance that cannot be read is refused, not waved through', async () =
 });
 
 test('every tool that moves a task is guarded, transfer included', () => {
-  const src = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../../mcp-servers/approval/server.js', import.meta.url), 'utf8');
   for (const name of ['approval_approve', 'approval_reject', 'approval_transfer']) {
     const block = src.slice(src.indexOf(`name: '${name}'`), src.indexOf('req:', src.indexOf(`name: '${name}'`)));
     assert.match(block, /guarded: true/, name);
@@ -193,7 +193,7 @@ test("reads are limited to what the caller could see in Lark: their queue, their
   for (const who of ['ou_starter', 'ou_approver', 'ou_cc']) assert.equal(g.isParticipant(instance, who), true, who);
   assert.equal(g.isParticipant(instance, 'ou_stranger'), false);
   assert.equal(g.isParticipant(undefined, 'ou_starter'), false);
-  const src = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../../mcp-servers/approval/server.js', import.meta.url), 'utf8');
   const block = (name) => src.slice(src.indexOf(`name: '${name}'`), src.indexOf('req:', src.indexOf(`name: '${name}'`)));
   assert.match(block('approval_list_pending'), /ownQueue: true/);
   assert.match(block('approval_get_instance'), /participantsOnly: true/);

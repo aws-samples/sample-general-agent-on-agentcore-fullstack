@@ -17,7 +17,7 @@ import os
 import urllib.parse
 import uuid
 
-log = logging.getLogger("agent.deliveries")
+log = logging.getLogger("agent.web_files")
 
 _BUCKET = os.environ.get("CHECKPOINT_BUCKET", "")
 _REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", ""))

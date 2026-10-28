@@ -17,8 +17,8 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 
-import deliveries
-import lark_notify
+from channels import web_files
+from channels import lark_card
 
 log = logging.getLogger("agent.delivery")
 
@@ -54,7 +54,7 @@ class LarkDelivery(Delivery):
 
     def __init__(self, target: str) -> None:
         # A chat id, or an open_id for the event-driven turns that have no chat to reply
-        # in — lark_notify._rid_type reads which it is.
+        # in — lark_card._rid_type reads which it is.
         self.target = target
 
     def refusal(self, name: str, size: int) -> str | None:
@@ -72,10 +72,10 @@ class LarkDelivery(Delivery):
         suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         if suffix in self._IMAGES:
             try:
-                key = lark_notify.upload_image(data)
-                if lark_notify.send_image(self.target, key):
+                key = lark_card.upload_image(data)
+                if lark_card.send_image(self.target, key):
                     return f"Sent {name} to the chat; it shows there."
-            except lark_notify.LarkError as e:
+            except lark_card.LarkError as e:
                 return f"{name} was not sent. {e}"
         # The upload's file_type and the message type have to agree: an mp4-typed upload
         # refuses to be sent as `file` ("The type of file upload does not match the type
@@ -85,24 +85,24 @@ class LarkDelivery(Delivery):
             try:
                 frame = cover()
                 if frame:
-                    image = lark_notify.upload_image(frame)
-                    key = lark_notify.upload_file(name, data, "mp4")
-                    if lark_notify.send_media(self.target, key, image):
+                    image = lark_card.upload_image(frame)
+                    key = lark_card.upload_file(name, data, "mp4")
+                    if lark_card.send_media(self.target, key, image):
                         return f"Sent {name} to the chat; it plays there."
-            except lark_notify.LarkError:
+            except lark_card.LarkError:
                 # Worth one attachment attempt: a cover Lark would not take says nothing
                 # about the video itself.
                 log.info("could not send %s as a video", name, exc_info=True)
             else:
                 log.info("no cover for %s, sending it as an attachment", name)
         try:
-            key = lark_notify.upload_file(
+            key = lark_card.upload_file(
                 name, data,
                 "stream" if suffix == "mp4" else self._TYPES.get(suffix, "stream"))
-            if lark_notify.send_file(self.target, key):
+            if lark_card.send_file(self.target, key):
                 return f"Sent {name} to the chat as an attachment."
             return f"{name} uploaded but the message would not send."
-        except lark_notify.LarkError as e:
+        except lark_card.LarkError as e:
             # Lark's own words, because the model has to tell the user something true:
             # "the bot is not in that chat" and "the file is too large" need different
             # next steps, and a bare failure reads as "try again".
@@ -111,7 +111,7 @@ class LarkDelivery(Delivery):
 
 class WebDelivery(Delivery):
     """Into the web page, on the turn's own event stream: an image shows and a video plays
-    inline, anything else downloads. Stored first (agent/deliveries.py), so the event carries a link and a reload of
+    inline, anything else downloads. Stored first (channels/web_files.py), so the event carries a link and a reload of
     the page shows it again; without a bucket the bytes ride on the event itself and are gone
     on reload. `out` collects CUSTOM events for the run's stream to write."""
 
@@ -133,12 +133,12 @@ class WebDelivery(Delivery):
                   cover: Callable[[], bytes | None]) -> str | tuple[str, dict]:
         # The key is returned, not kept on this object: one run's tool calls can run in
         # parallel, and a shared slot lost a file's record when two were sent at once.
-        if deliveries.configured() and self.actor_id:
+        if web_files.configured() and self.actor_id:
             try:
-                key = deliveries.put(self.actor_id, name, data)
+                key = web_files.put(self.actor_id, name, data)
                 self.out.append({"name": "file", "value": {
                     "name": name, "size": len(data),
-                    "url": deliveries.url(key, name, self.actor_id)}})
+                    "url": web_files.url(key, name, self.actor_id)}})
                 return (f"Sent {name} to the page; it shows there and stays in the conversation.",
                         {"file": {"key": key, "name": name, "size": len(data)}})
             except Exception:  # noqa: BLE001 — the stream can still carry it

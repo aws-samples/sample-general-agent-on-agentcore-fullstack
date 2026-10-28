@@ -1044,7 +1044,7 @@ def _web_caller(event: dict) -> tuple[str, str, str, dict | None]:
     """(user_id, actor_id, bearer, error_response) for a page signed in at the hosted login.
 
     API Gateway's JWT authorizer has verified the token; this only reads what it verified.
-    The web client's users are `web:{sub}` — the same rule as agent/caller.py, which checks
+    The web client's users are `web:{sub}` — the same rule as agent/identity/caller.py, which checks
     the token again when it is forwarded."""
     claims = (((event.get("requestContext") or {}).get("authorizer") or {})
               .get("jwt") or {}).get("claims") or {}

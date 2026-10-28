@@ -7,7 +7,7 @@ One pool, two kinds of user, told apart by the app client their token was issued
   admin auth (IAM). Lark chat and the page opened inside Lark both resolve to that user.
 - **Web users** (when the web page is deployed): created by an admin, username = their
   email, their own password, signed in at the pool's hosted login through the `web` client
-  (authorization code + PKCE). Their actor is `web:{sub}` (agent/caller.py).
+  (authorization code + PKCE). Their actor is `web:{sub}` (agent/identity/caller.py).
 
 The pool is only ever updated in place: AgentCore Identity keys a user's grants by the
 token's `sub`, so a replaced pool would orphan every Lark and Google grant.

@@ -67,7 +67,7 @@ cb_build() { # repo source-dir tag [docker build args...] — builds and pushes 
     aws ecr create-repository --repository-name "$repo" >/dev/null
   local zipf
   zipf="$(mktemp -u).zip"   # -u: name only; zip rejects a pre-existing empty file
-  ( cd "$dir" && zip -qr "$zipf" . -x '*.pyc' '__pycache__/*' -x 'test_*' )
+  ( cd "$dir" && zip -qr "$zipf" . -x '*.pyc' '*__pycache__/*' -x 'test_*' )
   aws s3 cp "$zipf" "s3://$CB_SRC_BUCKET/$key" >/dev/null
   rm -f "$zipf"  # safe-rm-ok
   local spec

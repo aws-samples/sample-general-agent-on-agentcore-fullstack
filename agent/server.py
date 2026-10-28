@@ -8,7 +8,7 @@
       warmup     : {action} -> {ready:true}
       status     : {action} -> {ready, instance, uptime, sessionAge, model, + clock diags}
       history_stats / clear_history / transcript / auth_status / reauth
-      no `action` -> AG-UI, answered as an SSE event stream (see agui.py)
+      no `action` -> AG-UI, answered as an SSE event stream (see channels/agui.py)
 """
 
 from __future__ import annotations
@@ -24,11 +24,15 @@ _T_IMPORT_START = time.monotonic()
 
 from aiohttp import web
 
-import agent_core   # pulls in langchain/langgraph, boto3 and mcp — the bulk of start-up
-import agui
-import caller
-import lark_notify
-import telemetry
+from channels import agui
+from identity import caller
+from channels import lark   # pulls in langchain/langgraph, boto3 and mcp — the bulk of start-up
+import core
+from identity import grants
+from channels import lark_card
+from runtime import sessions
+from runtime import telemetry
+from runtime import turns
 
 _T_IMPORT_DONE = time.monotonic()
 
@@ -96,7 +100,7 @@ _HTTP_PORT = int(os.environ.get("PORT", "8080"))
 async def handle_ping(request: web.Request) -> web.Response:
     # HealthyBusy tells AgentCore a background turn is still running, so the
     # container isn't reclaimed out from under it.
-    status = "HealthyBusy" if agent_core.busy() else "Healthy"
+    status = "HealthyBusy" if turns.busy() else "Healthy"
     return web.json_response({"status": status})
 
 
@@ -111,7 +115,7 @@ def _bind_caller(request: web.Request, payload: dict) -> web.Response | None:
         reason = "unverified"
     elif payload.get("actorId") and payload["actorId"] != actor:
         reason = "claim_mismatch"
-    elif payload.get("memorySessionId") and not agent_core.thread_belongs(
+    elif payload.get("memorySessionId") and not sessions.thread_belongs(
             actor, payload["memorySessionId"]):
         reason = "foreign_thread"
     if reason:
@@ -137,13 +141,13 @@ def _chat_refusal(actor_id: str, chat_id: str, image_handles: list,
     if chat_id.startswith("ou_"):
         if chat_id != open_id:
             return "foreign_chat"
-    elif not lark_notify.in_chat(chat_id, open_id):
+    elif not lark_card.in_chat(chat_id, open_id):
         return "foreign_chat"
     # The message being answered is reacted to and un-reacted with the bot's token, so it
     # has to be in that chat as well.
     mids = [(h or {}).get("message_id", "") for h in image_handles]
     for mid in mids + ([message_id] if message_id else []):
-        if not mid or lark_notify.chat_of(mid) != chat_id:
+        if not mid or lark_card.chat_of(mid) != chat_id:
             return "foreign_message"
     return ""
 
@@ -163,7 +167,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
     # Under CUSTOM_JWT inbound the Runtime validates the caller's JWT and hands us a
     # workload access token derived from it. Three header aliases carry the same value
     # (measured); read them in order and pass it down — the vault is looked up under it, so
-    # a token fetched is the caller's own. Who the caller is comes from caller.py.
+    # a token fetched is the caller's own. Who the caller is comes from identity/caller.py.
     workload_token = next(
         (request.headers[h] for h in (
             "x-amzn-bedrock-agentcore-runtime-workload-accesstoken",
@@ -214,9 +218,9 @@ async def handle_invocations(request: web.Request) -> web.Response:
             "sessionAge": round(now - _session_first_seen[sid], 1) if sid else None,
             # Reported by the container that actually calls Bedrock: the router's own
             # config can disagree with what was baked into this Runtime.
-            "model": agent_core.model_id(),
-            "cache": agent_core.cache_mode(),
-            "settings": agent_core.model_settings(),
+            "model": core.model_id(),
+            "cache": core.cache_mode(),
+            "settings": core.model_settings(),
         })
 
     if action == "warmup":
@@ -225,12 +229,12 @@ async def handle_invocations(request: web.Request) -> web.Response:
 
     # Thread bookkeeping for /status and /clear. Here rather than in the router because
     # the conversation is LangGraph state now — reading or deleting it needs the
-    # checkpointer, and agent_core is the only module allowed to know about the framework.
+    # checkpointer, which only the agent carries.
     if action in ("history_stats", "clear_history"):
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         mem_sid = payload.get("memorySessionId", "")
-        fn = (agent_core.history_stats if action == "history_stats"
-              else agent_core.clear_history)
+        fn = (sessions.history_stats if action == "history_stats"
+              else sessions.clear_history)
         try:
             result = await asyncio.get_event_loop().run_in_executor(
                 None, fn, actor_id, mem_sid)
@@ -243,12 +247,12 @@ async def handle_invocations(request: web.Request) -> web.Response:
     # actor, which is the one the page's turns run on.
     if action == "transcript":
         actor_id = payload["actorId"]
-        thread = payload.get("memorySessionId") or agent_core.thread_for(actor_id)
+        thread = payload.get("memorySessionId") or sessions.thread_for(actor_id)
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.transcript, actor_id, thread)
+                None, sessions.transcript, actor_id, thread)
             # A page reloaded mid-answer would otherwise look idle while the turn runs on.
-            return web.json_response({**result, "running": agent_core.thread_busy(thread)})
+            return web.json_response({**result, "running": turns.thread_busy(thread)})
         except Exception as e:
             log.exception("transcript failed")
             return web.json_response({"messages": [], "error": str(e)})
@@ -259,7 +263,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         try:
             return web.json_response(await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.compact, actor_id, payload.get("memorySessionId", ""),
+                None, sessions.compact, actor_id, payload.get("memorySessionId", ""),
                 workload_token))
         except Exception as e:
             log.exception("compact failed")
@@ -268,7 +272,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
     if action == "tools":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         try:
-            return web.json_response(await agent_core.atools_overview(
+            return web.json_response(await sessions.atools_overview(
                 actor_id, payload.get("memorySessionId", ""), workload_token))
         except Exception as e:
             log.exception("tools failed")
@@ -278,7 +282,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.auth_status, actor_id, workload_token)
+                None, grants.auth_status, actor_id, workload_token)
             return web.json_response(result)
         except Exception as e:
             log.exception("auth_status failed")
@@ -288,7 +292,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
     # the cached session's empty one. Precise rather than a short TTL for everyone.
     if action == "refresh_session":
         await asyncio.get_event_loop().run_in_executor(
-            None, agent_core._drop_sessions, payload["actorId"])
+            None, sessions._drop_sessions, payload["actorId"])
         return web.json_response({"refreshed": True})
 
     if action == "reauth":
@@ -296,7 +300,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
         idp = payload.get("message", "")   # the router sends the idp key here
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.reauth, actor_id, idp, workload_token
+                None, sessions.reauth, actor_id, idp, workload_token
             )
             return web.json_response(result)
         except Exception as e:
@@ -332,7 +336,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             # Returns as soon as the work is accepted; the result is pushed to the
             # chat later. Consent still comes back inline (see chat_async).
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.chat_async, actor_id, message, chat_id, email,
+                None, lark.chat_async, actor_id, message, chat_id, email,
                 mem_sid, msg_id, reaction_id, fresh_session, workload_token,
                 image_handles,
             )
@@ -353,7 +357,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             return web.json_response({"error": "message required"}, status=400)
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.chat_result, actor_id, message, email, mem_sid,
+                None, lark.chat_result, actor_id, message, email, mem_sid,
                 workload_token,
             )
             # {reply, needs_auth, auth_url?} — router drives the consent wait.

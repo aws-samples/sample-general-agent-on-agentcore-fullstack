@@ -11,16 +11,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
-from pathlib import Path
 from unittest import mock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-# The adapter imports agent_core only to report /ping busyness, and agent_core pulls in the
-# whole LangGraph stack. Stubbed so this suite stays dependency-light.
-sys.modules.setdefault("agent_core", mock.Mock(busy=lambda: False))
+# The adapter imports turns only to report /ping busyness. Stubbed so this suite stays
+# dependency-light.
+sys.modules.setdefault("runtime.turns", mock.Mock(busy=lambda: False))
 
 import a2a_server  # noqa: E402
 
@@ -134,6 +131,3 @@ def test_the_executor_never_invents_the_actor_it_acts_for():
     # No default: an empty actor makes the agent derive it from the token instead.
     assert 'get("actorId", "anonymous")' not in src
 
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))

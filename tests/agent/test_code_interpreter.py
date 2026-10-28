@@ -9,32 +9,22 @@ vanish, or worse, belong to somebody else.
 from __future__ import annotations
 
 import inspect
-import os
 import sys
-from pathlib import Path
 from unittest import mock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
-# What a deploy injects; the modules read it at import and have no fallback.
-os.environ.setdefault("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
-os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
-os.environ.setdefault("LARK_OAUTH_PROVIDER", "test-3lo")
-os.environ.setdefault("AGENT_WORKLOAD_NAME", "test-wl")
-os.environ.setdefault("METRICS_NAMESPACE", "test/agent")
-
-import code_tools  # noqa: E402
-import delivery  # noqa: E402
+from channels import delivery
+from tools import code_interpreter
 
 _FS = "arn:aws:s3files:ap-northeast-1:1234:file-system/fs-abc"
 
 
 @pytest.fixture(autouse=True)
 def _deployed():
-    with mock.patch.object(code_tools, "_INTERPRETER_ID", "ci-1"), \
-         mock.patch.object(code_tools, "_FS_ARN", _FS), \
-         mock.patch.object(code_tools, "_WORKSPACE", "/mnt/workspace"):
+    with mock.patch.object(code_interpreter, "_INTERPRETER_ID", "ci-1"), \
+         mock.patch.object(code_interpreter, "_FS_ARN", _FS), \
+         mock.patch.object(code_interpreter, "_WORKSPACE", "/mnt/workspace"):
         yield
 
 
@@ -50,15 +40,15 @@ class _FakeBox:
 
 
 def _tools(box=None):
-    return {t.name: t for t in code_tools.tools_for("lark:ou_x", box or _FakeBox())}
+    return {t.name: t for t in code_interpreter.tools_for("lark:ou_x", box or _FakeBox())}
 
 
 def test_absent_not_broken_when_no_interpreter_is_deployed():
     """Same convention as search and long-term memory: the agent simply cannot run code."""
-    with mock.patch.object(code_tools, "_INTERPRETER_ID", ""):
-        assert code_tools.tools_for("lark:ou_x") == []
-    with mock.patch.object(code_tools, "_FS_ARN", ""):
-        assert code_tools.tools_for("lark:ou_x") == []
+    with mock.patch.object(code_interpreter, "_INTERPRETER_ID", ""):
+        assert code_interpreter.tools_for("lark:ou_x") == []
+    with mock.patch.object(code_interpreter, "_FS_ARN", ""):
+        assert code_interpreter.tools_for("lark:ou_x") == []
 
 
 def test_every_tool_runs_in_the_mounted_workspace():
@@ -95,8 +85,8 @@ def test_a_broken_sandbox_reports_instead_of_killing_the_turn():
 def test_the_access_point_root_is_derived_from_the_actor_and_sanitised():
     """It becomes a filesystem path, and an actor id carries a colon. The shape also has
     to match what the previous implementation used, or existing files become unreachable."""
-    assert code_tools._ap_path("lark:ou_abc") == "/users/lark_ou_abc"
-    assert code_tools._ap_path("lark:../../etc") == "/users/lark_.._.._etc"
+    assert code_interpreter._ap_path("lark:ou_abc") == "/users/lark_ou_abc"
+    assert code_interpreter._ap_path("lark:../../etc") == "/users/lark_.._.._etc"
 
 
 def test_an_existing_access_point_is_reused_rather_than_duplicated():
@@ -107,8 +97,8 @@ def test_an_existing_access_point_is_reused_rather_than_duplicated():
         {"rootDirectory": {"path": "/users/other"}, "accessPointArn": "arn:other"},
         {"rootDirectory": {"path": "/users/lark_ou_x"}, "accessPointArn": "arn:mine"},
     ]}
-    with mock.patch.object(code_tools.boto3, "client", return_value=fake):
-        assert code_tools._access_point_for("lark:ou_x") == "arn:mine"
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=fake):
+        assert code_interpreter._access_point_for("lark:ou_x") == "arn:mine"
     assert fake.create_access_point.call_count == 0
 
 
@@ -116,14 +106,14 @@ def test_a_new_access_point_is_created_idempotently_and_rooted_server_side():
     fake = mock.Mock()
     fake.list_access_points.return_value = {"accessPoints": []}
     fake.create_access_point.return_value = {"accessPointArn": "arn:new"}
-    with mock.patch.object(code_tools.boto3, "client", return_value=fake):
-        assert code_tools._access_point_for("lark:ou_x") == "arn:new"
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=fake):
+        assert code_interpreter._access_point_for("lark:ou_x") == "arn:new"
     kw = fake.create_access_point.call_args.kwargs
     # rootDirectory is what confines the mount, and the service enforces it.
     assert kw["rootDirectory"]["path"] == "/users/lark_ou_x"
     # clientToken makes a concurrent second call return the same Access Point.
     assert kw["clientToken"] and kw["clientToken"] == mock.ANY
-    assert code_tools._access_point_for.__doc__
+    assert code_interpreter._access_point_for.__doc__
 
 
 def test_the_session_mounts_this_actors_access_point_and_starts_lazily():
@@ -131,10 +121,10 @@ def test_the_session_mounts_this_actors_access_point_and_starts_lazily():
     tool list — only when the model actually runs something."""
     client = mock.Mock()
     client.start_code_interpreter_session.return_value = {"sessionId": "s-1"}
-    with mock.patch.object(code_tools.boto3, "client", return_value=client):
-        box = code_tools._Sandbox("lark:ou_x")
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=client):
+        box = code_interpreter._Sandbox("lark:ou_x")
         assert client.start_code_interpreter_session.call_count == 0
-        with mock.patch.object(code_tools, "_access_point_for", return_value="arn:mine"):
+        with mock.patch.object(code_interpreter, "_access_point_for", return_value="arn:mine"):
             assert box.session_id() == "s-1"
             assert box.session_id() == "s-1"          # reused, not restarted
     assert client.start_code_interpreter_session.call_count == 1
@@ -148,8 +138,8 @@ def test_the_session_mounts_this_actors_access_point_and_starts_lazily():
 def test_closing_the_session_stops_the_sandbox():
     """A code session left running is billed until it times out, and _close_session is the
     only place that knows a cached entry is being discarded."""
-    import agent_core
-    src = inspect.getsource(agent_core._close_session)
+    from runtime import sessions
+    src = inspect.getsource(sessions._close_session)
     assert 'get("sandbox")' in src and ".close()" in src
 
 
@@ -160,8 +150,8 @@ def test_output_is_capped_from_the_middle_so_the_exception_survives():
     client = mock.Mock()
     client.invoke_code_interpreter.return_value = {"stream": [
         {"result": {"structuredContent": {"stdout": body, "stderr": ""}}}]}
-    with mock.patch.object(code_tools.boto3, "client", return_value=client):
-        box = code_tools._Sandbox("lark:ou_x")
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=client):
+        box = code_interpreter._Sandbox("lark:ou_x")
         box._session_id = "s-1"
         out = box.invoke("executeCommand", {"command": "boom"})
     assert len(out) < len(body)
@@ -180,9 +170,9 @@ def test_an_expired_session_is_replaced_instead_of_failing_every_later_call():
     client.invoke_code_interpreter.side_effect = [
         Exception("ValidationException: Code interpreter session s-old is not active"),
         {"stream": [{"result": {"structuredContent": {"stdout": "ok", "stderr": ""}}}]}]
-    with mock.patch.object(code_tools.boto3, "client", return_value=client), \
-         mock.patch.object(code_tools, "_access_point_for", return_value="arn:mine"):
-        box = code_tools._Sandbox("lark:ou_x")
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=client), \
+         mock.patch.object(code_interpreter, "_access_point_for", return_value="arn:mine"):
+        box = code_interpreter._Sandbox("lark:ou_x")
         assert box.invoke("executeCommand", {"command": "ls"}) == "ok"
     assert client.start_code_interpreter_session.call_count == 2
     assert client.invoke_code_interpreter.call_args_list[-1].kwargs["sessionId"] == "s-new"
@@ -193,9 +183,9 @@ def test_any_other_failure_is_not_retried():
     client = mock.Mock()
     client.start_code_interpreter_session.return_value = {"sessionId": "s-1"}
     client.invoke_code_interpreter.side_effect = Exception("ThrottlingException: slow down")
-    with mock.patch.object(code_tools.boto3, "client", return_value=client), \
-         mock.patch.object(code_tools, "_access_point_for", return_value="arn:mine"):
-        box = code_tools._Sandbox("lark:ou_x")
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=client), \
+         mock.patch.object(code_interpreter, "_access_point_for", return_value="arn:mine"):
+        box = code_interpreter._Sandbox("lark:ou_x")
         with pytest.raises(Exception, match="Throttling"):
             box.invoke("executeCommand", {"command": "ls"})
     assert client.invoke_code_interpreter.call_count == 1
@@ -206,8 +196,8 @@ def test_a_failure_with_no_output_still_says_something():
     client = mock.Mock()
     client.invoke_code_interpreter.return_value = {"stream": [
         {"result": {"isError": True, "content": [], "structuredContent": {}}}]}
-    with mock.patch.object(code_tools.boto3, "client", return_value=client):
-        box = code_tools._Sandbox("lark:ou_x")
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=client):
+        box = code_interpreter._Sandbox("lark:ou_x")
         box._session_id = "s-1"
         assert "failed" in box.invoke("executeCode", {"language": "python", "code": ""})
 
@@ -237,13 +227,13 @@ class _DeliverBox(_FakeBox):
 
 @pytest.fixture
 def _lark():
-    with mock.patch.object(delivery.lark_notify, "upload_file",
+    with mock.patch.object(delivery.lark_card, "upload_file",
                            return_value="file_k") as up, \
-         mock.patch.object(delivery.lark_notify, "upload_image",
+         mock.patch.object(delivery.lark_card, "upload_image",
                            return_value="img_k"), \
-         mock.patch.object(delivery.lark_notify, "send_media",
+         mock.patch.object(delivery.lark_card, "send_media",
                            return_value=True) as media, \
-         mock.patch.object(delivery.lark_notify, "send_file",
+         mock.patch.object(delivery.lark_card, "send_file",
                            return_value=True) as attach:
         yield {"upload": up, "media": media, "file": attach}
 
@@ -322,9 +312,9 @@ def test_a_file_for_the_web_page_is_stored_and_its_key_kept_out_of_the_models_si
     key rides on the tool message's artifact rather than in what the model reads."""
     out_files: list = []
     channel = delivery.WebDelivery(out_files, "web:s-1")
-    with mock.patch.object(delivery.deliveries, "configured", return_value=True), \
-         mock.patch.object(delivery.deliveries, "put", return_value="deliveries/o/u/chart.png") as put, \
-         mock.patch.object(delivery.deliveries, "url", return_value="https://signed") as url:
+    with mock.patch.object(delivery.web_files, "configured", return_value=True), \
+         mock.patch.object(delivery.web_files, "put", return_value="deliveries/o/u/chart.png") as put, \
+         mock.patch.object(delivery.web_files, "url", return_value="https://signed") as url:
         text, artifact = _tools(_DeliverBox(size=3))["deliver_file"].func(
             "chart.png", {"configurable": {"delivery": channel}})
     assert put.call_args.args == ("web:s-1", "chart.png", b"\0" * 3)
@@ -332,7 +322,7 @@ def test_a_file_for_the_web_page_is_stored_and_its_key_kept_out_of_the_models_si
     assert "stays in the conversation" in text and "deliveries/" not in text
     assert artifact == {"file": {"key": "deliveries/o/u/chart.png", "name": "chart.png", "size": 3}}
     assert out_files == [{"name": "file", "value": {"name": "chart.png", "size": 3,
-                                                     "url": "https://signed"}}]
+                                                    "url": "https://signed"}}]
     assert not _lark["upload"].called and not _lark["file"].called
 
 
@@ -341,7 +331,7 @@ def test_a_file_for_the_web_page_goes_onto_its_own_run_and_never_to_lark(_lark):
     reload."""
     import base64
     out_files: list = []
-    with mock.patch.object(delivery.deliveries, "configured", return_value=False):
+    with mock.patch.object(delivery.web_files, "configured", return_value=False):
         reply = _deliver(_DeliverBox(size=3), delivery.WebDelivery(out_files), "chart.png")
     assert "Sent chart.png to the page" in reply and "stays in the workspace" in reply
     assert out_files == [{"name": "file", "value": {
@@ -384,7 +374,7 @@ def test_a_missing_file_is_named_rather_than_sent_as_empty(_lark):
 def test_larks_own_reason_reaches_the_model(_lark):
     """A bare failure reads as "try again". "The bot is not in that chat" does not — and
     only Lark knows which it is."""
-    _lark["file"].side_effect = delivery.lark_notify.LarkError(
+    _lark["file"].side_effect = delivery.lark_card.LarkError(
         "Lark refused the message: bot is not in the chat")
     out = _deliver(_DeliverBox(), delivery.LarkDelivery("oc_1"))
     assert "was not sent" in out and "bot is not in the chat" in out
@@ -392,8 +382,8 @@ def test_larks_own_reason_reaches_the_model(_lark):
 
 def test_a_video_lark_will_not_take_a_cover_for_still_arrives(_lark):
     """A rejected cover says nothing about the video, so it falls back to an attachment."""
-    with mock.patch.object(delivery.lark_notify, "upload_image",
-                           side_effect=delivery.lark_notify.LarkError("bad cover")):
+    with mock.patch.object(delivery.lark_card, "upload_image",
+                           side_effect=delivery.lark_card.LarkError("bad cover")):
         out = _deliver(_DeliverBox(cover=True), delivery.LarkDelivery("oc_1"), "clip.mp4")
     assert "attachment" in out
     assert _lark["file"].called and not _lark["media"].called
@@ -404,7 +394,7 @@ def test_the_guard_does_not_hide_the_runs_config_from_the_tool(_lark):
     reading the callable's annotations, so the telemetry wrapper has to keep them. A bare
     `*a, **kw` wrapper leaves deliver_file with no target, and it then refuses silently —
     the tool returns a sentence, telemetry says ok, and nothing looks broken."""
-    tools = {t.name: t for t in code_tools.tools_for("lark:ou_x", _DeliverBox())}
+    tools = {t.name: t for t in code_interpreter.tools_for("lark:ou_x", _DeliverBox())}
     assert "config" not in tools["deliver_file"].args, "config must stay out of the schema"
     # Invoked the way a run does, through the tool rather than the raw function.
     out = tools["deliver_file"].invoke(
@@ -421,17 +411,17 @@ def test_save_attachment_takes_its_handle_from_the_run_not_from_the_model(_lark)
     box = _DeliverBox()
     written = {}
     box.write_bytes = lambda name, data: written.update({"name": name, "size": len(data)})
-    tools = {t.name: t for t in code_tools.tools_for("lark:ou_x", box)}
+    tools = {t.name: t for t in code_interpreter.tools_for("lark:ou_x", box)}
     assert list(tools["save_attachment"].args) == ["which"], \
         "no handle may come from the model"
 
-    code_tools.images.add_to_turn("t-att", [{"kind": "file", "key": "file_real",
+    code_interpreter.images.add_to_turn("t-att", [{"kind": "file", "key": "file_real",
                                              "name": "report.pdf", "message_id": "om_real"}])
-    with mock.patch.object(code_tools.images.lark_notify, "fetch_message_resource",
+    with mock.patch.object(code_interpreter.images.lark_card, "fetch_message_resource",
                            return_value=b"PK\x03\x04") as fetched:
         out = tools["save_attachment"].invoke(
             {"which": 1}, config={"configurable": {"thread_id": "t-att"}})
-    code_tools.images.end_turn("t-att")
+    code_interpreter.images.end_turn("t-att")
     assert "report.pdf" in out and written["name"] == "report.pdf"
     # The kind has to travel with the handle: Lark answers 500 if it does not match.
     assert fetched.call_args.args == ("om_real", "file_real", "file")
@@ -446,20 +436,20 @@ def test_a_picture_keeps_a_usable_name_when_the_sender_gave_none(_lark):
     box = _DeliverBox()
     written = {}
     box.write_bytes = lambda name, data: written.update({"name": name})
-    tools = {t.name: t for t in code_tools.tools_for("lark:ou_x", box)}
-    with mock.patch.object(code_tools.images, "blocks_for", return_value=[]):
-        code_tools.images.add_to_turn("t-pic", [{"kind": "image", "key": "img_1",
+    tools = {t.name: t for t in code_interpreter.tools_for("lark:ou_x", box)}
+    with mock.patch.object(code_interpreter.images, "blocks_for", return_value=[]):
+        code_interpreter.images.add_to_turn("t-pic", [{"kind": "image", "key": "img_1",
                                                  "message_id": "om_1"}])
-    with mock.patch.object(code_tools.images.lark_notify, "fetch_message_resource",
+    with mock.patch.object(code_interpreter.images.lark_card, "fetch_message_resource",
                            return_value=b"\xff\xd8ab"):
         tools["save_attachment"].invoke({"which": 1},
                                         config={"configurable": {"thread_id": "t-pic"}})
-    code_tools.images.end_turn("t-pic")
+    code_interpreter.images.end_turn("t-pic")
     assert written["name"] == "image-1.jpg"
 
 
 def test_an_edited_image_is_sent_so_it_shows_rather_than_downloads(_lark):
-    with mock.patch.object(delivery.lark_notify, "send_image", return_value=True) as shown:
+    with mock.patch.object(delivery.lark_card, "send_image", return_value=True) as shown:
         out = _deliver(_DeliverBox(), delivery.LarkDelivery("oc_1"), "cropped.png")
     assert "shows there" in out
     assert shown.called and not _lark["file"].called
@@ -477,22 +467,22 @@ def test_the_access_point_token_is_per_file_system_not_per_actor():
     fake.list_access_points.return_value = {"accessPoints": []}
     fake.create_access_point.side_effect = lambda **kw: tokens.append(kw["clientToken"]) or {
         "accessPointArn": "arn:ap"}
-    with mock.patch.object(code_tools.boto3, "client", return_value=fake):
+    with mock.patch.object(code_interpreter.boto3, "client", return_value=fake):
         for fs in ("arn:aws:s3files:r:1:file-system/fs-a", "arn:aws:s3files:r:1:file-system/fs-b"):
-            with mock.patch.object(code_tools, "_FS_ARN", fs):
-                code_tools._access_point_for("lark:ou_same")
-        with mock.patch.object(code_tools, "_FS_ARN", "arn:aws:s3files:r:1:file-system/fs-a"):
-            code_tools._access_point_for("lark:ou_same")
+            with mock.patch.object(code_interpreter, "_FS_ARN", fs):
+                code_interpreter._access_point_for("lark:ou_same")
+        with mock.patch.object(code_interpreter, "_FS_ARN", "arn:aws:s3files:r:1:file-system/fs-a"):
+            code_interpreter._access_point_for("lark:ou_same")
     assert tokens[0] != tokens[1], "same user, two file systems: tokens must differ"
     assert tokens[0] == tokens[2], "same user, same file system: the retry must be idempotent"
 
 
 def test_a_picture_from_the_page_is_written_to_the_workspace_from_its_own_bytes():
-    import images
+    from channels import images
     box = mock.Mock()
-    with mock.patch.object(images.lark_notify, "fetch_message_resource") as fetch:
+    with mock.patch.object(images.lark_card, "fetch_message_resource") as fetch:
         name = images.save_to_workspace(box, {"kind": "image", "source": "web", "data": b"jpg",
-                                             "name": "image-1.jpg"}, 1)
+                                              "name": "image-1.jpg"}, 1)
     assert name == "image-1.jpg" and not fetch.called
     box.write_bytes.assert_called_once_with("image-1.jpg", b"jpg")
 
@@ -506,9 +496,9 @@ def test_two_files_sent_in_one_message_each_keep_their_own_record(_lark):
     channel = delivery.WebDelivery([], "web:s-1")
     calls = [{"name": "deliver_file", "args": {"path": n}, "id": n, "type": "tool_call"}
              for n in ("one.png", "two.png")]
-    with mock.patch.object(delivery.deliveries, "configured", return_value=True), \
-         mock.patch.object(delivery.deliveries, "put", side_effect=lambda a, n, d: f"deliveries/o/{n}"), \
-         mock.patch.object(delivery.deliveries, "url", return_value="https://signed"):
+    with mock.patch.object(delivery.web_files, "configured", return_value=True), \
+         mock.patch.object(delivery.web_files, "put", side_effect=lambda a, n, d: f"deliveries/o/{n}"), \
+         mock.patch.object(delivery.web_files, "url", return_value="https://signed"):
         g = StateGraph(MessagesState)
         g.add_node("tools", ToolNode([_tools(_DeliverBox(size=3))["deliver_file"]]))
         g.add_edge(START, "tools")

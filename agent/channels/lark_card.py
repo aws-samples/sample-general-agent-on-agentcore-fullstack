@@ -403,7 +403,7 @@ def _times(n: int) -> str:
 # while something else runs.
 
 _ANIM_FILES = {"think": "thinking.gif", "work": "working.gif"}
-_ANIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_ANIM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
 _ANIM_SIZE = "24px 12px"
 _anim_keys: dict[str, str] = {}
 _anim_lock = threading.Lock()

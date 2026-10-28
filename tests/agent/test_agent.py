@@ -1,11 +1,11 @@
 """Unit tests for agent logic that doesn't require live AWS.
 
-Run: tests/run.sh (which supplies the deps), or from this directory:
+Run: tests/run.sh (which supplies the deps), or from the repo root:
   uv run --with langchain --with langchain-aws --with langgraph \
          --with langchain-mcp-adapters --with boto3 --with httpx --with pytest \
-         python -m pytest test_agent.py -v
+         python -m pytest tests/agent/test_agent.py -v
 
-`agent_core` is imported for real. That was impossible under Strands, whose wheels
+The agent modules are imported for real. That was impossible under Strands, whose wheels
 target the ARM64 runtime, so the streaming tests used to exec slices of the source with
 a faked `_iter_deltas` — asserting against a copy of the code rather than the code. The
 LangGraph stack is pure Python, so the turn loop is now driven through an actual
@@ -24,7 +24,8 @@ from unittest import mock
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
+AGENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "agent")
+sys.path.insert(0, AGENT)
 # What a deploy injects; the modules read it at import and have no fallback.
 os.environ.setdefault("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
 os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
@@ -32,9 +33,22 @@ os.environ.setdefault("LARK_OAUTH_PROVIDER", "test-3lo")
 os.environ.setdefault("AGENT_WORKLOAD_NAME", "test-wl")
 os.environ.setdefault("METRICS_NAMESPACE", "test/agent")
 
-import agent_core
+from channels import lark
+import core
+from channels import web_files
+from channels import delivery
+from identity import grants
+from channels import images
+from identity import lark_3lo
+from channels import lark_card
+import middleware
+from runtime import sessions
+import threading
+import tools
+from runtime import turns
+from tools import web_search
 
-# Message classes are used throughout; agent_core already pulls them in.
+# Message classes are used throughout; the agent modules already pull them in.
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 
@@ -43,20 +57,20 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 def test_web_search_is_signed_by_the_agent_role_not_a_users_token():
     """Search reads no user data, and minting a per-user token for it would need the agent
     to hold Cognito admin rights — and create a Cognito user for every web actor."""
-    import websearch
-    with mock.patch.object(websearch, "_GATEWAY_URL",
+    from tools import web_search
+    with mock.patch.object(web_search, "_GATEWAY_URL",
                            "https://gw-1.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"):
-        conn = websearch.connection_for("web:abc")
+        conn = web_search.connection_for("web:abc")
     assert "Authorization" not in conn["headers"]
     assert conn["auth"]._signer._region_name == "us-east-1"
     assert conn["auth"]._signer._service_name == "bedrock-agentcore"
 
 
-# ------------------------------- agent_core session id ----------------------
+# ------------------------------- session id ---------------------------------
 
 def test_session_id_deterministic_per_user():
     """Load just the _session_id_for function without importing the heavy deps."""
-    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
+    src = open(os.path.join(AGENT, "runtime", "sessions.py"), encoding="utf-8").read()
     ns = {"hashlib": hashlib}
     # exec only the function definition we care about
     start = src.index("def _session_id_for")
@@ -77,23 +91,23 @@ def test_session_id_deterministic_per_user():
 def test_checkpointer_falls_back_to_one_shared_in_process_saver():
     """No table configured — a session must still work, and the fallback has to be shared:
     a fresh InMemorySaver per session build would drop history every cache expiry."""
-    with mock.patch.object(agent_core, "_CHECKPOINT_TABLE", ""), \
-         mock.patch.object(agent_core, "_fallback_saver", None):
-        first = agent_core._checkpointer()
-        second = agent_core._checkpointer()
+    with mock.patch.object(sessions, "_CHECKPOINT_TABLE", ""), \
+         mock.patch.object(sessions, "_fallback_saver", None):
+        first = sessions._checkpointer()
+        second = sessions._checkpointer()
     from langgraph.checkpoint.memory import InMemorySaver
     assert isinstance(first, InMemorySaver)
     assert first is second
 
 
 def test_checkpointer_uses_dynamodb_with_offload_when_configured():
-    with mock.patch.object(agent_core, "_CHECKPOINT_TABLE", "tbl"), \
-         mock.patch.object(agent_core, "_CHECKPOINT_BUCKET", "bkt"), \
+    with mock.patch.object(sessions, "_CHECKPOINT_TABLE", "tbl"), \
+         mock.patch.object(sessions, "_CHECKPOINT_BUCKET", "bkt"), \
          mock.patch("langgraph_checkpoint_aws.DynamoDBSaver") as saver:
-        agent_core._checkpointer()
+        sessions._checkpointer()
     kwargs = saver.call_args.kwargs
     assert kwargs["table_name"] == "tbl"
-    assert kwargs["ttl_seconds"] == agent_core._CHECKPOINT_TTL
+    assert kwargs["ttl_seconds"] == sessions._CHECKPOINT_TTL
     # Compression keeps the spill rare; the spill keeps a long thread from failing hard.
     assert kwargs["enable_checkpoint_compression"] is True
     assert kwargs["s3_offload_config"]["bucket_name"] == "bkt"
@@ -102,10 +116,10 @@ def test_checkpointer_uses_dynamodb_with_offload_when_configured():
 def test_checkpointer_omits_offload_when_no_bucket():
     """Passing a config with an empty bucket name would fail at write time, deep inside
     the saver, instead of simply not offloading."""
-    with mock.patch.object(agent_core, "_CHECKPOINT_TABLE", "tbl"), \
-         mock.patch.object(agent_core, "_CHECKPOINT_BUCKET", ""), \
+    with mock.patch.object(sessions, "_CHECKPOINT_TABLE", "tbl"), \
+         mock.patch.object(sessions, "_CHECKPOINT_BUCKET", ""), \
          mock.patch("langgraph_checkpoint_aws.DynamoDBSaver") as saver:
-        agent_core._checkpointer()
+        sessions._checkpointer()
     assert saver.call_args.kwargs["s3_offload_config"] is None
 
 
@@ -137,7 +151,7 @@ def _repair(messages):
             appended.extend(values["messages"])
 
     config = {"configurable": {"thread_id": "t-test"}}
-    n = asyncio.run(agent_core._arepair_interrupted_turn(_Graph(), config))
+    n = asyncio.run(sessions._arepair_interrupted_turn(_Graph(), config))
     return n, appended
 
 
@@ -205,8 +219,8 @@ def test_a_second_downstream_system_is_absent_not_broken():
     """Google unconfigured must cost nothing: no session build failure, no tool, and /auth
     google says so instead of pretending. The same convention as search and long-term
     memory — an optional system that is not deployed simply is not there."""
-    with mock.patch.dict(agent_core._DOWNSTREAMS, {}, clear=True):
-        r = agent_core.reauth("lark:ou_x", "google")
+    with mock.patch.dict(grants._DOWNSTREAMS, {}, clear=True):
+        r = sessions.reauth("lark:ou_x", "google")
     assert r["needs_auth"] is False
     assert "未配置" in r["reply"]
 
@@ -214,7 +228,7 @@ def test_a_second_downstream_system_is_absent_not_broken():
 def test_reauth_still_refuses_an_idp_nobody_wired_up():
     """The list is explicit on purpose: a typo should not silently start a consent flow for
     a provider that does not exist."""
-    r = agent_core.reauth("lark:ou_x", "dropbox")
+    r = sessions.reauth("lark:ou_x", "dropbox")
     assert r["needs_auth"] is False and "尚未接入" in r["reply"]
 
 
@@ -223,7 +237,7 @@ def test_the_generic_vault_fetch_does_not_claim_larks_ownership_check():
     saying otherwise would be the more dangerous mistake — so the docstring states the limit
     and the second system's tool reports the account it reached."""
     import inspect
-    src = inspect.getsource(agent_core.lark_3lo.get_user_token_for)
+    src = inspect.getsource(lark_3lo.get_user_token_for)
     assert "_belongs_to" not in src
     assert "cannot make the same" in src or "cannot" in src
 
@@ -233,25 +247,25 @@ def test_the_thread_comes_from_the_router_never_from_a_client():
     conversation. The router owns rotation (/reset, /new) and is the only caller trusted to
     name one; a surface that cannot — the browser — inherits what it last named, which works
     because both share the router's runtime session id and land in one container."""
-    agent_core._thread_named.clear()
-    derived = agent_core._session_id_for("lark:ou_x")
-    assert agent_core.thread_for("lark:ou_x") == derived      # before anything is named
+    sessions._thread_named.clear()
+    derived = sessions._session_id_for("lark:ou_x")
+    assert sessions.thread_for("lark:ou_x") == derived      # before anything is named
     rotated = derived + "-0123456789ab"
-    agent_core.remember_thread("lark:ou_x", rotated)
-    assert agent_core.thread_for("lark:ou_x") == rotated
+    sessions.remember_thread("lark:ou_x", rotated)
+    assert sessions.thread_for("lark:ou_x") == rotated
     # An empty value must not erase what the router said, nor may another user's thread.
-    agent_core.remember_thread("lark:ou_x", "")
-    agent_core.remember_thread("lark:ou_x", agent_core._session_id_for("lark:ou_other"))
-    assert agent_core.thread_for("lark:ou_x") == rotated
+    sessions.remember_thread("lark:ou_x", "")
+    sessions.remember_thread("lark:ou_x", sessions._session_id_for("lark:ou_other"))
+    assert sessions.thread_for("lark:ou_x") == rotated
     # And it is per actor.
-    assert agent_core.thread_for("lark:ou_other") == agent_core._session_id_for("lark:ou_other")
+    assert sessions.thread_for("lark:ou_other") == sessions._session_id_for("lark:ou_other")
 
 
 def test_the_page_names_its_thread_only_alongside_a_verified_token():
     """It names the thread the router handed it, so /reset on the page takes effect; that is
     safe only because server.py refuses a thread outside the token's actor."""
     import pathlib as _p, server, inspect
-    page = (_p.Path(__file__).parents[1] / "webui" / "index.html").read_text()
+    page = (_p.Path(AGENT).parent / "webui" / "index.html").read_text()
     assert "memorySessionId: session.memorySessionId" in page
     assert "runtimeSessionId" in page      # the routing key, which is not a capability
     assert "thread_belongs(" in inspect.getsource(server._bind_caller)
@@ -261,10 +275,10 @@ def test_a_message_arriving_mid_turn_is_steered_not_refused():
     """Two turns on one thread each read the other's half-written checkpoint, which Bedrock
     rejects — the failure that made a live thread look broken. The second message joins the
     running turn instead, so nothing has to be re-sent."""
-    agent_core._pending_steer.clear()
-    agent_core.steer("t-1", "and also check the logs")
-    agent_core.steer("t-1", "one more thing")
-    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    turns._pending_steer.clear()
+    turns.steer("t-1", "and also check the logs")
+    turns.steer("t-1", "one more thing")
+    mw = [m for m in core._middleware() if getattr(m, "name", "") == "steering"][0]
     # The runtime's real shape on LangGraph 1.2: the thread id lives on execution_info,
     # and there is no `config` attribute at all. A fake carrying `config` kept this test
     # green while steering was dead in production — every queued message was dropped.
@@ -280,27 +294,27 @@ def test_steering_only_injects_before_a_model_call():
     """A toolResult must follow its toolUse immediately, so injecting anywhere else would
     recreate the very error this fixes. before_model is the one safe boundary: tool results
     from the previous step are written, the next model call has not happened."""
-    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    mw = [m for m in core._middleware() if getattr(m, "name", "") == "steering"][0]
     assert hasattr(mw, "before_model")
     # Nothing may hook the tool boundary, where the adjacency rule would be broken.
-    assert not hasattr(agent_core._SteeringMiddleware, "after_model")
-    assert not hasattr(agent_core._SteeringMiddleware, "wrap_tool_call")
+    assert not hasattr(middleware._SteeringMiddleware, "after_model")
+    assert not hasattr(middleware._SteeringMiddleware, "wrap_tool_call")
 
 
 def test_steering_is_per_thread():
     """One user's aside must not land in another user's turn."""
-    agent_core._pending_steer.clear()
-    agent_core.steer("t-a", "for A")
-    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    turns._pending_steer.clear()
+    turns.steer("t-a", "for A")
+    mw = [m for m in core._middleware() if getattr(m, "name", "") == "steering"][0]
     assert mw.before_model({"messages": []}, _runtime("t-b")) is None
-    assert [q[:3] for q in agent_core._pending_steer["t-a"]] == [("for A", "", False)]
-    assert list(agent_core._pending_steer) == ["t-a"]
+    assert [q[:3] for q in turns._pending_steer["t-a"]] == [("for A", "", False)]
+    assert list(turns._pending_steer) == ["t-a"]
 
 
 def _load_busy_helpers():
     """The real functions, with the counter reset so tests don't inherit each other."""
-    agent_core._in_flight = 0
-    return {"busy": agent_core.busy, "_track": agent_core._track}
+    turns._in_flight = 0
+    return {"busy": turns.busy, "_track": turns._track}
 
 
 def test_busy_reflects_in_flight_turns():
@@ -344,7 +358,7 @@ def test_track_is_usable_from_a_thread():
 def test_websearch_gateway_contract():
     """The protocol-version header: without it the Gateway negotiates 2025-03-26 and
     rejects with -32022."""
-    src = open(os.path.join(os.path.dirname(__file__), "websearch.py"), encoding="utf-8").read()
+    src = open(os.path.join(AGENT, "tools", "web_search.py"), encoding="utf-8").read()
     assert "MCP-Protocol-Version" in src
     assert "2025-11-25" in src
     # available() must be a pure config check, so an unset gateway just means no tool
@@ -360,20 +374,20 @@ def test_auth_marker_matches_the_mcp_server():
     """The client detects the auth wall by matching lark-mcp's rejection text. It is
     a cross-process string contract: if the server's wording changes and this does
     not, the user silently stops being offered a consent link."""
-    here = os.path.dirname(__file__)
-    core = open(os.path.join(here, "agent_core.py"), encoding="utf-8").read()
-    marker = re.search(r'_NEEDS_TOKEN_MARKER = "([^"]+)"', core).group(1)
+    here = AGENT
+    src = open(os.path.join(here, "identity", "grants.py"), encoding="utf-8").read()
+    marker = re.search(r'_NEEDS_TOKEN_MARKER = "([^"]+)"', src).group(1)
     for name in ("lark-cli", "approval", "google"):
         server = open(os.path.join(here, "..", "mcp-servers", name, "server.js"), encoding="utf-8").read()
         assert marker in server, (
-            f"agent_core expects {marker!r} but mcp-servers/{name}/server.js no longer says it")
+            f"grants expects {marker!r} but mcp-servers/{name}/server.js no longer says it")
 
 
 def test_hit_auth_wall_reads_tool_results_not_the_final_reply():
     """The check must inspect tool results, not the model's text answer: the model
     paraphrases errors, so 'no user token is available' in the reply slips past a string
     check on the reply — verified end-to-end before this fix."""
-    hit = agent_core._hit_auth_wall_from_tool_results
+    hit = grants._hit_auth_wall_from_tool_results
     lark = {"consent": {"lark": "https://consent"}, "tool_idp": {"lark_docs": "lark"}}
 
     # 1. Nothing collected → nothing to inspect, so no auth wall.
@@ -401,13 +415,13 @@ def test_unauthorized_session_passes_an_empty_token_and_still_gets_tools():
         opened.append(connection["headers"])
         return [_dummy_tool]
 
-    with mock.patch.object(agent_core.lark_3lo, "get_user_lark_token",
+    with mock.patch.object(lark_3lo, "get_user_lark_token",
                            return_value=("auth_url", "https://consent")), \
-         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+         mock.patch.object(lark_3lo, "mcp_connection_for",
                            side_effect=lambda tok, url="": {"headers": {"tok": tok}}), \
-         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
-         mock.patch.object(agent_core.websearch, "available", return_value=False):
-        s = agent_core._build_session("lark:ou_x", "", "mem1")
+         mock.patch.object(tools, "_aopen_tools", fake_open), \
+         mock.patch.object(web_search, "available", return_value=False):
+        s = sessions._build_session("lark:ou_x", "", "mem1")
 
     assert s["auth_url"] == "https://consent"      # consent is remembered, not raised
     assert s["consent"] == {"lark": "https://consent"}
@@ -427,22 +441,22 @@ def test_a_web_users_lark_is_granted_on_demand_like_google():
         opened.append(connection.get("url"))
         return [_dummy_tool]
 
-    with mock.patch.object(agent_core.lark_3lo, "get_user_lark_token",
+    with mock.patch.object(lark_3lo, "get_user_lark_token",
                            side_effect=lambda *a, **k: lark_user_path.append(a)), \
-         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value=""), \
-         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+         mock.patch.object(lark_3lo, "peek_user_token_for", return_value=""), \
+         mock.patch.object(lark_3lo, "mcp_connection_for",
                            side_effect=lambda tok, url="": {"url": url or "lark-mcp"}), \
-         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
-         mock.patch.object(agent_core.websearch, "available", return_value=False):
-        s = agent_core._build_session("web:sub-carol", "",
-                                      agent_core._session_id_for("web:sub-carol"))
+         mock.patch.object(tools, "_aopen_tools", fake_open), \
+         mock.patch.object(web_search, "available", return_value=False):
+        s = sessions._build_session("web:sub-carol", "",
+                                    sessions._session_id_for("web:sub-carol"))
         assert lark_user_path == []
         assert "lark-mcp" in opened and s["consent"]["lark"] == ""
         assert not s["auth_url"] and not s["identity_error"]
-        assert agent_core.auth_status("web:sub-carol")["lark"] is False
-        with mock.patch.object(agent_core.lark_3lo, "get_user_token_for",
+        assert grants.auth_status("web:sub-carol")["lark"] is False
+        with mock.patch.object(lark_3lo, "get_user_token_for",
                                return_value=("auth_url", "https://lark-consent")) as generic:
-            r = agent_core.reauth("web:sub-carol", "lark")
+            r = sessions.reauth("web:sub-carol", "lark")
     assert r["auth_url"] == "https://lark-consent" and generic.call_count == 1
     assert lark_user_path == []
 
@@ -510,11 +524,11 @@ def _make_tool(name):
 def _session_for(deltas, tool_calls=None, follow_up="", **extra):
     """A session dict backed by a real compiled graph. `tool_calls` are requested after
     the deltas, so the abort path runs exactly where it does in production."""
-    turns = [{"text": list(deltas), "tool_calls": list(tool_calls or [])}]
+    script = [{"text": list(deltas), "tool_calls": list(tool_calls or [])}]
     if tool_calls:
-        turns.append({"text": [follow_up] if follow_up else []})
+        script.append({"text": [follow_up] if follow_up else []})
     tools = [_dummy_tool] + [_make_tool(n) for n in (tool_calls or [])]
-    graph = agent_core.create_agent(model=_ScriptedModel(turns=turns), tools=tools)
+    graph = core.create_agent(model=_ScriptedModel(turns=script), tools=tools)
     s = {"graph": graph, "tool_texts": [],
          "config": {"configurable": {"thread_id": f"t{next(_thread_seq)}"}}}
     s.update(extra)
@@ -523,7 +537,7 @@ def _session_for(deltas, tool_calls=None, follow_up="", **extra):
 
 def _patch_notify(card, notify_sent):
     return mock.patch.object(
-        agent_core, "lark_notify",
+        lark, "lark_card",
         mock.Mock(StreamingCard=lambda chat_id, **kw: card,
                   send_text=lambda cid, t: notify_sent.append(t) or True))
 
@@ -568,7 +582,7 @@ class FakeCard:
 def _load_3lo_guard(owner_lookup):
     """Exec the ownership check in isolation, so the HTTP lookup can be replaced without
     touching the module's boto3 client at import time."""
-    src = open(os.path.join(os.path.dirname(__file__), "lark_3lo.py"), encoding="utf-8").read()
+    src = open(os.path.join(AGENT, "identity", "lark_3lo.py"), encoding="utf-8").read()
     start = src.index("_VERIFIED: dict[str, str] = {}")
     end = src.index("def get_user_lark_token(")
     ns = {"hashlib": hashlib, "log": mock.Mock(), "httpx": mock.Mock()}
@@ -592,7 +606,7 @@ def test_a_wrong_owner_is_refused_without_burning_the_real_grant():
     flow on that mismatch destroyed the caller's working grant — measured: a token at
     13:16:40, gone one second later, and every later fetch answered authorizationUrl."""
     import inspect
-    src = inspect.getsource(agent_core.lark_3lo.get_user_lark_token)
+    src = inspect.getsource(lark_3lo.get_user_lark_token)
     branch = src[src.index("if token:"):src.index('return "wrong_owner"')]
     assert "force=True" not in branch      # forcing here is what burned the grant
     # Forcing when the vault is *empty* is a different case and is required — see the
@@ -605,7 +619,7 @@ def test_an_empty_vault_mints_a_completable_consent_link():
     CompleteResourceTokenAuth answers "Invalid or expired session" for it, repeatably, while
     the same flow forced completes. So the empty case must re-ask with force."""
     import inspect
-    src = inspect.getsource(agent_core.lark_3lo.get_user_lark_token)
+    src = inspect.getsource(lark_3lo.get_user_lark_token)
     tail = src[src.index('return "wrong_owner"'):]
     assert "if not force:" in tail and "force=True" in tail
 
@@ -621,9 +635,9 @@ def test_the_session_retry_hands_back_the_live_consent_link():
         return {"auth_url": f"https://consent/{len(calls)}", "mem_sid": mem_sid,
                 "created": 0, "stack": None}
 
-    with mock.patch.object(agent_core, "_build_session", side_effect=build), \
-         mock.patch.object(agent_core, "_close_session"):
-        s = agent_core._get_session("lark:ou_x", "", "mem1", workload_token="wat")
+    with mock.patch.object(sessions, "_build_session", side_effect=build), \
+         mock.patch.object(sessions, "_close_session"):
+        s = sessions._get_session("lark:ou_x", "", "mem1", workload_token="wat")
     assert len(calls) == 2
     assert s["auth_url"] == "https://consent/2"   # the newest, not the first
 
@@ -659,12 +673,12 @@ def test_the_ownership_cache_is_bounded():
 
 def _load_card(monkeypatch_calls):
     """Import StreamingCard with its HTTP layer replaced. lark_notify imports boto3
-    only, so unlike agent_core it loads on the test host."""
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    only, so unlike the agent modules it loads on the test host."""
+    sys.path.insert(0, AGENT)
     import importlib
-    import lark_notify
-    importlib.reload(lark_notify)
-    lark_notify._tenant_token = lambda: "tok"
+    from channels import lark_card
+    importlib.reload(lark_card)
+    lark_card._tenant_token = lambda: "tok"
 
     def fake_call(method, url, body, bearer=""):
         content = body.get("content")
@@ -675,8 +689,8 @@ def _load_card(monkeypatch_calls):
             content = None
         monkeypatch_calls.append((method, content, body.get("sequence")))
         return {"code": 0}
-    lark_notify._call = fake_call
-    return lark_notify
+    lark_card._call = fake_call
+    return lark_card
 
 
 def test_card_worker_writes_the_newest_text_and_never_loses_the_last():
@@ -723,20 +737,20 @@ def test_card_sequence_never_repeats_or_goes_backwards():
 
 def _recording_card():
     """A StreamingCard whose writes are recorded as (method, path, body)."""
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    sys.path.insert(0, AGENT)
     import importlib
-    import lark_notify
-    importlib.reload(lark_notify)
-    lark_notify._tenant_token = lambda: "tok"
+    from channels import lark_card
+    importlib.reload(lark_card)
+    lark_card._tenant_token = lambda: "tok"
     writes = []
 
     def fake_call(method, url, body, bearer=""):
         writes.append((method, url.split("/cards/c1", 1)[-1], body))
         return {"code": 0}
-    lark_notify._call = fake_call
-    card = lark_notify.StreamingCard("oc_1")
+    lark_card._call = fake_call
+    card = lark_card.StreamingCard("oc_1")
     card.card_id, card.ok, card.sent = "c1", True, True
-    return lark_notify, card, writes
+    return lark_card, card, writes
 
 
 def _inserted(writes):
@@ -909,24 +923,24 @@ def test_the_status_animations_ship_with_the_image():
     """Read from agent/assets at run time; the Dockerfile has to copy them, and the image
     tag has to change with them or a new animation is never built."""
     import pathlib
-    sys.path.insert(0, os.path.dirname(__file__))
-    import lark_notify
-    here = pathlib.Path(__file__).parent
-    for name in lark_notify._ANIM_FILES.values():
+    sys.path.insert(0, AGENT)
+    from channels import lark_card
+    here = pathlib.Path(AGENT)
+    for name in lark_card._ANIM_FILES.values():
         assert (here / "assets" / name).read_bytes()[:6] in (b"GIF89a", b"GIF87a"), name
     assert "COPY assets/" in (here / "Dockerfile").read_text()
     assert 'glob.glob("assets/*")' in (here.parent / "scripts" / "provision.sh").read_text()
 
 
 def test_a_failed_animation_upload_is_not_retried_on_every_turn():
-    sys.path.insert(0, os.path.dirname(__file__))
+    sys.path.insert(0, AGENT)
     import importlib
-    import lark_notify
-    importlib.reload(lark_notify)
-    with mock.patch.object(lark_notify, "upload_image",
-                           side_effect=lark_notify.LarkError("no")) as up:
-        assert lark_notify._animation_keys() == {}
-        assert lark_notify._animation_keys() == {}
+    from channels import lark_card
+    importlib.reload(lark_card)
+    with mock.patch.object(lark_card, "upload_image",
+                           side_effect=lark_card.LarkError("no")) as up:
+        assert lark_card._animation_keys() == {}
+        assert lark_card._animation_keys() == {}
     assert up.call_count == 1
 
 
@@ -986,13 +1000,13 @@ def test_a_given_up_card_does_not_keep_its_dots():
 def test_a_network_error_is_a_failed_write_not_an_exception():
     """_call only knew HTTPError; a timeout or an HTML 502 escaped close() and skipped the
     text fallback."""
-    sys.path.insert(0, os.path.dirname(__file__))
+    sys.path.insert(0, AGENT)
     import importlib
-    import lark_notify
-    importlib.reload(lark_notify)           # earlier tests replace _call itself
-    with mock.patch.object(lark_notify.urllib.request, "urlopen",
+    from channels import lark_card
+    importlib.reload(lark_card)           # earlier tests replace _call itself
+    with mock.patch.object(lark_card.urllib.request, "urlopen",
                            side_effect=TimeoutError("slow")):
-        assert lark_notify._call("PUT", "https://x", {})["code"] == -1
+        assert lark_card._call("PUT", "https://x", {})["code"] == -1
 
 
 def test_stream_hands_over_every_delta_cumulatively():
@@ -1004,7 +1018,7 @@ def test_stream_hands_over_every_delta_cumulatively():
     deltas = ["a" * 30, "b" * 30, "c" * 30, "d" * 30]
     session = _session_for(deltas)
     with _patch_notify(card, []):
-        text = agent_core._stream_to_chat(session, "msg", "oc_1")
+        text = lark._stream_to_chat(session, "msg", "oc_1")
     assert text == "a"*30 + "b"*30 + "c"*30 + "d"*30
     assert len(card.updates) == len(deltas)
     for u in card.updates:
@@ -1021,7 +1035,7 @@ def test_stream_aborts_when_an_unauthorized_session_reaches_a_lark_tool():
                            consent={"lark": "https://consent"},
                            tool_idp={"approval_list_pending": "lark"})
     with _patch_notify(card, []):
-        text = agent_core._stream_to_chat(session, "查待审批", "oc_1")
+        text = lark._stream_to_chat(session, "查待审批", "oc_1")
     assert session.get("walled_tool") == "approval_list_pending"
     # The half-sentence is replaced, not left on the card, and the model's apology for
     # the refusal never runs at all.
@@ -1036,7 +1050,7 @@ def test_stream_does_not_abort_on_websearch_when_unauthorized():
     session = _session_for(["天气是…"], tool_calls=["WebSearch___WebSearch"],
                            follow_up="晴天", consent={"lark": "https://consent"})
     with _patch_notify(card, []):
-        text = agent_core._stream_to_chat(session, "今天天气", "oc_1")
+        text = lark._stream_to_chat(session, "今天天气", "oc_1")
     assert "walled_tool" not in session
     assert text == "天气是…晴天"           # the turn ran to completion
 
@@ -1061,7 +1075,7 @@ def test_the_card_hears_of_a_tool_only_after_the_words_before_it():
     session = _session_for(["我先", "看一下。"], tool_calls=["lark_lookup"],
                            follow_up="查到了。")
     with _patch_notify(card, []):
-        agent_core._stream_to_chat(session, "msg", "oc_1")
+        lark._stream_to_chat(session, "msg", "oc_1")
     assert card.seen[0] == ("start", "我先看一下。")
     assert ("finish", "我先看一下。") in card.seen
     assert card.updates[-1] == "我先看一下。查到了。"
@@ -1078,12 +1092,12 @@ def test_a_message_steered_in_mid_turn_is_answered_on_a_new_card_below_it():
 
     def lookup() -> str:
         """Steers a message in while the turn is between model calls, as a user would."""
-        agent_core.steer(thread, "不用看代码了")
-        agent_core._steer_reply_to[thread] = "om_steered"
+        turns.steer(thread, "不用看代码了")
+        turns._steer_reply_to[thread] = "om_steered"
         return "found"
     steering = type("SteeringMiddleware", (AgentMiddleware,),
-                    dict(agent_core._SteeringMiddleware.__dict__))()
-    graph = agent_core.create_agent(
+                    dict(middleware._SteeringMiddleware.__dict__))()
+    graph = core.create_agent(
         model=_ScriptedModel(turns=[{"text": ["我先查一下。"], "tool_calls": ["lookup"]},
                                     {"text": ["好的，不看了。"]}]),
         tools=[_dummy_tool, StructuredTool.from_function(func=lookup, name="lookup")],
@@ -1100,10 +1114,10 @@ def test_a_message_steered_in_mid_turn_is_answered_on_a_new_card_below_it():
     notify = mock.Mock(StreamingCard=factory, send_text=lambda cid, t: True,
                        is_group=lambda cid: True)
     try:
-        with mock.patch.object(agent_core, "lark_notify", notify):
-            text = agent_core._stream_to_chat(session, "看一下仓库", "oc_group")
+        with mock.patch.object(lark, "lark_card", notify):
+            text = lark._stream_to_chat(session, "看一下仓库", "oc_group")
     finally:
-        agent_core._pending_steer.pop(thread, None)
+        turns._pending_steer.pop(thread, None)
     first, second = made
     assert (first.closed_with, first.handed_over) == ("我先查一下。", True)
     assert second.reply_to == "om_steered" and second.carry is first
@@ -1117,19 +1131,19 @@ def test_a_card_that_showed_nothing_yet_is_not_handed_over():
     card already sits where the answer belongs, and closing it would leave it empty."""
     from langchain.agents.middleware import AgentMiddleware
     thread = f"t{next(_thread_seq)}"
-    agent_core.steer(thread, "B")
-    agent_core._steer_reply_to[thread] = "om_b"
+    turns.steer(thread, "B")
+    turns._steer_reply_to[thread] = "om_b"
     steering = type("SteeringMiddleware", (AgentMiddleware,),
-                    dict(agent_core._SteeringMiddleware.__dict__))()
-    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["A 和 B 的答案"]}]),
-                                    tools=[_dummy_tool], middleware=[steering])
+                    dict(middleware._SteeringMiddleware.__dict__))()
+    graph = core.create_agent(model=_ScriptedModel(turns=[{"text": ["A 和 B 的答案"]}]),
+                              tools=[_dummy_tool], middleware=[steering])
     session = {"graph": graph, "tool_texts": [],
                "config": {"configurable": {"thread_id": thread}}}
     made = []
     notify = mock.Mock(StreamingCard=lambda chat_id, **kw: made.append(FakeCard()) or made[-1],
                        send_text=lambda cid, t: True)
-    with mock.patch.object(agent_core, "lark_notify", notify):
-        agent_core._stream_to_chat(session, "A", "oc_1")
+    with mock.patch.object(lark, "lark_card", notify):
+        lark._stream_to_chat(session, "A", "oc_1")
     assert len(made) == 1 and made[0].closed_with == "A 和 B 的答案"
 
 
@@ -1142,11 +1156,11 @@ def test_a_failed_hand_over_still_delivers_the_rest():
 
     def lookup() -> str:
         """Steers a message in mid-turn."""
-        agent_core.steer(thread, "还有这个")
+        turns.steer(thread, "还有这个")
         return "found"
     steering = type("SteeringMiddleware", (AgentMiddleware,),
-                    dict(agent_core._SteeringMiddleware.__dict__))()
-    graph = agent_core.create_agent(
+                    dict(middleware._SteeringMiddleware.__dict__))()
+    graph = core.create_agent(
         model=_ScriptedModel(turns=[{"text": ["先查。"], "tool_calls": ["lookup"]},
                                     {"text": ["好了。"]}]),
         tools=[_dummy_tool, StructuredTool.from_function(func=lookup, name="lookup")],
@@ -1162,10 +1176,10 @@ def test_a_failed_hand_over_still_delivers_the_rest():
     notify = mock.Mock(StreamingCard=factory, send_text=lambda cid, t: sent.append(t) or True,
                        is_group=lambda cid: False)
     try:
-        with mock.patch.object(agent_core, "lark_notify", notify):
-            agent_core._stream_to_chat(session, "看一下", "oc_1")
+        with mock.patch.object(lark, "lark_card", notify):
+            lark._stream_to_chat(session, "看一下", "oc_1")
     finally:
-        agent_core._pending_steer.pop(thread, None)
+        turns._pending_steer.pop(thread, None)
     assert first.closed_with == "先查。" and sent == ["好了。"]
 
 
@@ -1175,7 +1189,7 @@ def test_stream_does_not_abort_when_authorized():
     session = _session_for(["结果…"], tool_calls=["lark_list_my_docs"],
                            follow_up="共 3 个文件")     # no auth_url
     with _patch_notify(card, []):
-        text = agent_core._stream_to_chat(session, "查文档", "oc_1")
+        text = lark._stream_to_chat(session, "查文档", "oc_1")
     assert "walled_tool" not in session
     assert text == "结果…共 3 个文件"
 
@@ -1190,10 +1204,10 @@ def test_stream_collects_tool_results_for_the_auth_wall_fallback():
     session = _session_for(["查询中…"], tool_calls=["lark_list_my_docs"],
                            follow_up="失败了", tool_idp={"lark_list_my_docs": "lark"})
     with _patch_notify(card, []):
-        agent_core._stream_to_chat(session, "查文档", "oc_1")
+        lark._stream_to_chat(session, "查文档", "oc_1")
     session["consent"] = {"lark": "https://consent"}   # the vault lookup that follows finds none
-    assert any(agent_core._NEEDS_TOKEN_MARKER in t for _, t in session["tool_texts"])
-    assert agent_core._hit_auth_wall(session) == "lark"
+    assert any(grants._NEEDS_TOKEN_MARKER in t for _, t in session["tool_texts"])
+    assert grants._hit_auth_wall(session) == "lark"
 
 
 def test_stream_falls_back_to_text_when_card_cannot_open():
@@ -1202,7 +1216,7 @@ def test_stream_falls_back_to_text_when_card_cannot_open():
     sent = []
     session = _session_for(["hello ", "world"])
     with _patch_notify(card, sent):
-        text = agent_core._stream_to_chat(session, "msg", "oc_1")
+        text = lark._stream_to_chat(session, "msg", "oc_1")
     assert text == "hello world"
     assert card.updates == []              # never tried to stream
     assert sent == ["hello world"]         # delivered as plain text instead
@@ -1214,7 +1228,7 @@ def test_stream_falls_back_when_an_update_fails_midway():
     sent = []
     session = _session_for(["x" * 100, "y" * 100])
     with _patch_notify(card, sent):
-        text = agent_core._stream_to_chat(session, "msg", "oc_1")
+        text = lark._stream_to_chat(session, "msg", "oc_1")
     assert text == "x"*100 + "y"*100
     assert sent == [text]                  # fell back after the failed update
     assert card.closed_with is None        # never reached a clean close
@@ -1232,17 +1246,17 @@ def test_fresh_session_evicts_a_cached_unauthorized_session():
         return {"created": 1e9}                      # authorized: no auth_url
 
     cached = {"auth_url": "https://consent", "created": 1e9, "stack": object()}
-    with mock.patch.dict(agent_core._sessions, {"lark:u|mem1": cached}, clear=True), \
-         mock.patch.object(agent_core, "_build_session", fake_build), \
-         mock.patch.object(agent_core, "_close_session", lambda s: closed.append(s)), \
-         mock.patch.object(agent_core.time, "time", return_value=1e9 + 10):
+    with mock.patch.dict(sessions._sessions, {"lark:u|mem1": cached}, clear=True), \
+         mock.patch.object(sessions, "_build_session", fake_build), \
+         mock.patch.object(sessions, "_close_session", lambda s: closed.append(s)), \
+         mock.patch.object(time, "time", return_value=1e9 + 10):
         # Without fresh, the cached unauthorized session is returned (still inside TTL).
-        s = agent_core._get_session("lark:u", "", "mem1")
+        s = sessions._get_session("lark:u", "", "mem1")
         assert s.get("auth_url") == "https://consent"
         assert built == []
 
         # With fresh, it is evicted, its MCP sessions closed, and a new one built.
-        s = agent_core._get_session("lark:u", "", "mem1", fresh=True)
+        s = sessions._get_session("lark:u", "", "mem1", fresh=True)
 
     assert closed == [cached], "the stale MCP sessions must be closed, not leaked"
     assert built == ["mem1"]
@@ -1278,16 +1292,16 @@ def test_history_stats_counts_a_turn_only_when_an_answer_was_delivered():
     from langchain_core.messages import AIMessage as AI, ToolMessage as TM
     msgs = [HumanMessage("q"), AI(content="", tool_calls=[{"name": "t", "args": {}, "id": "1"}]),
             TM(content="r", tool_call_id="1"), AI(content="a")]
-    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
-        assert agent_core.history_stats("lark:ou_x", "sess-1") == {
+    with mock.patch.object(sessions, "_checkpointer", return_value=_fake_saver(msgs)):
+        assert sessions.history_stats("lark:ou_x", "sess-1") == {
             "turns": 1, "toolCalls": 1, "messages": 3,
             "contextTokens": 0, "cachedTokens": 0,
             "modelCalls": 0, "inputTotal": 0, "cachedTotal": 0}
 
 
 def test_history_stats_reports_zero_for_an_untouched_thread():
-    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(None)):
-        assert agent_core.history_stats("lark:ou_x", "sess-1") == {
+    with mock.patch.object(sessions, "_checkpointer", return_value=_fake_saver(None)):
+        assert sessions.history_stats("lark:ou_x", "sess-1") == {
             "turns": 0, "toolCalls": 0, "messages": 0,
             "contextTokens": 0, "cachedTokens": 0,
             "modelCalls": 0, "inputTotal": 0, "cachedTotal": 0}
@@ -1303,60 +1317,60 @@ def test_context_size_is_the_latest_calls_billed_input_not_an_estimate():
     new = AI(content="b", usage_metadata={"input_tokens": 9147, "output_tokens": 517,
              "total_tokens": 9664, "input_token_details": {"cache_read": 5049}})
     msgs = [HumanMessage("q"), old, HumanMessage("q2"), new]
-    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
-        out = agent_core.history_stats("lark:ou_x", "sess-1")
+    with mock.patch.object(sessions, "_checkpointer", return_value=_fake_saver(msgs)):
+        out = sessions.history_stats("lark:ou_x", "sess-1")
     assert (out["contextTokens"], out["cachedTokens"]) == (9147, 5049)
     # Summed over every call still in the checkpoint, for the thread's hit rate.
     assert (out["modelCalls"], out["inputTotal"], out["cachedTotal"]) == (2, 14115, 9881)
 
 
-def _compactable(turns: int, summary: str):
-    """A real agent graph with `turns` finished turns, and the summary model replaced."""
+def _compactable(n_turns: int, summary: str):
+    """A real agent graph with `n_turns` finished turns, and the summary model replaced."""
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
     from langgraph.checkpoint.memory import InMemorySaver
-    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ans"]}]),
-                                    tools=[], checkpointer=InMemorySaver(),
-                                    middleware=agent_core._middleware()[:2])
+    graph = core.create_agent(model=_ScriptedModel(turns=[{"text": ["ans"]}]),
+                              tools=[], checkpointer=InMemorySaver(),
+                              middleware=core._middleware()[:2])
     config = {"configurable": {"thread_id": f"c{next(_thread_seq)}"}}
-    for i in range(turns):
-        agent_core._run(graph.ainvoke({"messages": [HumanMessage(f"q{i}")]}, config=config))
+    for i in range(n_turns):
+        turns._run(graph.ainvoke({"messages": [HumanMessage(f"q{i}")]}, config=config))
     session = {"graph": graph, "config": config}
-    return (session, mock.patch.object(agent_core, "_get_session", return_value=session),
-            mock.patch.object(agent_core, "_summary_model",
+    return (session, mock.patch.object(sessions, "_get_session", return_value=session),
+            mock.patch.object(core, "_summary_model",
                               return_value=FakeListChatModel(responses=[summary])))
 
 
 def test_compact_replaces_the_older_turns_with_a_summary_and_the_thread_goes_on():
-    session, got, model = _compactable(turns=6, summary="Earlier: q0 to q2 were asked.")
-    with got, model, mock.patch.object(agent_core, "_COMPACT_KEEP", 4):
-        out = agent_core.compact("lark:ou_x", "t")
-    msgs = agent_core._run(session["graph"].aget_state(session["config"])).values["messages"]
-    assert out["compacted"] > 0 and out["kept"] == sum(1 for m in msgs if not agent_core._is_summary(m))
-    assert agent_core._is_summary(msgs[0]) and "q0 to q2" in agent_core._text_of(msgs[0])
+    session, got, model = _compactable(n_turns=6, summary="Earlier: q0 to q2 were asked.")
+    with got, model, mock.patch.object(sessions, "_COMPACT_KEEP", 4):
+        out = sessions.compact("lark:ou_x", "t")
+    msgs = turns._run(session["graph"].aget_state(session["config"])).values["messages"]
+    assert out["compacted"] > 0 and out["kept"] == sum(1 for m in msgs if not middleware._is_summary(m))
+    assert middleware._is_summary(msgs[0]) and "q0 to q2" in sessions._text_of(msgs[0])
     # Nothing pending: the next turn starts from the summary, as on a live thread.
-    assert agent_core._run(session["graph"].aget_state(session["config"])).next == ()
-    agent_core._run(session["graph"].ainvoke({"messages": [HumanMessage("next")]},
-                                              config=session["config"]))
+    assert turns._run(session["graph"].aget_state(session["config"])).next == ()
+    turns._run(session["graph"].ainvoke({"messages": [HumanMessage("next")]},
+                                        config=session["config"]))
 
 
 def test_compact_refuses_a_fallback_summary_rather_than_erase_the_history():
     """The failure the threshold path was fixed for — a history replaced by the fallback
     line — must not come back through the manual door."""
-    session, got, model = _compactable(turns=6, summary=agent_core._SUMMARY_FALLBACK)
-    before = agent_core._run(session["graph"].aget_state(session["config"])).values["messages"]
-    with got, model, mock.patch.object(agent_core, "_COMPACT_KEEP", 4):
-        out = agent_core.compact("lark:ou_x", "t")
-    after = agent_core._run(session["graph"].aget_state(session["config"])).values["messages"]
+    session, got, model = _compactable(n_turns=6, summary=middleware._SUMMARY_FALLBACK)
+    before = turns._run(session["graph"].aget_state(session["config"])).values["messages"]
+    with got, model, mock.patch.object(sessions, "_COMPACT_KEEP", 4):
+        out = sessions.compact("lark:ou_x", "t")
+    after = turns._run(session["graph"].aget_state(session["config"])).values["messages"]
     assert out == {"compacted": 0, "reason": "failed"}
     assert [m.id for m in after] == [m.id for m in before]
 
 
 def test_compact_leaves_a_short_thread_and_a_running_turn_alone():
-    session, got, model = _compactable(turns=1, summary="s")
-    with got, model, mock.patch.object(agent_core, "_COMPACT_KEEP", 4):
-        assert agent_core.compact("lark:ou_x", "t")["reason"] == "short"
-    with mock.patch.object(agent_core, "thread_busy", return_value=True):
-        assert agent_core.compact("lark:ou_x", "t") == {"compacted": 0, "reason": "busy"}
+    session, got, model = _compactable(n_turns=1, summary="s")
+    with got, model, mock.patch.object(sessions, "_COMPACT_KEEP", 4):
+        assert sessions.compact("lark:ou_x", "t")["reason"] == "short"
+    with mock.patch.object(turns, "thread_busy", return_value=True):
+        assert sessions.compact("lark:ou_x", "t") == {"compacted": 0, "reason": "busy"}
 
 
 def test_the_tool_overview_keeps_assembly_order_and_names_the_missing_grants():
@@ -1364,11 +1378,11 @@ def test_the_tool_overview_keeps_assembly_order_and_names_the_missing_grants():
                                "run_code": "code"},
                "tool_idp": {"lark_whoami": "lark", "approval_list": "lark"},
                "consent": {"google": ""}}
-    out = agent_core.tools_overview(session)
+    out = sessions.tools_overview(session)
     assert [t["name"] for t in out["tools"]] == ["lark_whoami", "approval_list", "run_code"]
     assert out["tools"][1] == {"name": "approval_list", "source": "approval", "idp": "lark"}
     assert out["ungranted"] == ["google"]
-    assert agent_core.tools_overview({"identity_error": "x"}) == {
+    assert sessions.tools_overview({"identity_error": "x"}) == {
         "tools": [], "identityError": "x"}
 
 
@@ -1378,8 +1392,8 @@ def test_transcript_rebuilds_what_a_reloaded_page_should_show():
             AI(content="", tool_calls=[{"name": "list_docs", "args": {"n": 5}, "id": "c1"}]),
             TM(content="5 份", tool_call_id="c1"),
             AI(content="你有 5 份。")]
-    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
-        out = agent_core.transcript("lark:ou_x", "sess-1")
+    with mock.patch.object(sessions, "_checkpointer", return_value=_fake_saver(msgs)):
+        out = sessions.transcript("lark:ou_x", "sess-1")
     assert [m["role"] for m in out["messages"]] == [
         "user", "toolCall", "toolResult", "assistant"]
     # The id is what pairs a call with its result when the page rebuilds the card.
@@ -1390,18 +1404,18 @@ def test_transcript_rebuilds_what_a_reloaded_page_should_show():
 
 def test_transcript_reads_multimodal_content_without_crashing():
     """A turn that carried an image has a list of blocks, not a string."""
-    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(
+    with mock.patch.object(sessions, "_checkpointer", return_value=_fake_saver(
             [HumanMessage(content=[{"type": "text", "text": "看图"},
                                    {"type": "image", "source": {}}])])):
-        out = agent_core.transcript("lark:ou_x", "sess-1")
+        out = sessions.transcript("lark:ou_x", "sess-1")
     assert out["messages"] == [{"role": "user", "content": "看图"}]
 
 
 def test_transcript_caps_a_long_thread_and_says_so():
-    msgs = [HumanMessage(f"q{i}") for i in range(agent_core._TRANSCRIPT_LIMIT + 10)]
-    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
-        out = agent_core.transcript("lark:ou_x", "sess-1")
-    assert len(out["messages"]) == agent_core._TRANSCRIPT_LIMIT
+    msgs = [HumanMessage(f"q{i}") for i in range(sessions._TRANSCRIPT_LIMIT + 10)]
+    with mock.patch.object(sessions, "_checkpointer", return_value=_fake_saver(msgs)):
+        out = sessions.transcript("lark:ou_x", "sess-1")
+    assert len(out["messages"]) == sessions._TRANSCRIPT_LIMIT
     assert out["truncated"] is True
     assert out["messages"][-1]["content"] == f"q{len(msgs) - 1}"   # the tail, not the head
 
@@ -1409,8 +1423,8 @@ def test_transcript_caps_a_long_thread_and_says_so():
 def test_transcript_is_blank_rather_than_broken_when_unreadable():
     broken = mock.Mock()
     broken.aget_tuple.side_effect = RuntimeError("no table")
-    with mock.patch.object(agent_core, "_checkpointer", return_value=broken):
-        out = agent_core.transcript("lark:ou_x", "sess-1")
+    with mock.patch.object(sessions, "_checkpointer", return_value=broken):
+        out = sessions.transcript("lark:ou_x", "sess-1")
     assert out == {"messages": [], "unavailable": True}
 
 
@@ -1420,15 +1434,15 @@ def test_the_transcript_reads_the_verified_callers_thread():
     src = inspect.getsource(server.handle_invocations)
     i = src.index('action == "transcript"')
     block = src[i:i + 500]
-    assert 'payload["actorId"]' in block and "agent_core.thread_for(actor_id)" in block
+    assert 'payload["actorId"]' in block and "sessions.thread_for(actor_id)" in block
 
 
 def test_history_stats_degrades_instead_of_failing_status():
     """/status must still render if the checkpoint cannot be read."""
     broken = mock.Mock()
     broken.aget_tuple.side_effect = RuntimeError("no table")
-    with mock.patch.object(agent_core, "_checkpointer", return_value=broken):
-        assert agent_core.history_stats("lark:ou_x", "sess-1")["unavailable"] is True
+    with mock.patch.object(sessions, "_checkpointer", return_value=broken):
+        assert sessions.history_stats("lark:ou_x", "sess-1")["unavailable"] is True
 
 
 def test_clear_history_deletes_the_thread_and_drops_the_cached_session():
@@ -1436,20 +1450,20 @@ def test_clear_history_deletes_the_thread_and_drops_the_cached_session():
     top of a thread the user was told is gone."""
     saver = _fake_saver()
     closed = []
-    agent_core._sessions["lark:ou_x|sess-1"] = {"stack": None, "created": 0}
-    with mock.patch.object(agent_core, "_checkpointer", return_value=saver), \
-         mock.patch.object(agent_core, "_close_session", closed.append):
-        assert agent_core.clear_history("lark:ou_x", "sess-1") == {"deleted": True}
+    sessions._sessions["lark:ou_x|sess-1"] = {"stack": None, "created": 0}
+    with mock.patch.object(sessions, "_checkpointer", return_value=saver), \
+         mock.patch.object(sessions, "_close_session", closed.append):
+        assert sessions.clear_history("lark:ou_x", "sess-1") == {"deleted": True}
     assert saver.deleted == "sess-1"
-    assert "lark:ou_x|sess-1" not in agent_core._sessions
+    assert "lark:ou_x|sess-1" not in sessions._sessions
     assert len(closed) == 1
 
 
 def test_clear_history_reports_failure_rather_than_claiming_success():
     broken = mock.Mock()
     broken.adelete_thread.side_effect = RuntimeError("boom")
-    with mock.patch.object(agent_core, "_checkpointer", return_value=broken):
-        r = agent_core.clear_history("lark:ou_x", "sess-1")
+    with mock.patch.object(sessions, "_checkpointer", return_value=broken):
+        r = sessions.clear_history("lark:ou_x", "sess-1")
     assert r["deleted"] is False and r["error"] == "RuntimeError"
 
 
@@ -1473,7 +1487,7 @@ class _CaptureClient:
 def _invoke_capturing(**ctor):
     from langchain_core.messages import SystemMessage
     client = _CaptureClient()
-    m = agent_core._CachingChatBedrockConverse(
+    m = core._CachingChatBedrockConverse(
         model="global.anthropic.claude-sonnet-5", region_name="us-west-2",
         client=client, **ctor)
     m.bind_tools([{"name": "t", "description": "d",
@@ -1520,7 +1534,7 @@ def test_empty_ttl_disables_caching_entirely():
 def test_only_claude_and_nova_get_a_cache_point(model, explicit):
     """Bedrock's explicit-caching table for Converse lists only those two families; Kimi K3
     rejects any request with a cachePoint (measured), and caches implicitly instead."""
-    assert agent_core._caches_explicitly(model) is explicit
+    assert core._caches_explicitly(model) is explicit
 
 
 @pytest.mark.parametrize("model,setting,ttl,mode", [
@@ -1533,22 +1547,22 @@ def test_only_claude_and_nova_get_a_cache_point(model, explicit):
 def test_the_model_decides_whether_a_ttl_is_sent(model, setting, ttl, mode):
     import importlib
     with mock.patch.dict(os.environ, {"BEDROCK_MODEL_ID": model, "PROMPT_CACHE_TTL": setting}):
-        m = importlib.reload(agent_core)
+        m = importlib.reload(core)
         assert (m._CACHE_TTL, m.cache_mode(), m._model.cache_ttl) == (ttl, mode, ttl)
-    importlib.reload(agent_core)
+    importlib.reload(core)
 
 
 def test_a_mistyped_cache_setting_stops_the_container():
     import importlib
     with mock.patch.dict(os.environ, {"PROMPT_CACHE_TTL": "1hr"}), pytest.raises(SystemExit):
-        importlib.reload(agent_core)
-    importlib.reload(agent_core)
+        importlib.reload(core)
+    importlib.reload(core)
 
 
 def test_an_explicit_per_call_cache_control_is_not_overridden():
     from langchain_core.messages import SystemMessage
     client = _CaptureClient()
-    m = agent_core._CachingChatBedrockConverse(
+    m = core._CachingChatBedrockConverse(
         model="global.anthropic.claude-sonnet-5", region_name="us-west-2",
         client=client, cache_ttl="1h")
     m.invoke([SystemMessage("sys"), HumanMessage("a")], cache_control={"ttl": "5m"})
@@ -1562,13 +1576,13 @@ def test_an_explicit_per_call_cache_control_is_not_overridden():
 # recall read another user's records.
 
 def test_no_memory_resource_means_no_tools_rather_than_an_error():
-    import memory_tools
-    with mock.patch.object(memory_tools, "_MEMORY_ID", ""):
-        assert memory_tools.tools_for("lark:ou_x") == []
+    from tools import memory
+    with mock.patch.object(memory, "_MEMORY_ID", ""):
+        assert memory.tools_for("lark:ou_x") == []
 
 
 def test_the_namespace_comes_from_the_bound_actor_not_from_arguments():
-    import memory_tools
+    from tools import memory
     calls = {}
 
     class _C:
@@ -1580,9 +1594,9 @@ def test_the_namespace_comes_from_the_bound_actor_not_from_arguments():
             calls["read"] = kw
             return {"memoryRecordSummaries": [{"content": {"text": "code name is X"}}]}
 
-    with mock.patch.object(memory_tools, "_MEMORY_ID", "mem-1"), \
-         mock.patch.object(memory_tools.boto3, "client", return_value=_C()):
-        remember, recall = memory_tools.tools_for("lark:ou_alice")
+    with mock.patch.object(memory, "_MEMORY_ID", "mem-1"), \
+         mock.patch.object(memory.boto3, "client", return_value=_C()):
+        remember, recall = memory.tools_for("lark:ou_alice")
         assert remember.invoke({"fact": "likes tea"}) == "Saved."
         assert "code name is X" in recall.invoke({"query": "code name?"})
 
@@ -1595,29 +1609,29 @@ def test_the_namespace_comes_from_the_bound_actor_not_from_arguments():
 
 
 def test_a_rejected_record_is_reported_not_swallowed():
-    import memory_tools
+    from tools import memory
 
     class _C:
         def batch_create_memory_records(self, **kw):
             return {"successfulRecords": [], "failedRecords": [{"errorCode": "Throttled"}]}
 
-    with mock.patch.object(memory_tools, "_MEMORY_ID", "mem-1"), \
-         mock.patch.object(memory_tools.boto3, "client", return_value=_C()):
-        remember, _ = memory_tools.tools_for("lark:ou_x")
+    with mock.patch.object(memory, "_MEMORY_ID", "mem-1"), \
+         mock.patch.object(memory.boto3, "client", return_value=_C()):
+        remember, _ = memory.tools_for("lark:ou_x")
         assert "could not save" in remember.invoke({"fact": "x"})
 
 
 def test_recall_says_so_when_there_is_nothing_stored():
     """An empty result must not read as a tool failure, or the model retries it."""
-    import memory_tools
+    from tools import memory
 
     class _C:
         def retrieve_memory_records(self, **kw):
             return {"memoryRecordSummaries": []}
 
-    with mock.patch.object(memory_tools, "_MEMORY_ID", "mem-1"), \
-         mock.patch.object(memory_tools.boto3, "client", return_value=_C()):
-        _, recall = memory_tools.tools_for("lark:ou_x")
+    with mock.patch.object(memory, "_MEMORY_ID", "mem-1"), \
+         mock.patch.object(memory.boto3, "client", return_value=_C()):
+        _, recall = memory.tools_for("lark:ou_x")
         assert recall.invoke({"query": "anything?"}) == "Nothing on record about that."
 
 
@@ -1627,18 +1641,18 @@ def test_recall_says_so_when_there_is_nothing_stored():
 # rewriting the prefix every turn would make the prompt cache miss every turn.
 
 def test_summarisation_triggers_on_a_token_threshold_not_every_turn():
-    mw = [m for m in agent_core._middleware()
+    mw = [m for m in core._middleware()
           if type(m).__name__ == "SummarizationMiddleware"]
     assert len(mw) == 1
     clauses = mw[0]._trigger_clauses
-    assert clauses == [{"tokens": agent_core._SUMMARIZE_AT_TOKENS}]
-    assert agent_core._SUMMARIZE_AT_TOKENS > 0
+    assert clauses == [{"tokens": middleware._SUMMARIZE_AT_TOKENS}]
+    assert middleware._SUMMARIZE_AT_TOKENS > 0
 
 
 def test_the_summariser_does_not_pay_for_prompt_caching():
     """The summary call happens once per crossing and is never re-read, so a cachePoint
     would only buy a 1.25-2x write premium."""
-    summariser = [m for m in agent_core._middleware()
+    summariser = [m for m in core._middleware()
                   if type(m).__name__ == "SummarizationMiddleware"][0]
     assert summariser.model.cache_ttl == ""
 
@@ -1647,34 +1661,34 @@ def test_a_message_steered_in_or_answered_later_keeps_the_time_it_arrived():
     """A message steered in mid-turn, or answered as a continuation after the turn, was said
     when it arrived — not when the turn began, and not when its answer started."""
     from langgraph.checkpoint.memory import InMemorySaver
-    agent_core._pending_steer.clear()
-    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        mw = agent_core._middleware()
+    turns._pending_steer.clear()
+    with mock.patch.object(middleware, "_SUMMARIZE_AT_TOKENS", 0):
+        mw = core._middleware()
     tool = _make_tool("lookup")
-    graph = agent_core.create_agent(
+    graph = core.create_agent(
         model=_ScriptedModel(turns=[{"text": ["looking"], "tool_calls": ["lookup"]},
                                     {"text": ["done"]}, {"text": ["later"]}]),
         tools=[tool], middleware=mw, checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "t-steer-clock", "received_ms": 1000}}
-    agent_core.steer("t-steer-clock", "also this", "h-steer")
-    arrived = agent_core._pending_steer["t-steer-clock"][0][3]
+    turns.steer("t-steer-clock", "also this", "h-steer")
+    arrived = turns._pending_steer["t-steer-clock"][0][3]
 
     async def run(inputs):
         async for _ in graph.astream({"messages": inputs}, cfg, stream_mode="messages"):
             pass
-    agent_core._run(run([HumanMessage("q", id="h-q")]))
-    agent_core._run(run(agent_core._turn_input([("and later", "h-late", False, 5000)])))
+    turns._run(run([HumanMessage("q", id="h-q")]))
+    turns._run(run(lark._turn_input([("and later", "h-late", False, 5000)])))
     by_id = {m.id: m.additional_kwargs.get("ts")
-             for m in agent_core._run(graph.aget_state(cfg)).values["messages"]}
+             for m in turns._run(graph.aget_state(cfg)).values["messages"]}
     assert by_id["h-q"] == 1000 and by_id["h-steer"] == arrived and by_id["h-late"] == 5000
 
 
 def test_a_message_whose_turn_stopped_before_a_reply_still_gets_its_time():
     """Stopped at a consent wall the model never returns, so the clock never stamps it."""
     from langgraph.checkpoint.memory import InMemorySaver
-    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        mw = agent_core._middleware()
-    graph = agent_core.create_agent(
+    with mock.patch.object(middleware, "_SUMMARIZE_AT_TOKENS", 0):
+        mw = core._middleware()
+    graph = core.create_agent(
         model=_ScriptedModel(turns=[{"text": ["one"]}, {"text": ["walled"]}, {"text": ["two"]}]),
         tools=[_dummy_tool], middleware=mw, checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "t-stop", "received_ms": 1}}
@@ -1690,12 +1704,12 @@ def test_a_message_whose_turn_stopped_before_a_reply_still_gets_its_time():
         async for _ in stream:
             break
         await stream.aclose()
-    agent_core._run(full("q1", "h1"))
-    agent_core._run(stopped("q2", "h2"))
-    assert agent_core._run(agent_core.astamp_unanswered(graph, cfg, 4242)) == 1
-    assert agent_core._run(agent_core.astamp_unanswered(graph, cfg, 9999)) == 0   # idempotent
-    agent_core._run(full("q3", "h3"))
-    msgs = agent_core._run(graph.aget_state(cfg)).values["messages"]
+    turns._run(full("q1", "h1"))
+    turns._run(stopped("q2", "h2"))
+    assert turns._run(sessions.astamp_unanswered(graph, cfg, 4242)) == 1
+    assert turns._run(sessions.astamp_unanswered(graph, cfg, 9999)) == 0   # idempotent
+    turns._run(full("q3", "h3"))
+    msgs = turns._run(graph.aget_state(cfg)).values["messages"]
     by_id = {m.id: m.additional_kwargs.get("ts") for m in msgs if isinstance(m, HumanMessage)}
     assert by_id["h2"] == 4242 and [m.id for m in msgs if isinstance(m, HumanMessage)] == ["h1", "h2", "h3"]
 
@@ -1704,19 +1718,19 @@ def test_auth_status_names_the_account_each_grant_came_from():
     """Read with the grant itself, so a user can tell which of their accounts it is; a lookup
     that fails costs the name, never the status."""
     tokens = {"lark-prov": "lark-tok", "google-prov": "g-tok"}
-    with mock.patch.object(agent_core.lark_3lo, "configured", return_value=True), \
-         mock.patch.object(agent_core.lark_3lo, "lark_provider", return_value=("lark-prov", [])), \
-         mock.patch.object(agent_core, "_DOWNSTREAMS", {"google": ("u", "google-prov", [])}), \
-         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for",
+    with mock.patch.object(lark_3lo, "configured", return_value=True), \
+         mock.patch.object(lark_3lo, "lark_provider", return_value=("lark-prov", [])), \
+         mock.patch.object(grants, "_DOWNSTREAMS", {"google": ("u", "google-prov", [])}), \
+         mock.patch.object(lark_3lo, "peek_user_token_for",
                            side_effect=lambda actor, prov, scopes, wt: tokens.get(prov, "")), \
-         mock.patch.dict(agent_core._ACCOUNT_OF, {"lark": lambda t: "XUESONG · me@myners.net",
-                                                  "google": lambda t: "me@myners.net"}):
-        st = agent_core.auth_status("web:s-1")
+         mock.patch.dict(grants._ACCOUNT_OF, {"lark": lambda t: "XUESONG · me@myners.net",
+                                              "google": lambda t: "me@myners.net"}):
+        st = grants.auth_status("web:s-1")
         assert st["lark"] is True and st["google"] is True
         assert st["accounts"] == {"lark": "XUESONG · me@myners.net", "google": "me@myners.net"}
         tokens.pop("google-prov")
-        with mock.patch.dict(agent_core._ACCOUNT_OF, {"lark": lambda t: ""}):
-            st = agent_core.auth_status("web:s-1")
+        with mock.patch.dict(grants._ACCOUNT_OF, {"lark": lambda t: ""}):
+            st = grants.auth_status("web:s-1")
         assert st["lark"] is True and st["google"] is False and st["accounts"] == {}
 
 
@@ -1728,20 +1742,20 @@ def test_reauthorising_a_system_already_granted_starts_a_new_consent():
     def fake_fetch(wat, actor, force=False, provider="", scopes=None):
         fetched.append(force)
         return {"authorizationUrl": "https://new-consent"} if force else {"accessToken": "old"}
-    with mock.patch.dict(agent_core._DOWNSTREAMS, {"google": ("https://g", "p", ["openid"])}), \
-         mock.patch.object(agent_core.lark_3lo, "_workload_token_for", return_value="wat"), \
-         mock.patch.object(agent_core.lark_3lo, "_fetch_vaulted", side_effect=fake_fetch):
-        r = agent_core.reauth("web:s-1", "google")
+    with mock.patch.dict(grants._DOWNSTREAMS, {"google": ("https://g", "p", ["openid"])}), \
+         mock.patch.object(lark_3lo, "_workload_token_for", return_value="wat"), \
+         mock.patch.object(lark_3lo, "_fetch_vaulted", side_effect=fake_fetch):
+        r = sessions.reauth("web:s-1", "google")
         assert r["auth_url"] == "https://new-consent" and fetched == [True]
         # An ordinary fetch still hands back the vaulted grant.
-        assert agent_core.lark_3lo.get_user_token_for("web:s-1", "p", ["openid"]) == ("token", "old")
+        assert lark_3lo.get_user_token_for("web:s-1", "p", ["openid"]) == ("token", "old")
 
 
 def test_summarisation_can_be_disabled_outright():
     """Steering and image attachment stay either way — one keeps a mid-turn message from
     being lost, the other is what lets the model see a screenshot at all."""
-    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        assert [type(m).__name__ for m in agent_core._middleware()] == [
+    with mock.patch.object(middleware, "_SUMMARIZE_AT_TOKENS", 0):
+        assert [type(m).__name__ for m in core._middleware()] == [
             "ImageMiddleware", "SteeringMiddleware", "ClockMiddleware"]
 
 
@@ -1749,9 +1763,9 @@ def test_each_message_records_when_it_was_said():
     """A reloaded page shows the times Lark chat shows, so they live on the thread itself:
     the user's message and the reply each carry one, and the transcript hands them out."""
     from langgraph.checkpoint.memory import InMemorySaver
-    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        mw = agent_core._middleware()
-    graph = agent_core.create_agent(
+    with mock.patch.object(middleware, "_SUMMARIZE_AT_TOKENS", 0):
+        mw = core._middleware()
+    graph = core.create_agent(
         model=_ScriptedModel(turns=[{"text": ["one"]}, {"text": ["two"]}]), tools=[_dummy_tool],
         middleware=mw, checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "t-clock"}}
@@ -1766,19 +1780,19 @@ def test_each_message_records_when_it_was_said():
         async for _ in graph.astream({"messages": [HumanMessage(text, id=mid)]}, arrived,
                                      stream_mode="messages"):
             pass
-    agent_core._run(first("q1", "h1"))
-    agent_core._run(turn("q2", "h2"))
+    turns._run(first("q1", "h1"))
+    turns._run(turn("q2", "h2"))
     after = int(time.time() * 1000)
-    msgs = agent_core._run(graph.aget_state(cfg)).values["messages"]
+    msgs = turns._run(graph.aget_state(cfg)).values["messages"]
     assert [type(m).__name__ for m in msgs] == ["HumanMessage", "AIMessage"] * 2
     stamps = [m.additional_kwargs.get("ts") for m in msgs]
     assert stamps[0] == before - 5000
     assert all(before <= t <= after for t in stamps[1:]) and stamps == sorted(stamps), stamps
     # Stamped in place: still one copy of each.
-    assert [agent_core._text_of(m) for m in msgs] == ["q1", "one", "q2", "two"]
-    with mock.patch.object(agent_core, "_checkpointer", return_value=graph.checkpointer), \
-         mock.patch.object(agent_core, "_thread_config", return_value=cfg):
-        out = agent_core.transcript("web:s-1")["messages"]
+    assert [sessions._text_of(m) for m in msgs] == ["q1", "one", "q2", "two"]
+    with mock.patch.object(sessions, "_checkpointer", return_value=graph.checkpointer), \
+         mock.patch.object(sessions, "_thread_config", return_value=cfg):
+        out = sessions.transcript("web:s-1")["messages"]
     assert [m.get("ts") for m in out] == stamps
 
 
@@ -1788,7 +1802,7 @@ def _runtime(thread_id):
 
 
 def _image_mw():
-    return [m for m in agent_core._middleware() if getattr(m, "name", "") == "images"][0]
+    return [m for m in core._middleware() if getattr(m, "name", "") == "images"][0]
 
 
 _BLOCK = {"type": "image", "base64": "Zm9v", "mime_type": "image/jpeg"}
@@ -1796,8 +1810,8 @@ _BLOCK = {"type": "image", "base64": "Zm9v", "mime_type": "image/jpeg"}
 
 def _register(thread_id, handles):
     """Register attachments with a turn, with the Lark fetch replaced."""
-    with mock.patch.object(agent_core.images, "blocks_for", return_value=[_BLOCK]):
-        return agent_core.images.add_to_turn(thread_id, handles)
+    with mock.patch.object(images, "blocks_for", return_value=[_BLOCK]):
+        return images.add_to_turn(thread_id, handles)
 
 
 def test_the_pixels_reach_the_request_but_never_the_thread():
@@ -1813,7 +1827,7 @@ def test_the_pixels_reach_the_request_but_never_the_thread():
     assert sent.id == mid
     # The stored message is untouched: still text, still carrying the handle.
     assert stored.content == "what is in this?\n[image 1 msg=om_x key=img_y]"
-    agent_core.images.end_turn("t-px")
+    images.end_turn("t-px")
 
 
 def test_a_run_with_no_images_is_left_alone():
@@ -1837,59 +1851,59 @@ def test_a_picture_sent_mid_turn_reaches_the_running_turn_on_its_own_message():
     sent = _image_mw()._attach(request).messages
     assert [b["type"] for b in sent[0].content] == ["text", "image"]
     assert [b["type"] for b in sent[2].content] == ["text", "image"]
-    agent_core.images.end_turn("t-mid")
-    assert agent_core.images.pixels_for("t-mid") == {}
+    images.end_turn("t-mid")
+    assert images.pixels_for("t-mid") == {}
 
 
 def test_an_attachment_steered_into_a_running_turn_is_not_dropped():
     """It used to be: the busy check came before the attachments were read, and steering
     carried text only, so a file sent while the bot was answering vanished silently."""
-    agent_core._pending_steer.clear()
-    agent_core._in_flight_threads.clear()
-    agent_core._track(+1, "t-busy", "lark", "oc_1")
+    turns._pending_steer.clear()
+    turns._in_flight_threads.clear()
+    turns._track(+1, "t-busy", "lark", "oc_1")
     try:
-        with mock.patch.object(agent_core.images, "blocks_for", return_value=[]), \
-             mock.patch.object(agent_core, "lark_notify"):
+        with mock.patch.object(images, "blocks_for", return_value=[]), \
+             mock.patch.object(lark, "lark_card"):
             # From another chat — a DM and a group share the thread — it is not steered: the
             # answer would appear in the chat the turn is answering.
-            other = agent_core.chat_async("lark:ou_x", "elsewhere", "oc_2", mem_sid="t-busy")
-            assert other["busy"] == "lark-other" and "t-busy" not in agent_core._pending_steer
-            out = agent_core.chat_async("lark:ou_x", "also this", "oc_1", mem_sid="t-busy",
-                                        image_handles=[{"kind": "file", "key": "f_1",
-                                                        "name": "q3.pdf", "message_id": "om_9"}])
+            other = lark.chat_async("lark:ou_x", "elsewhere", "oc_2", mem_sid="t-busy")
+            assert other["busy"] == "lark-other" and "t-busy" not in turns._pending_steer
+            out = lark.chat_async("lark:ou_x", "also this", "oc_1", mem_sid="t-busy",
+                                  image_handles=[{"kind": "file", "key": "f_1",
+                                                  "name": "q3.pdf", "message_id": "om_9"}])
         assert out["steered"] is True
-        (text, mid, _fresh, _arrived), = agent_core._pending_steer["t-busy"]
+        (text, mid, _fresh, _arrived), = turns._pending_steer["t-busy"]
         assert "also this" in text and "save_attachment(1)" in text and "q3.pdf" in text
-        assert agent_core.images.handles_for("t-busy")[0]["key"] == "f_1"
+        assert images.handles_for("t-busy")[0]["key"] == "f_1"
     finally:
-        agent_core._track(-1, "t-busy")
-        agent_core.images.end_turn("t-busy")
-        agent_core._pending_steer.clear()
+        turns._track(-1, "t-busy")
+        images.end_turn("t-busy")
+        turns._pending_steer.clear()
 
 
 def test_a_lark_message_during_a_web_turn_is_told_not_steered():
     """Steered into a web turn, its answer would appear on the page while the user waits in
     Lark. Nothing is registered either, so the web turn's attachment numbering is untouched."""
-    agent_core._pending_steer.clear()
-    agent_core._in_flight_threads.clear()
-    agent_core._track(+1, "t-web", "web")
+    turns._pending_steer.clear()
+    turns._in_flight_threads.clear()
+    turns._track(+1, "t-web", "web")
     try:
-        with mock.patch.object(agent_core, "lark_notify") as notify:
-            out = agent_core.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-web",
-                                        image_handles=[{"kind": "file", "key": "f_1",
-                                                        "message_id": "om_9"}])
+        with mock.patch.object(lark, "lark_card") as notify:
+            out = lark.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-web",
+                                  image_handles=[{"kind": "file", "key": "f_1",
+                                                  "message_id": "om_9"}])
         assert out["busy"] == "web"
         assert "网页" in notify.send_text.call_args.args[1]
-        assert agent_core._pending_steer == {} and agent_core.images.handles_for("t-web") == []
+        assert turns._pending_steer == {} and images.handles_for("t-web") == []
     finally:
-        agent_core._track(-1, "t-web")
+        turns._track(-1, "t-web")
 
 
 def _fresh_claims():
     """Tests share the module's claim state; start each from nothing."""
-    agent_core._in_flight = 0
-    agent_core._in_flight_threads.clear()
-    agent_core._pending_steer.clear()
+    turns._in_flight = 0
+    turns._in_flight_threads.clear()
+    turns._pending_steer.clear()
 
 
 class _InlineThread:
@@ -1903,10 +1917,10 @@ class _InlineThread:
 
 def test_a_claim_is_one_step_and_a_second_claimant_learns_who_holds_it():
     _fresh_claims()
-    assert agent_core.try_claim("t-c", "web") is None
-    assert agent_core.try_claim("t-c", "lark") == "web"
-    agent_core.release("t-c")
-    assert agent_core.thread_owner("t-c") is None and agent_core._in_flight == 0
+    assert turns.try_claim("t-c", "web") is None
+    assert turns.try_claim("t-c", "lark") == "web"
+    turns.release("t-c")
+    assert turns.thread_owner("t-c") is None and turns._in_flight == 0
 
 
 def test_a_turn_releases_its_thread_and_attachments_on_every_way_out():
@@ -1916,22 +1930,22 @@ def test_a_turn_releases_its_thread_and_attachments_on_every_way_out():
     for case in ("identity", "raises", "ok"):
         _fresh_claims()
         if case == "identity":
-            got = mock.patch.object(agent_core, "_get_session",
+            got = mock.patch.object(sessions, "_get_session",
                                     return_value={"identity_error": "nope"})
         elif case == "raises":
-            got = mock.patch.object(agent_core, "_get_session", side_effect=RuntimeError("cold"))
+            got = mock.patch.object(sessions, "_get_session", side_effect=RuntimeError("cold"))
         else:
-            got = mock.patch.object(agent_core, "_get_session", return_value=_session_for([]))
-        with got, mock.patch.object(agent_core, "lark_notify"), \
-             mock.patch.object(agent_core, "_stream_to_chat", return_value="ok"), \
-             mock.patch.object(agent_core.threading, "Thread", _InlineThread):
+            got = mock.patch.object(sessions, "_get_session", return_value=_session_for([]))
+        with got, mock.patch.object(lark, "lark_card"), \
+             mock.patch.object(lark, "_stream_to_chat", return_value="ok"), \
+             mock.patch.object(threading, "Thread", _InlineThread):
             try:
-                agent_core.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-out",
-                                      image_handles=handles)
+                lark.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-out",
+                                image_handles=handles)
             except RuntimeError:
                 assert case == "raises"
-        assert agent_core.thread_owner("t-out") is None, case
-        assert agent_core.images.handles_for("t-out") == [], case
+        assert turns.thread_owner("t-out") is None, case
+        assert images.handles_for("t-out") == [], case
 
 
 def test_a_message_steered_after_the_last_model_call_is_answered_not_dropped():
@@ -1943,23 +1957,23 @@ def test_a_message_steered_after_the_last_model_call_is_answered_not_dropped():
     def stream(session, inputs, chat_id, message_id=None, received_ms=None):
         seen.append(inputs)
         if len(seen) == 1:       # arrives while the first answer is streaming
-            with mock.patch.object(agent_core.images, "blocks_for", return_value=[]):
-                agent_core.chat_async("lark:ou_x", "also this", "oc_1", mem_sid="t-late",
-                                      image_handles=[{"kind": "file", "key": "f_9",
-                                                      "name": "late.pdf", "message_id": "om_9"}])
-            assert agent_core.images.handles_for("t-late"), "still registered for the continuation"
+            with mock.patch.object(images, "blocks_for", return_value=[]):
+                lark.chat_async("lark:ou_x", "also this", "oc_1", mem_sid="t-late",
+                                image_handles=[{"kind": "file", "key": "f_9",
+                                                "name": "late.pdf", "message_id": "om_9"}])
+            assert images.handles_for("t-late"), "still registered for the continuation"
         return "ok"
 
-    with mock.patch.object(agent_core, "_get_session", return_value=_session_for([])), \
-         mock.patch.object(agent_core, "lark_notify"), \
-         mock.patch.object(agent_core, "_stream_to_chat", side_effect=stream), \
-         mock.patch.object(agent_core.threading, "Thread", _InlineThread):
-        agent_core.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-late")
+    with mock.patch.object(sessions, "_get_session", return_value=_session_for([])), \
+         mock.patch.object(lark, "lark_card"), \
+         mock.patch.object(lark, "_stream_to_chat", side_effect=stream), \
+         mock.patch.object(threading, "Thread", _InlineThread):
+        lark.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-late")
     assert len(seen) == 2
     (text, _mid, _fresh, _arrived), = seen[1]
     assert "also this" in text and "save_attachment(1)" in text
-    assert agent_core.thread_owner("t-late") is None
-    assert agent_core.images.handles_for("t-late") == []
+    assert turns.thread_owner("t-late") is None
+    assert images.handles_for("t-late") == []
 
 
 def test_across_surfaces_a_message_is_told_not_steered():
@@ -1967,16 +1981,16 @@ def test_across_surfaces_a_message_is_told_not_steered():
     would be promised an answer it never receives."""
     for owner, arrives in (("sync", "lark"), ("web", "lark"), ("lark", "sync"), ("web", "sync")):
         _fresh_claims()
-        agent_core.try_claim("t-x", owner)
-        with mock.patch.object(agent_core, "lark_notify") as notify:
+        turns.try_claim("t-x", owner)
+        with mock.patch.object(lark, "lark_card") as notify:
             if arrives == "lark":
-                out = agent_core.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-x")
+                out = lark.chat_async("lark:ou_x", "hi", "oc_1", mem_sid="t-x")
                 assert out["busy"] == owner and notify.send_text.called
             else:
-                out = agent_core.chat_result("lark:ou_x", "hi", mem_sid="t-x")
+                out = lark.chat_result("lark:ou_x", "hi", mem_sid="t-x")
                 assert out["busy"] == owner and "steered" not in out
-        assert agent_core._pending_steer == {}, (owner, arrives)
-        agent_core.release("t-x")
+        assert turns._pending_steer == {}, (owner, arrives)
+        turns.release("t-x")
 
 
 def test_a_web_runs_claim_lasts_until_the_run_ends_not_until_the_page_stops_reading():
@@ -1991,7 +2005,7 @@ def test_a_web_runs_claim_lasts_until_the_run_ends_not_until_the_page_stops_read
             yield i
 
     async def read_one_and_leave():
-        events = agent_core.stream_on_agent_loop(produce, on_done=done.set)
+        events = turns.stream_on_agent_loop(produce, on_done=done.set)
         async for _ in events:
             break            # the page went away after the first event
         assert not done.is_set(), "released while the run was still going"
@@ -2013,38 +2027,39 @@ def test_a_picture_steered_into_a_real_turn_reaches_the_model_on_its_own_message
                 yield chunk
 
     from langgraph.checkpoint.memory import InMemorySaver
-    graph = agent_core.create_agent(model=_Recording(turns=[{"text": ["ok"]}]), tools=[],
-                                    checkpointer=InMemorySaver(),
-                                    middleware=agent_core._middleware()[:2])
-    with mock.patch.object(agent_core.images, "blocks_for", return_value=[_BLOCK]):
-        _, first = agent_core.images.add_to_turn(
+    graph = core.create_agent(model=_Recording(turns=[{"text": ["ok"]}]), tools=[],
+                              checkpointer=InMemorySaver(),
+                              middleware=core._middleware()[:2])
+    with mock.patch.object(images, "blocks_for", return_value=[_BLOCK]):
+        _, first = images.add_to_turn(
             "t-real", [{"kind": "image", "key": "img_a", "message_id": "om_1"}])
-        marks, later = agent_core.images.add_to_turn(
+        marks, later = images.add_to_turn(
             "t-real", [{"kind": "image", "key": "img_b", "message_id": "om_2"}])
-    agent_core.steer("t-real", "and this one\n" + marks, later)
+    turns.steer("t-real", "and this one\n" + marks, later)
     # Streamed, as a real turn is (_iter_deltas): that is the path that calls _astream.
     async def run():
         async for _ in graph.astream({"messages": [HumanMessage("look", id=first)]},
                                      config={"configurable": {"thread_id": "t-real"}},
                                      stream_mode="messages"):
             pass
-    agent_core._run(run())
+    turns._run(run())
     humans = [m for m in seen_by_model[0] if isinstance(m, HumanMessage)]
     assert [m.id for m in humans] == [first, later]
     for m in humans:
         assert any(isinstance(b, dict) and b.get("type") == "image" for b in m.content), m.id
-    agent_core.images.end_turn("t-real")
+    images.end_turn("t-real")
 
 
 def test_a_malformed_page_request_does_not_leave_the_thread_claimed():
     """Claimed before the run input is built, so a payload that fails validation must
     release it — left claimed, Lark answers "正在网页上回答" for good."""
-    import asyncio, agui
+    import asyncio
+    from channels import agui
     _fresh_claims()
     session = {"mem_sid": "t-bad", "graph": object(), "config": {"configurable": {}}}
 
     async def go():
-        with mock.patch.object(agent_core, "aget_session",
+        with mock.patch.object(sessions, "aget_session",
                                mock.AsyncMock(return_value=session)):
             await agui.handle(mock.Mock(), {"actorId": "lark:ou_x", "messages": "not a list"}, "")
 
@@ -2052,15 +2067,15 @@ def test_a_malformed_page_request_does_not_leave_the_thread_claimed():
         asyncio.run(go())
     except Exception:  # noqa: BLE001 — the validation error itself is not under test
         pass
-    assert agent_core.thread_owner("t-bad") is None and agent_core._in_flight == 0
+    assert turns.thread_owner("t-bad") is None and turns._in_flight == 0
 
 
 def test_release_is_idempotent():
     _fresh_claims()
-    agent_core.try_claim("t-i", "lark")
-    agent_core.release("t-i")
-    agent_core.release("t-i")
-    assert agent_core._in_flight == 0
+    turns.try_claim("t-i", "lark")
+    turns.release("t-i")
+    turns.release("t-i")
+    assert turns._in_flight == 0
 
 
 def test_a_steer_queued_while_a_turn_failed_to_start_is_reported_not_carried_over():
@@ -2069,18 +2084,18 @@ def test_a_steer_queued_while_a_turn_failed_to_start_is_reported_not_carried_ove
     _fresh_claims()
 
     def cold_build(*a, **k):
-        agent_core.steer("t-fail", "meanwhile", "msg-x")     # arrives during the build
+        turns.steer("t-fail", "meanwhile", "msg-x")     # arrives during the build
         raise RuntimeError("build failed")
 
-    with mock.patch.object(agent_core, "_get_session", side_effect=cold_build), \
-         mock.patch.object(agent_core, "lark_notify") as notify:
+    with mock.patch.object(sessions, "_get_session", side_effect=cold_build), \
+         mock.patch.object(lark, "lark_card") as notify:
         try:
-            agent_core.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-fail")
+            lark.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-fail")
         except RuntimeError:
             pass
-    assert agent_core._pending_steer == {}
+    assert turns._pending_steer == {}
     assert any("1 条消息没来得及处理" in c.args[1] for c in notify.send_text.call_args_list)
-    assert agent_core.thread_owner("t-fail") is None
+    assert turns.thread_owner("t-fail") is None
 
 
 def test_a_continuation_that_cannot_get_a_session_says_how_many_it_dropped():
@@ -2097,30 +2112,30 @@ def test_a_continuation_that_cannot_get_a_session_says_how_many_it_dropped():
 
     def stream(session, inputs, chat_id, message_id=None, received_ms=None):
         if calls["n"] == 1:
-            agent_core.steer("t-cont", "after consent", "m-r", fresh=True)
+            turns.steer("t-cont", "after consent", "m-r", fresh=True)
         return "ok"
 
-    with mock.patch.object(agent_core, "_get_session", side_effect=get_session), \
-         mock.patch.object(agent_core, "_drop_sessions"), \
-         mock.patch.object(agent_core, "lark_notify") as notify, \
-         mock.patch.object(agent_core, "_stream_to_chat", side_effect=stream), \
-         mock.patch.object(agent_core.threading, "Thread", _InlineThread):
-        agent_core.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-cont")
+    with mock.patch.object(sessions, "_get_session", side_effect=get_session), \
+         mock.patch.object(sessions, "_drop_sessions"), \
+         mock.patch.object(lark, "lark_card") as notify, \
+         mock.patch.object(lark, "_stream_to_chat", side_effect=stream), \
+         mock.patch.object(threading, "Thread", _InlineThread):
+        lark.chat_async("lark:ou_x", "first", "oc_1", mem_sid="t-cont")
     sent = [c.args[1] for c in notify.send_text.call_args_list]
     assert any("1 条消息没来得及处理" in m and "RuntimeError" in m for m in sent), sent
-    assert agent_core.thread_owner("t-cont") is None
+    assert turns.thread_owner("t-cont") is None
 
 
 def test_a_consent_replay_waits_for_the_continuation_on_a_rebuilt_session():
     """Injected into the running turn it would run on the session built before the grant
     and wall again, with the parked message already spent."""
     _fresh_claims()
-    agent_core.steer("t-r", "aside", "m1")
-    agent_core.steer("t-r", "replayed after consent", "m2", fresh=True)
-    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    turns.steer("t-r", "aside", "m1")
+    turns.steer("t-r", "replayed after consent", "m2", fresh=True)
+    mw = [m for m in core._middleware() if getattr(m, "name", "") == "steering"][0]
     out = mw.before_model({"messages": []}, _runtime("t-r"))
     assert [m.content for m in out["messages"]] == ["aside"]
-    assert [q[:3] for q in agent_core._pending_steer["t-r"]] == [("replayed after consent", "m2", True)]
+    assert [q[:3] for q in turns._pending_steer["t-r"]] == [("replayed after consent", "m2", True)]
     _fresh_claims()
 
 
@@ -2130,20 +2145,20 @@ def test_the_claim_holder_repairs_its_own_thread():
     from langgraph.checkpoint.memory import InMemorySaver
     from langchain_core.messages import AIMessage as _AI
     _fresh_claims()
-    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]), tools=[],
-                                    checkpointer=InMemorySaver(),
-                                    middleware=agent_core._middleware()[:2])
+    graph = core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]), tools=[],
+                              checkpointer=InMemorySaver(),
+                              middleware=core._middleware()[:2])
     cfg = {"configurable": {"thread_id": "t-rep"}}
-    agent_core._run(graph.aupdate_state(cfg, {"messages": [
+    turns._run(graph.aupdate_state(cfg, {"messages": [
         HumanMessage("q"),
         _AI(content="", tool_calls=[{"name": "t", "args": {}, "id": "lost", "type": "tool_call"}]),
         HumanMessage("asked again")]}, as_node="model"))
-    agent_core.try_claim("t-rep", "lark")
+    turns.try_claim("t-rep", "lark")
     try:
-        assert agent_core._run(agent_core._arepair_interrupted_turn(graph, cfg)) == 0
-        assert agent_core._run(agent_core._arepair_interrupted_turn(graph, cfg, own_claim=True)) == 1
+        assert turns._run(sessions._arepair_interrupted_turn(graph, cfg)) == 0
+        assert turns._run(sessions._arepair_interrupted_turn(graph, cfg, own_claim=True)) == 1
     finally:
-        agent_core.release("t-rep")
+        turns.release("t-rep")
 
 
 def test_the_card_says_when_the_thread_is_being_summarised():
@@ -2165,43 +2180,43 @@ def test_a_summary_inside_a_turn_tells_that_turns_card_start_and_end():
     when a summary is being written, and nothing when the threshold check passes."""
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
     from langgraph.checkpoint.memory import InMemorySaver
-    middleware = agent_core._summarization(FakeListChatModel(responses=["a summary"]),
+    summariser = middleware._summarization(FakeListChatModel(responses=["a summary"]),
                                            trigger=("messages", 3), keep=("messages", 1))
-    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]), tools=[],
-                                    checkpointer=InMemorySaver(), middleware=[middleware])
+    graph = core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]), tools=[],
+                              checkpointer=InMemorySaver(), middleware=[summariser])
     cfg = {"configurable": {"thread_id": "t-sum"}}
     card = mock.Mock()
-    agent_core._turn_cards["t-sum"] = card
+    turns._turn_cards["t-sum"] = card
 
     async def turn(text):
         async for _ in graph.astream({"messages": [HumanMessage(text)]}, config=cfg,
                                      stream_mode="messages"):
             pass
     try:
-        agent_core._run(turn("one"))                 # below the trigger: no summary
+        turns._run(turn("one"))                 # below the trigger: no summary
         assert card.compacting.call_args_list == []
-        agent_core._run(turn("two"))                 # past it: one summary
+        turns._run(turn("two"))                 # past it: one summary
         assert [c.args for c in card.compacting.call_args_list] == [(True,), (False,)]
     finally:
-        agent_core._turn_cards.pop("t-sum", None)
+        turns._turn_cards.pop("t-sum", None)
 
 
 def test_a_broken_card_cannot_cost_the_summary():
     """The status signal runs inside the summariser; anything it raises would be read as a
     failed summary and skip the compaction."""
-    agent_core._turn_cards["t-broken"] = object()          # no compacting() at all
+    turns._turn_cards["t-broken"] = object()          # no compacting() at all
     try:
         with mock.patch("langgraph.config.get_config",
                         return_value={"configurable": {"thread_id": "t-broken"}}):
-            agent_core._turn_status("compacting", True)     # must not raise
+            middleware._turn_status("compacting", True)     # must not raise
     finally:
-        agent_core._turn_cards.pop("t-broken", None)
+        turns._turn_cards.pop("t-broken", None)
 
 
 def test_compacting_outside_a_turn_is_quiet():
     """/compact summarises outside any graph run; that is expected, not worth a traceback."""
-    with mock.patch.object(agent_core.log, "warning") as warned:
-        agent_core._turn_status("compacting", True)
+    with mock.patch.object(middleware.log, "warning") as warned:
+        middleware._turn_status("compacting", True)
     assert not warned.called
 
 
@@ -2209,13 +2224,13 @@ def test_a_turn_unregisters_its_card_even_when_it_fails():
     card = mock.Mock(open=mock.Mock(return_value=True))
     session = {"graph": object(), "config": {"configurable": {"thread_id": "t-fail-card"}},
                "tool_texts": []}
-    with mock.patch.object(agent_core.lark_notify, "StreamingCard", return_value=card), \
-         mock.patch.object(agent_core, "_iter_deltas", side_effect=RuntimeError("boom")):
+    with mock.patch.object(lark_card, "StreamingCard", return_value=card), \
+         mock.patch.object(lark, "_iter_deltas", side_effect=RuntimeError("boom")):
         try:
-            agent_core._stream_to_chat(session, "hi", "oc_1")
+            lark._stream_to_chat(session, "hi", "oc_1")
         except RuntimeError:
             pass
-    assert "t-fail-card" not in agent_core._turn_cards
+    assert "t-fail-card" not in turns._turn_cards
 
 
 def test_the_sync_path_judges_consent_on_this_turns_tool_results_only():
@@ -2237,8 +2252,8 @@ def test_the_sync_path_judges_consent_on_this_turns_tool_results_only():
 
     session = {"graph": _Graph(), "config": {"configurable": {"thread_id": "t-sync"}},
                "tool_texts": [], "consent": {}, "tool_idp": {}}
-    with mock.patch.object(agent_core, "_get_session", return_value=session):
-        out = agent_core.chat_result("lark:ou_x", "today's question", mem_sid="t-sync")
+    with mock.patch.object(sessions, "_get_session", return_value=session):
+        out = lark.chat_result("lark:ou_x", "today's question", mem_sid="t-sync")
     assert session["tool_texts"] == [], "an old tool result leaked into this turn"
     assert out == {"reply": "fresh answer", "needs_auth": False}
 
@@ -2246,7 +2261,7 @@ def test_the_sync_path_judges_consent_on_this_turns_tool_results_only():
 def test_images_are_attached_before_anything_downstream_can_see_them():
     """First in the chain on purpose: summarisation runs on the placeholders, never on
     the bytes, and its token counter charges a flat 85 per image regardless of size."""
-    assert [type(m).__name__ for m in agent_core._middleware()][0] == "ImageMiddleware"
+    assert [type(m).__name__ for m in core._middleware()][0] == "ImageMiddleware"
 
 
 def test_summarisation_rewrites_state_so_the_checkpoint_shrinks():
@@ -2262,19 +2277,19 @@ def test_summarisation_rewrites_state_so_the_checkpoint_shrinks():
 def test_the_summariser_sees_the_whole_slice_and_stays_off_the_chat():
     """The library trims to 4,000 tokens by default, which an agentic tail cannot fit;
     and the summary call runs inside the graph, so untagged it streams like an answer."""
-    mw = [m for m in agent_core._middleware()
+    mw = [m for m in core._middleware()
           if type(m).__name__ == "SummarizationMiddleware"][0]
     assert mw.trim_tokens_to_summarize is None
     assert "nostream" in mw.model.tags
     assert mw.model.metadata.get("emit-messages") is False
-    assert mw.model.timeout == agent_core._SUMMARY_TIMEOUT
+    assert mw.model.timeout == middleware._SUMMARY_TIMEOUT
 
 
 def test_the_turn_model_outlasts_a_silent_tool_call():
     """A model can go quiet for over a minute while it writes one large tool argument;
     the read timeout must outlast that, while a dead connection still fails to connect fast."""
-    client = agent_core._model.client
-    assert client.meta.config.read_timeout == agent_core._MODEL_READ_TIMEOUT >= 300
+    client = core._model.client
+    assert client.meta.config.read_timeout == core._MODEL_READ_TIMEOUT >= 300
     assert client.meta.config.connect_timeout == 60
 
 
@@ -2312,12 +2327,12 @@ def _agentic_history(results: int = 3, chars: int = 30_000) -> list:
 def _summarising_session(summary_model, answer="the answer"):
     """A real graph with the production summariser and steering, over a seeded thread."""
     from langgraph.checkpoint.memory import InMemorySaver
-    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        base = agent_core._middleware()                 # images, steering, clock
-    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 1000), \
-         mock.patch.object(agent_core, "_SUMMARIZE_KEEP", 2):
-        summariser = agent_core._summarization(summary_model)
-    graph = agent_core.create_agent(
+    with mock.patch.object(middleware, "_SUMMARIZE_AT_TOKENS", 0):
+        base = core._middleware()                 # images, steering, clock
+    with mock.patch.object(middleware, "_SUMMARIZE_AT_TOKENS", 1000), \
+         mock.patch.object(middleware, "_SUMMARIZE_KEEP", 2):
+        summariser = middleware._summarization(summary_model)
+    graph = core.create_agent(
         model=_ScriptedModel(turns=[{"text": [answer]}]), tools=[_dummy_tool],
         middleware=base + [summariser], checkpointer=InMemorySaver())
     thread = f"t{next(_thread_seq)}"
@@ -2334,23 +2349,23 @@ def test_a_tool_heavy_thread_is_really_summarised_and_none_of_it_reaches_the_car
     session, _ = _summarising_session(summary)
     card = FakeCard()
     with _patch_notify(card, []):
-        text = agent_core._stream_to_chat(session, "next question", "oc_1")
+        text = lark._stream_to_chat(session, "next question", "oc_1")
     assert text == "the answer"
     assert all("SUMMARY" not in u and "Here is a summary" not in u for u in card.updates)
     head = session["graph"].get_state(session["config"]).values["messages"][0]
-    assert agent_core._is_summary(head)
+    assert middleware._is_summary(head)
     assert summary.calls >= 1
     assert "SUMMARY-OF-EARLIER-WORK" in head.content
-    assert agent_core._SUMMARY_FALLBACK not in head.content
+    assert middleware._SUMMARY_FALLBACK not in head.content
 
 
 def test_a_steered_message_is_not_echoed_onto_the_card():
     """Steering writes a HumanMessage from a node, which the stream replays."""
     session, thread = _summarising_session(_SummaryModel(tags=["nostream"]))
-    agent_core.steer(thread, "STEERED-IN")
+    turns.steer(thread, "STEERED-IN")
     card = FakeCard()
     with _patch_notify(card, []):
-        text = agent_core._stream_to_chat(session, "next question", "oc_1")
+        text = lark._stream_to_chat(session, "next question", "oc_1")
     assert "STEERED-IN" not in text
 
 
@@ -2367,11 +2382,11 @@ def test_a_failed_summary_keeps_the_history_instead_of_replacing_it(outcome):
     """Applying the fallback line is what deleted 114 messages; an exception would fail
     the turn and every one after it. Either way the thread is left as it was."""
     import asyncio
-    mw = agent_core._summarization(_SummaryModel())
+    mw = middleware._summarization(_SummaryModel())
     base = type(mw).__mro__[1]
     if outcome == "fallback":
         patch = mock.patch.object(base, "abefore_model", mock.AsyncMock(
-            return_value=_summary_update(agent_core._SUMMARY_FALLBACK)))
+            return_value=_summary_update(middleware._SUMMARY_FALLBACK)))
     else:
         patch = mock.patch.object(base, "abefore_model",
                                   mock.AsyncMock(side_effect=RuntimeError("throttled")))
@@ -2381,7 +2396,7 @@ def test_a_failed_summary_keeps_the_history_instead_of_replacing_it(outcome):
 
 def test_a_real_summary_is_applied():
     import asyncio
-    mw = agent_core._summarization(_SummaryModel())
+    mw = middleware._summarization(_SummaryModel())
     update = _summary_update("what happened so far")
     with mock.patch.object(type(mw).__mro__[1], "abefore_model",
                            mock.AsyncMock(return_value=update)):
@@ -2392,8 +2407,8 @@ def test_the_transcript_shows_the_summary_as_a_note_not_as_the_user():
     head = _summary_update("what happened so far")["messages"][1]
     tup = mock.Mock(checkpoint={"channel_values": {"messages": [head, HumanMessage("hi")]}})
     saver = mock.Mock(aget_tuple=mock.AsyncMock(return_value=tup))
-    with mock.patch.object(agent_core, "_checkpointer", return_value=saver):
-        roles = [m["role"] for m in agent_core.transcript("lark:ou_x")["messages"]]
+    with mock.patch.object(sessions, "_checkpointer", return_value=saver):
+        roles = [m["role"] for m in sessions.transcript("lark:ou_x")["messages"]]
     assert roles == ["summary", "user"]
 
 
@@ -2402,7 +2417,7 @@ def test_the_transcript_shows_the_summary_as_a_note_not_as_the_user():
 # nothing it sends can name a user: threadId decides whose conversation and whose files.
 
 def test_agui_requests_are_told_apart_from_the_router_protocol():
-    import agui
+    from channels import agui
     assert agui.is_agui_request({"threadId": "t", "messages": []}) is True
     assert agui.is_agui_request({"runId": "r"}) is True
     # The router always sends an action, even alongside a thread id.
@@ -2413,7 +2428,8 @@ def test_agui_requests_are_told_apart_from_the_router_protocol():
 def test_the_page_is_sent_only_what_it_renders():
     """Snapshots repeat the whole thread and raw events the whole LangGraph payload: a few
     large tool results made one turn's stream 12 MB, which the browser dropped."""
-    import agui, json as _j
+    from channels import agui
+    import json as _j
     from ag_ui.core.events import (EventType, MessagesSnapshotEvent, StateSnapshotEvent,
                                    TextMessageContentEvent, ToolCallResultEvent)
     big = "x" * 100_000
@@ -2431,7 +2447,7 @@ def test_the_page_is_sent_only_what_it_renders():
 def test_the_pages_run_input_is_accepted_with_the_sessions_thread():
     """The shape webui/index.html sends, through the real RunAgentInput: a field it carries
     and we also set must be replaced, not passed twice (TypeError on every web turn)."""
-    import agui
+    from channels import agui
     from ag_ui.core.types import RunAgentInput
     page = {"actorId": "web:s-1", "memorySessionId": "sess-x", "runId": "r-1",
             "threadId": "resolved-by-agent", "messages": [{"id": "m-1", "role": "user",
@@ -2444,7 +2460,8 @@ def test_the_pages_run_input_is_accepted_with_the_sessions_thread():
 def test_a_web_turn_may_take_as_many_steps_as_a_lark_turn():
     """The AG-UI adapter fills an unset recursion limit with langchain_core's 25, where a Lark
     turn keeps LangGraph's own default; a dozen tool calls must not end a web turn."""
-    import agui, asyncio
+    from channels import agui
+    import asyncio
     from typing import Annotated, TypedDict
     from ag_ui.core.types import RunAgentInput
     from ag_ui_langgraph import LangGraphAgent
@@ -2464,8 +2481,8 @@ def test_a_web_turn_may_take_as_many_steps_as_a_lark_turn():
     run = RunAgentInput(**agui._run_input_fields(
         {"runId": "r-1", "messages": [{"id": "m-1", "role": "user", "content": "hi"}],
          "tools": [], "context": [], "state": {}, "forwardedProps": {}}, "sess-x"))
-    adapter = LangGraphAgent(name="t", graph=graph, config=agent_core._run_config(
-        session, agent_core.delivery.NoDelivery("test")))
+    adapter = LangGraphAgent(name="t", graph=graph, config=turns._run_config(
+        session, delivery.NoDelivery("test")))
 
     async def events():
         return [e async for e in adapter.run(run)]
@@ -2476,7 +2493,8 @@ def test_a_web_turn_may_take_as_many_steps_as_a_lark_turn():
 def test_a_web_turn_stops_at_a_tool_that_needs_a_grant():
     """As a Lark turn does: the model must not go on to narrate a refusal that is certain,
     and the page gets the consent prompt and a finished run."""
-    import agui, asyncio
+    from channels import agui
+    import asyncio
     from types import SimpleNamespace as E
     reached = []
 
@@ -2498,7 +2516,7 @@ def test_a_web_turn_stops_at_a_tool_that_needs_a_grant():
 
     session = {"mem_sid": "sess-x", "graph": None, "config": {"configurable": {}},
                "tool_idp": {"lark_docs": "lark"}, "consent": {"lark": ""}}
-    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+    with mock.patch.object(sessions, "aget_session", mock.AsyncMock(return_value=session)), \
          mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
          mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
          mock.patch.object(agui.web, "StreamResponse", Resp):
@@ -2508,12 +2526,13 @@ def test_a_web_turn_stops_at_a_tool_that_needs_a_grant():
     assert frames[:2] == ["RUN_STARTED", "TEXT_MESSAGE_CONTENT"]
     assert json.loads(frames[2]) == {"type": "CUSTOM", "name": "consent", "value": {"idp": "lark"}}
     assert json.loads(frames[3])["type"] == "RUN_FINISHED" and len(frames) == 4
-    assert reached == [] and agent_core.try_claim("sess-x", "web") is None
-    agent_core.release("sess-x")
+    assert reached == [] and turns.try_claim("sess-x", "web") is None
+    turns.release("sess-x")
 
 
 def test_a_file_the_run_sends_reaches_the_page_on_that_runs_stream():
-    import agui, asyncio
+    from channels import agui
+    import asyncio
     from types import SimpleNamespace as E
 
     class Run:
@@ -2535,7 +2554,7 @@ def test_a_file_the_run_sends_reaches_the_page_on_that_runs_stream():
 
     session = {"mem_sid": "sess-f", "graph": None, "config": {"configurable": {}},
                "tool_idp": {}, "consent": {}}
-    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+    with mock.patch.object(sessions, "aget_session", mock.AsyncMock(return_value=session)), \
          mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
          mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
          mock.patch.object(agui.web, "StreamResponse", Resp):
@@ -2550,7 +2569,7 @@ def test_a_file_the_run_sends_reaches_the_page_on_that_runs_stream():
     sent = sent[0]
     assert sent["name"] == "file" and sent["value"]["name"] == "chart.png"
     assert base64.b64decode(sent["value"]["data"]) == b"png!"
-    agent_core.release("sess-f")
+    turns.release("sess-f")
 
 
 class _CapturedResp:
@@ -2564,31 +2583,32 @@ class _CapturedResp:
 
 
 def test_a_message_steers_into_its_own_surfaces_turn_and_only_that():
-    agent_core._pending_steer.clear()
-    assert agent_core.claim_or_steer("t-cs", "web", "web:tab-a", "first") is None
+    turns._pending_steer.clear()
+    assert turns.claim_or_steer("t-cs", "web", "web:tab-a", "first") is None
     try:
-        assert agent_core.claim_or_steer("t-cs", "web", "web:tab-a", "also this", "m2") == "steered"
+        assert turns.claim_or_steer("t-cs", "web", "web:tab-a", "also this", "m2") == "steered"
         # Another tab, a reload or another device would have the answer stream into this one.
-        assert agent_core.claim_or_steer("t-cs", "web", "web:tab-b", "from b") == "web-other"
-        assert agent_core.claim_or_steer("t-cs", "web", "", "no stream id") == "web-other"
-        assert agent_core.claim_or_steer("t-cs", "lark", "oc_1", "from lark") == "web"
-        assert [q[:2] for q in agent_core._pending_steer["t-cs"]] == [("also this", "m2")]
+        assert turns.claim_or_steer("t-cs", "web", "web:tab-b", "from b") == "web-other"
+        assert turns.claim_or_steer("t-cs", "web", "", "no stream id") == "web-other"
+        assert turns.claim_or_steer("t-cs", "lark", "oc_1", "from lark") == "web"
+        assert [q[:2] for q in turns._pending_steer["t-cs"]] == [("also this", "m2")]
         # Taken as a continuation, the thread stays claimed; with nothing left it is freed.
-        assert [q[0] for q in agent_core.take_steer_or_release("t-cs")] == ["also this"]
-        assert agent_core.thread_owner("t-cs") == "web"
-        assert agent_core.take_steer_or_release("t-cs") == []
-        assert agent_core.thread_owner("t-cs") is None
+        assert [q[0] for q in turns.take_steer_or_release("t-cs")] == ["also this"]
+        assert turns.thread_owner("t-cs") == "web"
+        assert turns.take_steer_or_release("t-cs") == []
+        assert turns.thread_owner("t-cs") is None
     finally:
-        agent_core.release("t-cs")
+        turns.release("t-cs")
 
 
 def test_a_message_sent_from_the_page_mid_turn_joins_it_and_is_answered_below():
     """As in Lark chat: what the page sends while its turn runs is not refused as busy. Too
     late for the running model call, it is answered as a continuation on the same stream,
     marked so the page starts the reply under that message."""
-    import agui, asyncio
+    from channels import agui
+    import asyncio
     from types import SimpleNamespace as E
-    agent_core._pending_steer.clear()
+    turns._pending_steer.clear()
     inputs = []
 
     class Run:
@@ -2619,7 +2639,7 @@ def test_a_message_sent_from_the_page_mid_turn_joins_it_and_is_answered_below():
     page = {"actorId": "web:s-1", "memorySessionId": "sess-st",
             "forwardedProps": {"streamId": "tab-a"}}
     resp = _CapturedResp()
-    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+    with mock.patch.object(sessions, "aget_session", mock.AsyncMock(return_value=session)), \
          mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
          mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
          mock.patch.object(agui.web, "StreamResponse", lambda **kw: resp):
@@ -2629,26 +2649,27 @@ def test_a_message_sent_from_the_page_mid_turn_joins_it_and_is_answered_below():
     assert inputs == [["first"], ["also this"]]
     assert frames[:2] == ["RUN_STARTED", "RUN_FINISHED"] and frames[-1] == "RUN_FINISHED"
     assert json.loads(frames[2])["name"] == "steered" and frames[3] == "RUN_STARTED"
-    assert agent_core.thread_owner("sess-st") is None and "sess-st" not in agent_core._turn_cards
+    assert turns.thread_owner("sess-st") is None and "sess-st" not in turns._turn_cards
 
 
 def test_a_message_steered_into_a_turn_that_stops_for_consent_is_reported_not_lost():
-    import agui, asyncio
+    from channels import agui
+    import asyncio
     from types import SimpleNamespace as E
-    agent_core._pending_steer.clear()
+    turns._pending_steer.clear()
 
     class Run:
         def __init__(self, **kw): pass
 
         async def run(self, _input):
             yield E(type="RUN_STARTED")
-            assert agent_core.claim_or_steer("sess-w", "web", "web:tab-a", "also", "m2") == "steered"
+            assert turns.claim_or_steer("sess-w", "web", "web:tab-a", "also", "m2") == "steered"
             yield E(type="TOOL_CALL_START", tool_call_id="t1", tool_call_name="lark_docs")
 
     session = {"mem_sid": "sess-w", "graph": None, "config": {"configurable": {}},
                "tool_idp": {"lark_docs": "lark"}, "consent": {"lark": ""}}
     resp = _CapturedResp()
-    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+    with mock.patch.object(sessions, "aget_session", mock.AsyncMock(return_value=session)), \
          mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
          mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
          mock.patch.object(agui.web, "StreamResponse", lambda **kw: resp):
@@ -2657,76 +2678,79 @@ def test_a_message_steered_into_a_turn_that_stops_for_consent_is_reported_not_lo
                                        "messages": []}, ""))
     marks = [json.loads(f) for f in resp.frames() if f.startswith("{")]
     assert {"type": "CUSTOM", "name": "unanswered", "value": {"count": 1}} in marks
-    assert agent_core.thread_owner("sess-w") is None
+    assert turns.thread_owner("sess-w") is None
 
 
 def test_a_web_run_never_releases_a_claim_it_no_longer_holds():
     """The run releases in the same step as finding nothing left; releasing again when the
     producer ends could free a turn that claimed the thread in between."""
-    import agui
+    from channels import agui
     state = {"released": True}
-    agent_core._track(+1, "sess-r", "lark", "oc_1")      # someone else's turn, meanwhile
+    turns._track(+1, "sess-r", "lark", "oc_1")      # someone else's turn, meanwhile
     try:
         assert agui._end("sess-r", agui._PageMarks([]), state) == []
-        assert agent_core.thread_owner("sess-r") == "lark"
+        assert turns.thread_owner("sess-r") == "lark"
     finally:
-        agent_core.release("sess-r")
+        turns.release("sess-r")
 
 
 def test_a_delivered_file_is_stored_under_its_owner_and_only_media_is_shown_inline():
-    import deliveries, hashlib
+    from channels import web_files
+    import hashlib
     s3 = mock.Mock()
     s3.generate_presigned_url.side_effect = lambda op, ExpiresIn, Params: f"https://s/{Params['Key']}"
-    with mock.patch.object(deliveries, "_BUCKET", "b"), mock.patch.object(deliveries, "_s3", return_value=s3):
-        key = deliveries.put("web:s-1", "../chart.png", b"x")
+    with mock.patch.object(web_files, "_BUCKET", "b"), mock.patch.object(web_files, "_s3", return_value=s3):
+        key = web_files.put("web:s-1", "../chart.png", b"x")
         owner = hashlib.sha256(b"web:s-1").hexdigest()[:32]
         assert key.startswith(f"deliveries/{owner}/") and key.endswith("/chart.png")
         put = s3.put_object.call_args.kwargs
         assert put["ContentType"] == "image/png" and put["ContentDisposition"].startswith("inline")
-        deliveries.put("web:s-1", "clip.mp4", b"x")
+        web_files.put("web:s-1", "clip.mp4", b"x")
         mp4 = s3.put_object.call_args.kwargs
         assert mp4["ContentType"] == "video/mp4" and mp4["ContentDisposition"].startswith("inline")
-        deliveries.put("web:s-1", "page.svg", b"<svg/>")
+        web_files.put("web:s-1", "page.svg", b"<svg/>")
         svg = s3.put_object.call_args.kwargs
         assert svg["ContentType"] == "application/octet-stream"
         assert svg["ContentDisposition"].startswith("attachment")
-        assert deliveries.url(key, "chart.png", "web:s-1") == f"https://s/{key}"
+        assert web_files.url(key, "chart.png", "web:s-1") == f"https://s/{key}"
         # Only this actor's own deliveries are signed or deleted.
-        assert deliveries.url(key, "chart.png", "web:someone-else") == ""
-        assert deliveries.url("state/x", "x.png", "web:s-1") == ""
-        assert deliveries.delete(["state/x", key, key], "web:s-1") == 1
-        assert deliveries.delete([key], "web:someone-else") == 0
+        assert web_files.url(key, "chart.png", "web:someone-else") == ""
+        assert web_files.url("state/x", "x.png", "web:s-1") == ""
+        assert web_files.delete(["state/x", key, key], "web:s-1") == 1
+        assert web_files.delete([key], "web:someone-else") == 0
 
 
 def test_the_history_shows_a_delivered_file_again_and_clear_removes_it():
     from langchain_core.messages import AIMessage as _AI, ToolMessage as _Tool
     from langgraph.checkpoint.memory import InMemorySaver
     saver = InMemorySaver()
-    graph = agent_core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]),
-                                    tools=[_dummy_tool], checkpointer=saver)
+    graph = core.create_agent(model=_ScriptedModel(turns=[{"text": ["ok"]}]),
+                              tools=[_dummy_tool], checkpointer=saver)
     cfg = {"configurable": {"thread_id": "t-files"}}
     sent = {"file": {"key": "deliveries/o/u/chart.png", "name": "chart.png", "size": 3}}
-    agent_core._run(graph.aupdate_state(cfg, {"messages": [
+    turns._run(graph.aupdate_state(cfg, {"messages": [
         HumanMessage("chart please", id="h1"),
         _AI(content="", id="a1", tool_calls=[{"name": "deliver_file", "args": {}, "id": "c1",
                                               "type": "tool_call"}]),
         _Tool(content="Sent chart.png to the page", tool_call_id="c1", artifact=sent),
         _AI(content="here it is", id="a2")]}, as_node="model"))
-    with mock.patch.object(agent_core, "_checkpointer", return_value=saver), \
-         mock.patch.object(agent_core, "_thread_config", return_value=cfg), \
-         mock.patch.object(agent_core.deliveries, "url", return_value="https://fresh") as url, \
-         mock.patch.object(agent_core.deliveries, "delete") as delete:
-        files = [m for m in agent_core.transcript("web:s-1")["messages"] if m["role"] == "file"]
+    with mock.patch.object(sessions, "_checkpointer", return_value=saver), \
+         mock.patch.object(sessions, "_thread_config", return_value=cfg), \
+         mock.patch.object(web_files, "url", return_value="https://fresh") as url, \
+         mock.patch.object(web_files, "delete") as delete:
+        files = [m for m in sessions.transcript("web:s-1")["messages"] if m["role"] == "file"]
         assert files == [{"role": "file", "name": "chart.png", "size": 3, "url": "https://fresh"}]
         url.assert_called_once_with("deliveries/o/u/chart.png", "chart.png", "web:s-1")
-        assert agent_core.clear_history("web:s-1")["deleted"] is True
+        assert sessions.clear_history("web:s-1")["deleted"] is True
         assert delete.call_args.args[0][0] == "deliveries/o/u/chart.png"
         assert delete.call_args.args[1] == "web:s-1"
 
 
 def test_a_picture_from_the_page_is_seen_on_its_turn_and_kept_as_a_placeholder():
     """As a Lark picture is: inlined into the checkpoint it would be re-billed on every turn."""
-    import agui, asyncio, io
+    from channels import agui
+    import asyncio
+    import io
     from types import SimpleNamespace as E
     from PIL import Image
     buf = io.BytesIO(); Image.new("RGB", (4, 4), "red").save(buf, format="PNG")
@@ -2739,52 +2763,53 @@ def test_a_picture_from_the_page_is_seen_on_its_turn_and_kept_as_a_placeholder()
         async def run(self, run_input):
             m = run_input.messages[-1]
             seen["message"] = (m.id, m.content)
-            seen["pixels"] = agent_core.images.pixels_for("sess-img")
-            seen["handles"] = agent_core.images.handles_for("sess-img")
+            seen["pixels"] = images.pixels_for("sess-img")
+            seen["handles"] = images.handles_for("sess-img")
             yield E(type="RUN_STARTED")
             yield E(type="RUN_FINISHED")
 
     session = {"mem_sid": "sess-img", "graph": None, "config": {"configurable": {}},
                "tool_idp": {}, "consent": {}}
-    with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
+    with mock.patch.object(sessions, "aget_session", mock.AsyncMock(return_value=session)), \
          mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
          mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
          mock.patch.object(agui.web, "StreamResponse", lambda **kw: _CapturedResp()):
         asyncio.run(agui.handle(None, {"actorId": "web:s-1", "memorySessionId": "sess-img",
                                        "runId": "r", "messages": [{"id": "page-1", "role": "user",
-            "content": [{"type": "text", "text": "what is this"},
-                        {"type": "image", "source": {"type": "data", "value": png,
-                                                     "mimeType": "image/png"}}]}]}, ""))
+                                                                   "content": [{"type": "text", "text": "what is this"},
+                                                                               {"type": "image", "source": {"type": "data", "value": png,
+                                                                                                            "mimeType": "image/png"}}]}]}, ""))
     mid, content = seen["message"]
     assert content == "what is this\n[image 1: image-1.png]" and mid.startswith("msg-")
     assert [b["type"] for b in seen["pixels"][mid]] == ["image"]
     assert seen["handles"][0]["data"] == buf.getvalue()          # save_attachment's source
-    assert agent_core.images.pixels_for("sess-img") == {}         # gone with the turn
+    assert images.pixels_for("sess-img") == {}         # gone with the turn
 
 
 def test_a_picture_the_model_cannot_read_is_kept_but_not_shown_to_it():
     """Labelled as a jpeg, an unreadable picture would make Bedrock refuse the whole turn."""
-    text, handles, blocks = agent_core.images.from_page([
+    text, handles, blocks = images.from_page([
         {"type": "text", "text": "look"},
         {"type": "image", "source": {"type": "data", "value": base64.b64encode(b"not an image").decode(),
                                      "mimeType": "image/heic"}}])
     assert text == "look" and blocks == [] and handles[0]["name"] == "image-1.heic"
-    marks, _ = agent_core.images.register("t-heic", handles, blocks)
+    marks, _ = images.register("t-heic", handles, blocks)
     assert "not a picture the model can read" in marks and "save_attachment" in marks
-    agent_core.images.end_turn("t-heic")
+    images.end_turn("t-heic")
 
 
 def test_a_web_run_stamps_an_unanswered_message_only_when_it_ended_without_a_reply():
     """Stopped at a wall, or failed: stamped with that run's own message's arrival, while the
     claim is held. A run that replied is left to the clock and costs no extra read."""
-    import agui, asyncio
+    from channels import agui
+    import asyncio
     from types import SimpleNamespace as E
-    agent_core._pending_steer.clear()
+    turns._pending_steer.clear()
     stamped, owners = [], []
 
     async def fake_stamp(graph, config, at_ms):
         stamped.append(at_ms)
-        owners.append(agent_core.thread_owner("sess-sm"))
+        owners.append(turns.thread_owner("sess-sm"))
         return 1
 
     def run_with(script):
@@ -2800,8 +2825,8 @@ def test_a_web_run_stamps_an_unanswered_message_only_when_it_ended_without_a_rep
         session = {"mem_sid": "sess-sm", "graph": object(), "config": {"configurable": {}},
                    "tool_idp": {"lark_docs": "lark"}, "consent": {"lark": ""}}
         stamped.clear(); owners.clear()
-        with mock.patch.object(agent_core, "aget_session", mock.AsyncMock(return_value=session)), \
-             mock.patch.object(agent_core, "astamp_unanswered", fake_stamp), \
+        with mock.patch.object(sessions, "aget_session", mock.AsyncMock(return_value=session)), \
+             mock.patch.object(sessions, "astamp_unanswered", fake_stamp), \
              mock.patch("ag_ui_langgraph.LangGraphAgent", Run), \
              mock.patch.object(agui, "_sse", lambda e: f"data: {e.type}\n\n".encode()), \
              mock.patch.object(agui.web, "StreamResponse", lambda **kw: _CapturedResp()):
@@ -2823,18 +2848,18 @@ def test_a_web_run_stamps_an_unanswered_message_only_when_it_ended_without_a_rep
     def steer():
         time.sleep(0.01)       # so the steered message arrives measurably after the first
         sent["ms"] = int(time.time() * 1000)
-        agent_core.steer("sess-sm", "also", "m2")
+        turns.steer("sess-sm", "also", "m2")
     at, held = run_with([[E(type="RUN_STARTED"), steer, E(type="RUN_FINISHED")],
                          [E(type="RUN_STARTED"),
                           E(type="TOOL_CALL_START", tool_call_id="t", tool_call_name="lark_docs")]])
     assert held == ["web"] and len(at) == 1 and at[0] >= sent["ms"]
-    assert agent_core.thread_owner("sess-sm") is None
+    assert turns.thread_owner("sess-sm") is None
 
 
 def test_a_refused_tool_on_the_page_ends_the_run_with_a_consent_prompt():
     """The page gets the system to authorise, not a link: it mints one through /auth when the
     user clicks, with the token it will complete with."""
-    import agui
+    from channels import agui
     session = {"tool_texts": [("google_whoami", "no user token (authorize first)")],
                "tool_idp": {"google_whoami": "google"}, "consent": {"google": ""}}
     event = json.loads(agui._consent(session).decode()[len("data: "):])
@@ -2846,9 +2871,10 @@ def test_agui_takes_its_thread_from_the_session_not_the_pages_thread_id():
     """AG-UI's own threadId is the page's to choose, so it is replaced by the session's —
     which is built on the page's memorySessionId only after server.py checked it belongs to
     the verified actor."""
-    import agui, inspect
+    from channels import agui
+    import inspect
     src = inspect.getsource(agui.handle)
-    assert 'thread_id = payload.get("memorySessionId") or agent_core.thread_for(actor_id)' in src
+    assert 'thread_id = payload.get("memorySessionId") or sessions.thread_for(actor_id)' in src
     assert "_pictures_handed_over, payload, thread_id)" in src and "_run_input_fields(handed, thread_id)" in src
     assert agui._run_input_fields({"threadId": "theirs"}, "ours")["threadId"] == "ours"
 
@@ -2863,7 +2889,9 @@ _POOL_ISSUER = "https://cognito-idp.ap-northeast-1.amazonaws.com/pool-1"
 @pytest.fixture
 def _signer():
     """A key pair standing in for the pool's, and a way to mint tokens with it."""
-    import jwt as pyjwt, time as _t, caller
+    import jwt as pyjwt
+    import time as _t
+    from identity import caller
     from cryptography.hazmat.primitives.asymmetric import rsa
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     keys = mock.Mock()
@@ -2882,7 +2910,8 @@ def _signer():
 
 
 def test_a_web_users_account_comes_from_the_verified_token_and_nothing_else(_signer):
-    import caller, server
+    from identity import caller
+    import server
     web = _signer(client_id="web-client", username="carol@example.com", sub="s-carol")
     assert caller.identify([web]) == ("web:s-carol", "carol@example.com")
     assert caller.identify([_signer()]) == ("lark:ou_alice", "")     # Lark's comes from Lark
@@ -2894,21 +2923,22 @@ def test_a_web_users_account_comes_from_the_verified_token_and_nothing_else(_sig
 
 
 def test_whoami_says_how_they_signed_in_as_whom_and_what_they_granted():
-    with mock.patch.object(agent_core, "auth_status", return_value={
+    with mock.patch.object(grants, "auth_status", return_value={
             "lark": True, "google": False, "accounts": {"lark": "XUESONG"}}):
-        tool = agent_core._whoami_tool("web:s-carol", "wat")
+        tool = grants._whoami_tool("web:s-carol", "wat")
         out = json.loads(tool.invoke({}, config={"configurable": {"account": "carol@example.com"}}))
         assert out == {"signed_in_with": "the web page (its own sign-in)",
                        "account": "carol@example.com", "user_id": "web:s-carol",
                        "authorised": {"lark": "XUESONG"}, "not_authorised": ["google"]}
-        lark = json.loads(agent_core._whoami_tool("lark:ou_alice", "wat").invoke({}))
+        lark = json.loads(grants._whoami_tool("lark:ou_alice", "wat").invoke({}))
         assert lark["signed_in_with"] == "Lark" and lark["account"] == "XUESONG"
     # The account is never a parameter the model could fill in.
     assert "account" not in (tool.args or {})
 
 
 def test_the_actor_is_the_username_of_a_verified_access_token(_signer):
-    import caller, time as _t
+    from identity import caller
+    import time as _t
     from cryptography.hazmat.primitives.asymmetric import rsa
     assert caller.actor([_signer()]) == "lark:ou_alice"
     other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -2929,7 +2959,7 @@ def test_the_actor_is_the_username_of_a_verified_access_token(_signer):
 def test_the_issuing_client_decides_the_actors_namespace(_signer):
     """Cognito signs client_id, so a caller cannot choose it. A web user is `web:{sub}`, and
     the router's client yields only `lark:` actors, so a stray user of it is nobody."""
-    import caller
+    from identity import caller
     web = dict(client_id="web-client", sub="sub-carol")
     assert caller.actor([_signer(**web, username="carol@example.com")]) == "web:sub-carol"
     # A Lark user's own account signed in at the hosted login carries their sub: refused.
@@ -2947,8 +2977,8 @@ def _bind(headers, payload):
 
 
 def test_a_payload_may_only_agree_with_the_verified_caller(_signer):
-    import agent_core
-    alice = agent_core._session_id_for("lark:ou_alice")
+    from runtime import sessions
+    alice = sessions._session_id_for("lark:ou_alice")
     payload = {"action": "chat", "actorId": "lark:ou_alice", "userId": "user_abc",
                "memorySessionId": alice}
     assert _bind([("Authorization", _signer())], payload) is None
@@ -2968,28 +2998,28 @@ def test_a_payload_may_only_agree_with_the_verified_caller(_signer):
 def test_a_thread_is_honoured_only_under_the_callers_own_prefix(_signer):
     """The checkpoint is keyed by thread id alone and the default id is computable by
     anyone, so naming another user's thread under your own identity has to fail too."""
-    import agent_core
-    bob = agent_core._session_id_for("lark:ou_bob")
-    alice = agent_core._session_id_for("lark:ou_alice")
+    from runtime import sessions
+    bob = sessions._session_id_for("lark:ou_bob")
+    alice = sessions._session_id_for("lark:ou_alice")
     for thread in (bob, bob + "-0123456789ab", "sess-" + "0" * 32):
         r = _bind([("Authorization", _signer())], {"action": "clear_history",
                                                    "memorySessionId": thread})
         assert r is not None and r.status == 403, thread
-    assert agent_core.thread_belongs("lark:ou_alice", alice)
-    assert agent_core.thread_belongs("lark:ou_alice", alice + "-0123456789ab")
-    assert not agent_core.thread_belongs("lark:ou_alice", alice + "-xyz")
-    assert not agent_core.thread_belongs("lark:ou_alice", alice + "-0123456789abc")
+    assert sessions.thread_belongs("lark:ou_alice", alice)
+    assert sessions.thread_belongs("lark:ou_alice", alice + "-0123456789ab")
+    assert not sessions.thread_belongs("lark:ou_alice", alice + "-xyz")
+    assert not sessions.thread_belongs("lark:ou_alice", alice + "-0123456789abc")
 
 
 def test_a_turn_is_answered_only_into_a_chat_the_caller_is_in():
     """The bot's token reaches every chat the bot is in, so a verified caller naming some
     other chat — or another chat's message to pull a picture from — is refused."""
     import server
-    member = lambda chat, who: (chat, who) == ("oc_mine", "ou_alice")
+    member = lambda lark, who: (lark, who) == ("oc_mine", "ou_alice")
     chat_of = {"om_mine": "oc_mine", "om_theirs": "oc_theirs"}.get
-    with mock.patch.object(server.lark_notify, "in_chat", side_effect=member), \
-         mock.patch.object(server.lark_notify, "chat_of", side_effect=lambda m: chat_of(m, "")):
-        ok = lambda chat, imgs=(): server._chat_refusal("lark:ou_alice", chat, list(imgs))
+    with mock.patch.object(server.lark_card, "in_chat", side_effect=member), \
+         mock.patch.object(server.lark_card, "chat_of", side_effect=lambda m: chat_of(m, "")):
+        ok = lambda lark, imgs=(): server._chat_refusal("lark:ou_alice", lark, list(imgs))
         assert ok("oc_mine") == "" and ok("ou_alice") == ""
         assert ok("oc_theirs") == "foreign_chat" and ok("ou_bob") == "foreign_chat"
         assert ok("oc_mine", [{"message_id": "om_mine", "key": "k"}]) == ""
@@ -3003,35 +3033,37 @@ def test_a_turn_is_answered_only_into_a_chat_the_caller_is_in():
 def test_an_id_from_a_request_cannot_address_another_endpoint():
     """`messages/{id}?` is the recall endpoint, so a reaction id carrying `?` would have
     recalled any message the bot sent; a key carrying `../` would read another chat's."""
-    sys.path.insert(0, os.path.dirname(__file__))
-    import importlib, lark_notify
-    importlib.reload(lark_notify)
+    sys.path.insert(0, AGENT)
+    import importlib
+    from channels import lark_card
+    importlib.reload(lark_card)
     calls = []
-    with mock.patch.object(lark_notify, "_tenant_token", return_value="t"), \
-         mock.patch.object(lark_notify, "_call", side_effect=lambda *a, **k: calls.append(a) or {"code": 0}):
-        assert lark_notify.remove_reaction("om_victim?", "x") is False
-        assert lark_notify.remove_reaction("om_1", "../chats/oc_x") is False
-        assert lark_notify.remove_reaction("om_1", "ZCaCIjUBVVW-rm5L_3Z=") is True
+    with mock.patch.object(lark_card, "_tenant_token", return_value="t"), \
+         mock.patch.object(lark_card, "_call", side_effect=lambda *a, **k: calls.append(a) or {"code": 0}):
+        assert lark_card.remove_reaction("om_victim?", "x") is False
+        assert lark_card.remove_reaction("om_1", "../chats/oc_x") is False
+        assert lark_card.remove_reaction("om_1", "ZCaCIjUBVVW-rm5L_3Z=") is True
     assert len(calls) == 1
-    with mock.patch.object(lark_notify, "_tenant_token", return_value="t"):
-        with pytest.raises(lark_notify.LarkError):
-            lark_notify.fetch_message_resource("om_mine", "../../om_theirs/resources/img_x")
-    assert lark_notify.chat_of("om_1/../om_2") == ""
+    with mock.patch.object(lark_card, "_tenant_token", return_value="t"):
+        with pytest.raises(lark_card.LarkError):
+            lark_card.fetch_message_resource("om_mine", "../../om_theirs/resources/img_x")
+    assert lark_card.chat_of("om_1/../om_2") == ""
 
 
 def test_membership_is_read_from_lark_and_cached_only_when_true():
-    sys.path.insert(0, os.path.dirname(__file__))
-    import importlib, lark_notify
-    importlib.reload(lark_notify)
+    sys.path.insert(0, AGENT)
+    import importlib
+    from channels import lark_card
+    importlib.reload(lark_card)
     pages = [{"code": 0, "data": {"items": [{"member_id": "ou_x"}], "has_more": True,
                                   "page_token": "p2"}},
              {"code": 0, "data": {"items": [{"member_id": "ou_alice"}], "has_more": False}}]
-    with mock.patch.object(lark_notify, "_get", side_effect=pages) as get:
-        assert lark_notify.in_chat("oc_1", "ou_alice") is True
-        assert lark_notify.in_chat("oc_1", "ou_alice") is True      # cached
+    with mock.patch.object(lark_card, "_get", side_effect=pages) as get:
+        assert lark_card.in_chat("oc_1", "ou_alice") is True
+        assert lark_card.in_chat("oc_1", "ou_alice") is True      # cached
     assert get.call_count == 2
-    with mock.patch.object(lark_notify, "_get", return_value={"code": 1, "msg": "no"}):
-        assert lark_notify.in_chat("oc_2", "ou_alice") is False
+    with mock.patch.object(lark_card, "_get", return_value={"code": 1, "msg": "no"}):
+        assert lark_card.in_chat("oc_2", "ou_alice") is False
 
 
 def test_only_the_probes_go_without_a_bearer():
@@ -3058,23 +3090,23 @@ def test_github_without_a_grant_offers_one_tool_that_asks_for_it():
     async def fake_open(stack, connection):
         opened.append(connection)
         return [_make_tool("get_me"), _make_tool("list_branches")]
-    with mock.patch.dict(agent_core._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
+    with mock.patch.dict(grants._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
                          clear=True), \
-         mock.patch.object(agent_core.lark_3lo, "get_user_lark_token", return_value=("token", "lark")), \
-         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+         mock.patch.object(lark_3lo, "get_user_lark_token", return_value=("token", "lark")), \
+         mock.patch.object(lark_3lo, "mcp_connection_for",
                            side_effect=lambda tok, url="": {"url": url or "lark-mcp"}), \
-         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
-         mock.patch.object(agent_core.websearch, "available", return_value=False):
-        with mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value=""):
-            s = agent_core._build_session("lark:ou_x", "", "mem-gh1")
+         mock.patch.object(tools, "_aopen_tools", fake_open), \
+         mock.patch.object(web_search, "available", return_value=False):
+        with mock.patch.object(lark_3lo, "peek_user_token_for", return_value=""):
+            s = sessions._build_session("lark:ou_x", "", "mem-gh1")
         assert s["consent"]["github"] == "" and s["tool_idp"]["github"] == "github"
         assert all("gh/mcp" not in c.get("url", "") for c in opened)   # nothing to list yet
-        assert agent_core._walled_idp(s, "github") == "github"
+        assert grants._walled_idp(s, "github") == "github"
         opened.clear()
-        with mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value="gho_tok"), \
-             mock.patch.dict(agent_core._VENDOR_MCP, {"github": (agent_core._github_connection,
-                                                                 lambda tok: False)}):
-            s = agent_core._build_session("lark:ou_x", "", "mem-gh2")
+        with mock.patch.object(lark_3lo, "peek_user_token_for", return_value="gho_tok"), \
+             mock.patch.dict(grants._VENDOR_MCP, {"github": (grants._github_connection,
+                                                             lambda tok: False)}):
+            s = sessions._build_session("lark:ou_x", "", "mem-gh2")
         gh = [c for c in opened if c.get("url") == "https://gh/mcp/"][0]
         assert gh["headers"]["Authorization"] == "Bearer gho_tok"
         assert gh["headers"]["X-MCP-Readonly"] == "true" and "repos" in gh["headers"]["X-MCP-Toolsets"]
@@ -3085,51 +3117,51 @@ def test_github_without_a_grant_offers_one_tool_that_asks_for_it():
 def test_a_github_grant_github_refuses_is_asked_for_again_past_the_vault():
     """Revoked on GitHub's side, the vault still holds it: an ordinary consent would answer
     "already granted" for ever, so the new link is forced."""
-    with mock.patch.dict(agent_core._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
+    with mock.patch.dict(grants._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
                          clear=True), \
-         mock.patch.dict(agent_core._VENDOR_MCP, {"github": (agent_core._github_connection,
-                                                             lambda tok: True)}), \
-         mock.patch.object(agent_core.lark_3lo, "configured", return_value=False), \
-         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value="gho_dead"), \
-         mock.patch.object(agent_core, "_aopen_tools", side_effect=AssertionError("opened")), \
-         mock.patch.object(agent_core.websearch, "available", return_value=False):
-        s = agent_core._build_session("web:s-1", "", "mem-gh3")
+         mock.patch.dict(grants._VENDOR_MCP, {"github": (grants._github_connection,
+                                                         lambda tok: True)}), \
+         mock.patch.object(lark_3lo, "configured", return_value=False), \
+         mock.patch.object(lark_3lo, "peek_user_token_for", return_value="gho_dead"), \
+         mock.patch.object(tools, "_aopen_tools", side_effect=AssertionError("opened")), \
+         mock.patch.object(web_search, "available", return_value=False):
+        s = sessions._build_session("web:s-1", "", "mem-gh3")
         assert s["tool_idp"]["github"] == "github" and s["consent"]["github"] == ""
-        with mock.patch.object(agent_core.lark_3lo, "get_user_token_for",
+        with mock.patch.object(lark_3lo, "get_user_token_for",
                                return_value=("auth_url", "https://consent")) as get:
-            assert agent_core._consent_link(s, "github") == "https://consent"
+            assert grants._consent_link(s, "github") == "https://consent"
         assert get.call_args.kwargs["force"] is True
 
 
 def test_auth_status_counts_a_grant_github_refuses_as_none():
-    with mock.patch.dict(agent_core._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
+    with mock.patch.dict(grants._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
                          clear=True), \
-         mock.patch.object(agent_core.lark_3lo, "configured", return_value=False), \
-         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value="gho_tok"), \
-         mock.patch.dict(agent_core._ACCOUNT_OF, {"github": lambda tok: "aleck31"}):
-        with mock.patch.dict(agent_core._VENDOR_MCP, {"github": (None, lambda tok: True)}):
-            assert agent_core.auth_status("web:s-1") == {"github": False, "accounts": {}}
-        with mock.patch.dict(agent_core._VENDOR_MCP, {"github": (None, lambda tok: False)}):
-            assert agent_core.auth_status("web:s-1") == {"github": True,
-                                                         "accounts": {"github": "aleck31"}}
+         mock.patch.object(lark_3lo, "configured", return_value=False), \
+         mock.patch.object(lark_3lo, "peek_user_token_for", return_value="gho_tok"), \
+         mock.patch.dict(grants._ACCOUNT_OF, {"github": lambda tok: "aleck31"}):
+        with mock.patch.dict(grants._VENDOR_MCP, {"github": (None, lambda tok: True)}):
+            assert grants.auth_status("web:s-1") == {"github": False, "accounts": {}}
+        with mock.patch.dict(grants._VENDOR_MCP, {"github": (None, lambda tok: False)}):
+            assert grants.auth_status("web:s-1") == {"github": True,
+                                                     "accounts": {"github": "aleck31"}}
 
 
 def test_github_refuses_only_a_401():
     with mock.patch("httpx.get", return_value=mock.Mock(status_code=401)):
-        assert agent_core._github_refuses("t") is True
+        assert grants._github_refuses("t") is True
     with mock.patch("httpx.get", return_value=mock.Mock(status_code=503)):
-        assert agent_core._github_refuses("t") is False
+        assert grants._github_refuses("t") is False
     with mock.patch("httpx.get", side_effect=OSError):
-        assert agent_core._github_refuses("t") is False
+        assert grants._github_refuses("t") is False
 
 
 def test_auth_shows_the_github_login_that_granted_it():
     resp = mock.Mock()
     resp.json.return_value = {"login": "aleck31"}
     with mock.patch("httpx.get", return_value=resp) as get:
-        assert agent_core._github_account("gho_tok") == "aleck31"
+        assert grants._github_account("gho_tok") == "aleck31"
     assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer gho_tok"
-    assert agent_core._label("github") == "GitHub"
+    assert grants._label("github") == "GitHub"
 
 
 def test_consent_is_asked_for_the_system_the_tool_acts_on():
@@ -3137,12 +3169,12 @@ def test_consent_is_asked_for_the_system_the_tool_acts_on():
     the wall keyed on Lark alone. Each tool now walls only on its own system's grant."""
     tool_idp = {"lark_docs": "lark", "google_whoami": "google"}
     s = {"consent": {"lark": "https://lark"}, "tool_idp": tool_idp}
-    assert agent_core._walled_idp(s, "lark_docs") == "lark"
-    assert agent_core._walled_idp(s, "google_whoami") is None      # Google is granted
-    assert agent_core._walled_idp(s, "memory_save") is None        # untagged never walls
+    assert grants._walled_idp(s, "lark_docs") == "lark"
+    assert grants._walled_idp(s, "google_whoami") is None      # Google is granted
+    assert grants._walled_idp(s, "memory_save") is None        # untagged never walls
     s = {"consent": {"google": ""}, "tool_idp": tool_idp}
-    assert agent_core._walled_idp(s, "google_whoami") == "google"
-    assert agent_core._walled_idp(s, "lark_docs") is None
+    assert grants._walled_idp(s, "google_whoami") == "google"
+    assert grants._walled_idp(s, "lark_docs") is None
 
 
 def test_stream_walls_a_google_tool_with_the_google_card():
@@ -3150,7 +3182,7 @@ def test_stream_walls_a_google_tool_with_the_google_card():
     session = _session_for(["查一下…"], tool_calls=["google_whoami"], follow_up="没有权限",
                            consent={"google": ""}, tool_idp={"google_whoami": "google"})
     with _patch_notify(card, []):
-        text = agent_core._stream_to_chat(session, "我的 Google 账号", "oc_1")
+        text = lark._stream_to_chat(session, "我的 Google 账号", "oc_1")
     assert session.get("walled_tool") == "google_whoami"
     assert "Google" in text and "Lark" not in text
 
@@ -3161,20 +3193,20 @@ def test_downstream_consent_is_recorded_at_build_and_minted_only_when_reached():
     async def fake_open(stack, connection):
         return [_make_tool("google_whoami")] if connection["url"] else [_dummy_tool]
 
-    with mock.patch.dict(agent_core._DOWNSTREAMS, {"google": ("https://g", "p", ["openid"])},
+    with mock.patch.dict(grants._DOWNSTREAMS, {"google": ("https://g", "p", ["openid"])},
                          clear=True), \
-         mock.patch.object(agent_core.lark_3lo, "get_user_lark_token",
+         mock.patch.object(lark_3lo, "get_user_lark_token",
                            return_value=("token", "lark-tok")), \
-         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value=""), \
-         mock.patch.object(agent_core.lark_3lo, "get_user_token_for",
+         mock.patch.object(lark_3lo, "peek_user_token_for", return_value=""), \
+         mock.patch.object(lark_3lo, "get_user_token_for",
                            return_value=("auth_url", "https://google-consent")) as mint, \
-         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+         mock.patch.object(lark_3lo, "mcp_connection_for",
                            side_effect=lambda tok, url="": {"url": url}), \
-         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
-         mock.patch.object(agent_core.websearch, "available", return_value=False):
-        s = agent_core._build_session("lark:ou_x", "", "mem1")
+         mock.patch.object(tools, "_aopen_tools", fake_open), \
+         mock.patch.object(web_search, "available", return_value=False):
+        s = sessions._build_session("lark:ou_x", "", "mem1")
         assert s["consent"] == {"google": ""} and not s["auth_url"]
         assert s["tool_idp"]["google_whoami"] == "google"
         mint.assert_not_called()
-        assert agent_core._consent_link(s, "google") == "https://google-consent"
+        assert grants._consent_link(s, "google") == "https://google-consent"
         mint.assert_called_once()

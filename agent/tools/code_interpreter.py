@@ -26,9 +26,9 @@ import logging
 import os
 import re
 
-import delivery
-import images
-import telemetry
+from channels import delivery
+from channels import images
+from runtime import telemetry
 
 import boto3
 from langchain_core.runnables import RunnableConfig
@@ -103,7 +103,7 @@ def _access_point_for(actor_id: str) -> str:
 class _Sandbox:
     """One Code Interpreter session, started on first use and reused for the rest of it.
 
-    Held by the caller (agent_core's session cache) rather than module state, so its
+    Held by the caller (sessions' cache) rather than module state, so its
     lifetime matches the conversation's and two users can never share one."""
 
     def __init__(self, actor_id: str) -> None:

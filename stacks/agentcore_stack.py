@@ -2,7 +2,7 @@
 
 Scope is deliberately small (this is a from-scratch simple agent, not OpenClaw):
   - Execution role: Bedrock invoke, Secrets read, CloudWatch logs, ECR pull. It holds no
-    Cognito rights: it never mints a user's token (agent/caller.py, agent/websearch.py).
+    Cognito rights: it never mints a user's token (agent/identity/caller.py, agent/tools/web_search.py).
   - Container image: with AGENT_BUILD=local, built from ./agent via DockerImageAsset
     (ARM64) and pushed to the CDK assets ECR repo; by default it is built in CodeBuild
     by scripts/provision.sh and this stack holds no image at all.

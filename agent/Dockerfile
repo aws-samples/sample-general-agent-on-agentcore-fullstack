@@ -24,6 +24,10 @@ RUN python3.13 -m pip install --no-cache-dir -r /app/requirements.txt
 RUN ln -sf /usr/bin/python3.13 /usr/local/bin/python3
 
 COPY *.py /app/
+COPY tools/ /app/tools/
+COPY identity/ /app/identity/
+COPY channels/ /app/channels/
+COPY runtime/ /app/runtime/
 COPY assets/ /app/assets/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

@@ -12,7 +12,7 @@ import { once } from 'node:events';
 const PORT = 8731;
 
 async function withServer(fn) {
-  const proc = spawn(process.execPath, [new URL('./server.js', import.meta.url).pathname],
+  const proc = spawn(process.execPath, [new URL('../../mcp-servers/google/server.js', import.meta.url).pathname],
     { env: { ...process.env, PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'pipe'] });
   try {
     await once(proc.stdout, 'data');          // the listen line
@@ -67,7 +67,7 @@ test('an unknown tool is an error, not a silent success', async () => {
 
 test('the server holds no credential of its own', async () => {
   const src = await (await import('node:fs/promises')).readFile(
-    new URL('./server.js', import.meta.url), 'utf8');
+    new URL('../../mcp-servers/google/server.js', import.meta.url), 'utf8');
   // No client secret, no service account, no refresh: the only thing it ever acts with is
   // the token that arrived with the request.
   for (const forbidden of ['CLIENT_SECRET', 'client_secret', 'service_account', 'refresh_token']) {

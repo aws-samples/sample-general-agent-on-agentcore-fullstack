@@ -187,7 +187,7 @@ def _default_thread(actor_id: str) -> str:
 def thread_belongs(actor_id: str, mem_sid: str) -> bool:
     """The agent honours a thread only under the actor's own prefix — the checkpoint is
     keyed by thread id alone and the default is computable by anyone. Kept in step with
-    agent_core.thread_belongs."""
+    sessions.thread_belongs in the agent."""
     default = _default_thread(actor_id)
     suffix = mem_sid[len(default) + 1:] if mem_sid.startswith(default + "-") else ""
     return mem_sid == default or (len(suffix) == 12

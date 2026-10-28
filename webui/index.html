@@ -619,7 +619,7 @@ async function ask(content) {
 // happened, and a one-line summary at the end. A status line says what the turn is doing
 // now — thinking, a tool running — with moving dots instead of a clock, and when text
 // resumes it freezes as the record of that wait ("🤔 思考 · 3 秒 · 🔧 调用工具 ×2 · 5 秒").
-// Tools are not named: the chat is not a log (agent/lark_notify.py, StreamingCard).
+// Tools are not named: the chat is not a log (agent/channels/lark_card.py, StreamingCard).
 let turn = null, waitingForFirst = null;
 
 // Between submit and the first event there is real latency (session assembly, MCP

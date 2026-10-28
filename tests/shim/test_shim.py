@@ -4,12 +4,14 @@ import base64
 import io
 import json
 import os
+import sys
 import urllib.error
 from unittest import mock
 
 # What the stack injects; index reads it at import and has no fallback.
 os.environ.setdefault("LARK_API_DOMAIN", "https://open.larksuite.com")
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lambda", "shim"))
 import index
 
 

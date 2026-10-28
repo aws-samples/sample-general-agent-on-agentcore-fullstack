@@ -3,7 +3,7 @@
 Two metric sources, and knowing which is which matters. **AgentCore emits**
 `gen_ai.client.token.usage` and `gen_ai.client.operation.duration` into the
 `bedrock-agentcore` namespace — cost and model latency, and nothing else. **The agent emits**
-its own counters through the same OTel pipeline (`agent/telemetry.py`): whether a turn
+its own counters through the same OTel pipeline (`agent/runtime/telemetry.py`): whether a turn
 succeeded, which tool ran, whether a user hit a consent wall. Those are not platform facts
 and nothing would measure them otherwise, which is why every failure in this project used to
 be found by a human reading a bad reply.

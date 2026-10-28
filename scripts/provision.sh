@@ -108,10 +108,8 @@ ensure_agent_image() {
 import glob, hashlib, os
 os.chdir("agent")
 h = hashlib.sha256()
-for f in sorted({"Dockerfile", "requirements.txt", "entrypoint.sh", *glob.glob("*.py"),
-                *glob.glob("assets/*")}):
-    if f.startswith("test_"):
-        continue
+for f in sorted({"Dockerfile", "requirements.txt", "entrypoint.sh",
+                *glob.glob("**/*.py", recursive=True), *glob.glob("assets/*")}):
     h.update(f.encode() + b"\0" + open(f, "rb").read())
 print(h.hexdigest()[:12])
 PYHASH
@@ -304,7 +302,7 @@ env = {
     # window and on how much a cache-prefix invalidation costs at your traffic.
     "SUMMARIZE_AT_TOKENS": os.environ.get("SUMMARIZE_AT_TOKENS", ""),
     "PROMPT_CACHE_TTL": os.environ.get("PROMPT_CACHE_TTL", ""),
-    # Empty means "keep the default in agent_core"; the env filter below drops it.
+    # Empty means "keep the default in agent/core.py"; the env filter below drops it.
     "AGENT_SYSTEM_PROMPT": os.environ.get("AGENT_SYSTEM_PROMPT", ""),
     "CHECKPOINT_BUCKET": e["CKPT_BUCKET"],
     # Long-term memory only; empty until the Memory resource exists.
@@ -659,7 +657,7 @@ phase3_gateway() {
   [ -n "$grole" ] && [ "$grole" != "None" ] || { echo "gateway stack outputs missing — run --base first"; exit 1; }
 
   # Inbound is IAM: the agent signs with its own role. Search reads no user data, so a
-  # per-user token bought nothing and cost the agent Cognito admin rights (agent/websearch.py).
+  # per-user token bought nothing and cost the agent Cognito admin rights (agent/tools/web_search.py).
   # IAM roles are global, so the role from the main region is reused as-is.
   local gw_params
   gw_params="$(ACP_NAME="${PREFIX}-websearch-gw" ACP_ROLE="$grole" uv run python -c '

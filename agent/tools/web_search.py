@@ -22,7 +22,7 @@ from datetime import timedelta
 
 import boto3
 
-import lark_3lo
+from identity import lark_3lo
 
 log = logging.getLogger("agent.websearch")
 

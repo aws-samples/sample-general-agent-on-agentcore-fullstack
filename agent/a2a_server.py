@@ -28,7 +28,7 @@ import os
 import urllib.parse
 import uuid
 
-import agent_core
+from runtime import turns
 
 log = logging.getLogger("agent.a2a")
 
@@ -134,7 +134,7 @@ def build_app():
 
     @app.get("/ping")
     async def ping():
-        return {"status": "HealthyBusy" if agent_core.busy() else "Healthy"}
+        return {"status": "HealthyBusy" if turns.busy() else "Healthy"}
 
     handler = DefaultRequestHandler(agent_executor=ForwardingExecutor(),
                                     task_store=InMemoryTaskStore(), agent_card=card)

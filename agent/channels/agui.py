@@ -18,7 +18,12 @@ import uuid
 
 from aiohttp import web
 
-import agent_core
+from channels import delivery
+from identity import grants
+from channels import images
+from runtime import sessions
+from runtime import telemetry
+from runtime import turns
 
 log = logging.getLogger("agent.agui")
 
@@ -78,7 +83,7 @@ def _consent(session: dict) -> bytes:
     token it will complete with — only the token a consent was started with can complete it,
     and a link minted now could be killed by a later build before it is clicked."""
     try:
-        idp = agent_core._hit_auth_wall(session)
+        idp = grants._hit_auth_wall(session)
     except Exception:  # noqa: BLE001 — a missing prompt must not cost the answer
         log.warning("could not check for a consent wall", exc_info=True)
         return b""
@@ -95,7 +100,7 @@ def _walls(session: dict, event) -> bool:
     if getattr(event, "type", "") != "TOOL_CALL_START":
         return False
     name = getattr(event, "tool_call_name", "") or ""
-    if not agent_core._walled_idp(session, name):
+    if not grants._walled_idp(session, name):
         return False
     session["walled_tool"] = name
     log.info("aborting web turn: %s needs consent", name)
@@ -115,7 +120,7 @@ class _Mark:
 
 
 class _PageMarks:
-    """Stands in for the Lark card on a web turn (agent_core._turn_cards): what happens inside
+    """Stands in for the Lark card on a web turn (turns._turn_cards): what happens inside
     the graph that the token stream cannot show, put on the run's own stream."""
 
     def __init__(self, out: list) -> None:
@@ -134,15 +139,15 @@ def _end(thread_id: str, marks: _PageMarks, state: dict) -> list:
     the same step as finding nothing left to answer, release it — exactly once, since a
     second release would free a claim another turn may have taken meanwhile. Messages still
     queued were acknowledged to the page, so they are reported, not dropped."""
-    if agent_core._turn_cards.get(thread_id) is marks:
-        agent_core._turn_cards.pop(thread_id, None)
+    if turns._turn_cards.get(thread_id) is marks:
+        turns._turn_cards.pop(thread_id, None)
     if state.get("released"):
         return []
     state["released"] = True
-    leftover = agent_core.release(thread_id)
+    leftover = turns.release(thread_id)
     if not leftover:
         return []
-    agent_core.telemetry.count("steer_unanswered", n=str(len(leftover)))
+    telemetry.count("steer_unanswered", n=str(len(leftover)))
     return [_Mark({"name": "unanswered", "value": {"count": len(leftover)}})]
 
 
@@ -167,10 +172,10 @@ def _pictures_handed_over(payload: dict, thread_id: str) -> dict:
     last = messages[-1] if messages else None
     if not isinstance(last, dict) or not isinstance(last.get("content"), list):
         return payload
-    text, handles, blocks = agent_core.images.from_page(last["content"])
+    text, handles, blocks = images.from_page(last["content"])
     if not handles:
         return payload
-    marks, message_id = agent_core.images.register(thread_id, handles, blocks)
+    marks, message_id = images.register(thread_id, handles, blocks)
     content = "\n".join(t for t in (text or "看看这张图。", marks) if t)
     return {**payload, "messages": [*messages[:-1],
                                     {**last, "id": message_id, "content": content}]}
@@ -221,21 +226,21 @@ async def handle(request: web.Request, payload: dict,
     # instead. Claimed before the session is built, as chat_async does: a build may close a
     # session a running turn is using. The thread the page names was checked against the
     # actor by server.py; a page that names none gets the one the router last named.
-    thread_id = payload.get("memorySessionId") or agent_core.thread_for(actor_id)
+    thread_id = payload.get("memorySessionId") or sessions.thread_for(actor_id)
     dest = _stream_of(payload)
     text, message_id = _steerable(payload)
-    owner = agent_core.claim_or_steer(thread_id, "web", dest, text, message_id) if text \
-        else agent_core.try_claim(thread_id, "web", dest)
+    owner = turns.claim_or_steer(thread_id, "web", dest, text, message_id) if text \
+        else turns.try_claim(thread_id, "web", dest)
     if owner == "steered":
         return await _steered_stream(request, thread_id, payload.get("runId") or thread_id)
     if owner == "web":     # a picture, which cannot join a turn; is that turn this page's?
-        owner = "picture" if dest and agent_core._claim_dest.get(thread_id) == dest \
+        owner = "picture" if dest and turns._claim_dest.get(thread_id) == dest \
             else "web-other"
     if owner == "picture":
         return await _error_stream(request, "这一轮回答结束后再发图片。")
     if owner:
-        return await _error_stream(request, agent_core._BUSY_ELSEWHERE.get(
-            owner, agent_core._BUSY_ELSEWHERE["sync"]))
+        return await _error_stream(request, turns._BUSY_ELSEWHERE.get(
+            owner, turns._BUSY_ELSEWHERE["sync"]))
 
     # What the graph does that the token stream cannot show — a file sent, a message steered
     # in, a summary being written — as CUSTOM events for this run's stream. Per run, never on
@@ -249,7 +254,7 @@ async def handle(request: web.Request, payload: dict,
     try:
         # The session carries the tools, the checkpointer and the summarisation middleware,
         # so a web turn lands in the same conversation as a Lark turn for the same person.
-        session = await agent_core.aget_session(actor_id, workload_token=workload_token,
+        session = await sessions.aget_session(actor_id, workload_token=workload_token,
                                                 thread=thread_id, own_claim=True)
         # Only a Lark user's own Lark lookup can fail this way; a system not yet granted is
         # not an error here — the run stops at the tool that needs it and the page asks.
@@ -260,16 +265,16 @@ async def handle(request: web.Request, payload: dict,
         session.pop("walled_tool", None)
         # thread_id was never taken from AG-UI's threadId: that one is the page's to choose.
         # Off the server's loop: decoding and downscaling a photo stalls every other stream.
-        handed = await agent_core.arun_in_thread(_pictures_handed_over, payload, thread_id)
+        handed = await turns.arun_in_thread(_pictures_handed_over, payload, thread_id)
         run_input = RunAgentInput(**_run_input_fields(handed, thread_id))
 
         def agent_for(arrived_ms: int):
             return LangGraphAgent(name="agentcore-fullstack", graph=session["graph"],
-                                  config=agent_core._run_config(
-                                      session, agent_core.delivery.WebDelivery(out, actor_id),
+                                  config=turns._run_config(
+                                      session, delivery.WebDelivery(out, actor_id),
                                       arrived_ms, account=payload.get("actorAccount") or ""))
 
-        async def turns():
+        async def run_turns():
             """The turn, then a continuation for whatever was steered in after its last
             model call — the loop chat_async runs for Lark — until nothing is left."""
             nonlocal session
@@ -290,7 +295,7 @@ async def handle(request: web.Request, payload: dict,
             arrival of the run's own message, a continuation's included. Only while the
             claim is held: after it, another turn may be writing the thread."""
             try:
-                await agent_core.astamp_unanswered(session["graph"], session["config"],
+                await sessions.astamp_unanswered(session["graph"], session["config"],
                                                    arrived["ms"])
             except Exception:  # noqa: BLE001 — a missing time must not cost the release
                 log.warning("could not stamp an unanswered message", exc_info=True)
@@ -312,7 +317,7 @@ async def handle(request: web.Request, payload: dict,
                     await stamp()
                 run_in = None
                 while run_in is None:
-                    queued = agent_core.take_steer_or_release(thread_id)
+                    queued = turns.take_steer_or_release(thread_id)
                     if not queued:
                         state["released"] = True
                         return
@@ -320,7 +325,7 @@ async def handle(request: web.Request, payload: dict,
                     try:
                         # Fetched again, as chat_async does: a consent completed meanwhile
                         # drops the cached session, and its MCP connections with it.
-                        session = await agent_core.aget_session(
+                        session = await sessions.aget_session(
                             actor_id, workload_token=workload_token, thread=thread_id,
                             own_claim=True)
                         arrived["ms"] = queued[0][3] if len(queued[0]) > 3 else 0
@@ -335,13 +340,13 @@ async def handle(request: web.Request, payload: dict,
                         log.exception("continuation failed for %s", actor_id)
                         yield _Mark({"name": "unanswered", "value": {"count": len(queued)}})
 
-        agent_core._turn_cards[thread_id] = marks
-        # The graph's MCP sessions live on agent_core's own loop, so the run happens there
+        turns._turn_cards[thread_id] = marks
+        # The graph's MCP sessions live on the agent loop (turns), so the run happens there
         # and the events come back over a queue. Released when the run finishes, not when
         # this handler stops reading: a page closed mid-answer leaves the graph running,
         # and a Lark message must see the thread busy until it ends.
-        events = agent_core.stream_on_agent_loop(
-            turns, on_done=lambda: _end(thread_id, marks, state),
+        events = turns.stream_on_agent_loop(
+            run_turns, on_done=lambda: _end(thread_id, marks, state),
             until=lambda event: _walls(session, event))
     except BaseException:
         _end(thread_id, marks, state)

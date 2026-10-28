@@ -2,7 +2,7 @@
 
 Skipped unless WEBHOOK_URL + LARK_ENCRYPT_KEY are set.
 Run: WEBHOOK_URL=... LARK_ENCRYPT_KEY=... \
-     uv run --with cryptography --with pytest python -m pytest tests/test_webhook_smoke.py -v
+     uv run --with cryptography --with pytest python -m pytest tests/e2e/test_webhook_smoke.py -v
 """
 
 import hashlib

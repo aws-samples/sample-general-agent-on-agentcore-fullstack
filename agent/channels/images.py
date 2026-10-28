@@ -22,7 +22,7 @@ import logging
 import threading
 import uuid
 
-import lark_notify
+from channels import lark_card
 
 log = logging.getLogger("agent.images")
 
@@ -67,7 +67,7 @@ def downscale(data: bytes) -> tuple[bytes, str]:
 
 def fetch(message_id: str, image_key: str) -> tuple[bytes, str]:
     """An image's bytes, downscaled, from Lark."""
-    return downscale(lark_notify.fetch_message_resource(message_id, image_key, "image"))
+    return downscale(lark_card.fetch_message_resource(message_id, image_key, "image"))
 
 
 # Lark names its resource kinds, and asking for the wrong one answers 500. A picture is
@@ -83,7 +83,7 @@ def save_to_workspace(sandbox, handle: dict, index: int) -> str:
     long pdf would not fit, and code can read exactly the part that matters."""
     kind = handle.get("kind", IMAGE)
     # A web picture came with its bytes, held for the turn; a Lark one is fetched again.
-    data = handle.get("data") or lark_notify.fetch_message_resource(
+    data = handle.get("data") or lark_card.fetch_message_resource(
         handle.get("message_id", ""), handle.get("key", ""), kind)
     name = handle.get("name") or (
         f"image-{index}.jpg" if kind == IMAGE else f"attachment-{index}")

@@ -1,6 +1,6 @@
 """Router unit tests — Lark webhook crypto + event handling.
 
-Run: uv run --with cryptography --with boto3 python -m pytest lambda/router/test_router.py -v
+Run: uv run --with cryptography --with boto3 python -m pytest tests/router/test_router.py -v
 
 Env is set before importing modules so boto3 clients construct without error;
 AWS calls are mocked.
@@ -22,7 +22,8 @@ os.environ.setdefault("IDENTITY_TABLE_NAME", "test-identity")
 os.environ.setdefault("LARK_SECRET_ID", "test/lark")
 os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:1:runtime/x")
 
-sys.path.insert(0, os.path.dirname(__file__))
+ROUTER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lambda", "router")
+sys.path.insert(0, ROUTER)
 
 ENCRYPT_KEY = "test-encrypt-key"
 
@@ -901,10 +902,10 @@ def test_cors_is_configured_on_the_api_and_not_duplicated_in_the_handler():
     Gateway answers OPTIONS itself and ignores the integration's own CORS headers — so
     setting them here too is dead code, which is exactly how this shipped broken."""
     import pathlib
-    stack = pathlib.Path(__file__).parents[2] / "stacks" / "router_stack.py"
+    stack = pathlib.Path(ROUTER).parents[1] / "stacks" / "router_stack.py"
     src = stack.read_text()
     assert "cors_preflight" in src and "web_allowed_origins.split" in src
-    handler_src = pathlib.Path(__file__).with_name("index.py").read_text()
+    handler_src = (pathlib.Path(ROUTER) / "index.py").read_text()
     assert "Access-Control-Allow-Origin" not in handler_src
 
 
