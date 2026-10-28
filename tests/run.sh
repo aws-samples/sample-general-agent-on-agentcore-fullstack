@@ -28,6 +28,9 @@ lambda_py --with-requirements lambda/router/requirements.txt python -m pytest te
 echo "== shim =="
 lambda_py python -m pytest tests/shim/test_shim.py -q
 
+echo "== mcp protocol, both eras (node) =="
+node --test tests/mcp/test_protocol.mjs
+
 echo "== google mcp (node) =="
 # Node's own runner: this server has no dependencies, so a toolchain for one file would be
 # the wrong trade. Pointed at the file — the server listens on import.

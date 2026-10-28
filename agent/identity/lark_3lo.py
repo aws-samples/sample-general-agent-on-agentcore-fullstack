@@ -39,6 +39,7 @@ import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 import httpx
+import httpx2
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 # Empty when the deployment has no Lark: then nothing here is called for Lark (configured()).
@@ -229,17 +230,17 @@ def get_user_lark_token(actor_id: str, force: bool = False,
     return "auth_url", resp["authorizationUrl"]
 
 
-class _SigV4HTTPXAuth(httpx.Auth):
-    """Sign every httpx request (incl. SSE polls) with SigV4 for bedrock-agentcore.
+class _SigV4HTTPXAuth(httpx2.Auth):
+    """Sign every request of an MCP connection (httpx2, incl. SSE polls) with SigV4 for bedrock-agentcore.
 
-    Only `auth_flow` (sync) is defined on purpose: httpx's default `async_auth_flow`
+    Only `auth_flow` (sync) is defined on purpose: httpx2's default `async_auth_flow`
     iterates it directly, so the same object serves the async MCP transport — signing
     is pure CPU and blocks nothing."""
 
     def __init__(self, creds, service: str, region: str):
         self._signer = SigV4Auth(creds, service, region)
 
-    def auth_flow(self, request: httpx.Request):
+    def auth_flow(self, request: httpx2.Request):
         headers = dict(request.headers)
         headers.pop("connection", None)  # or the server rejects on signature mismatch
         aws_req = AWSRequest(method=request.method, url=str(request.url),
@@ -300,7 +301,7 @@ def peek_user_token_for(actor_id: str, provider: str, scopes: list,
 
 
 def mcp_connection_for(lark_token: str, url: str = "") -> dict:
-    """A langchain-mcp-adapters `StreamableHttpConnection` for an MCP-server Runtime:
+    """A streamable-HTTP connection (tools/mcp_client.py) for an MCP-server Runtime:
     SigV4 transport + the Lark token in the custom passthrough header. Defaults to the
     lark-cli server; pass `url` for another one (the approval server, say). Same
     transport either way — what differs is which tools the server exposes and which
@@ -315,4 +316,9 @@ def mcp_connection_for(lark_token: str, url: str = "") -> dict:
         "headers": {_CUSTOM_HEADER: lark_token},
         "auth": _SigV4HTTPXAuth(creds, "bedrock-agentcore", _REGION),
         "timeout": timedelta(seconds=60),
+        # The legacy handshake, deliberately. The Runtime pins a connection to one microVM by
+        # the Mcp-Session-Id it returns, and the SDK keeps that id only from an `initialize`
+        # answer: under 2026-07-28 three calls landed on three fresh microVMs, under the
+        # handshake on one (measured; AgentCore's MCP protocol contract says the same).
+        "mode": "legacy",
     }

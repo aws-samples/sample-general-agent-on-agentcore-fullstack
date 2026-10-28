@@ -16,7 +16,11 @@
 'use strict';
 
 const http = require('http');
+// In the image it sits beside this file (scripts/build-mcp.sh copies it in); in the repo, in _shared/.
+const protocol = require(require('fs').existsSync(`${__dirname}/mcp-protocol.js`)
+  ? './mcp-protocol' : '../_shared/mcp-protocol');
 
+const SERVER_INFO = { name: 'lark-approval-mcp', version: '1.0.0' };
 const PORT = parseInt(process.env.PORT || '8000', 10);
 const APP_ID = process.env.APP_ID || '';
 // Injected as an environment variable, not fetched from Secrets Manager: this
@@ -378,8 +382,8 @@ async function callLark(req, as, userToken) {
   return { isError: failed, text: text.slice(0, 8000), parsed };
 }
 
-function sse(res, obj) {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+function sse(res, obj, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   res.end(`event: message\ndata: ${JSON.stringify(obj)}\n\n`);
 }
 
@@ -405,14 +409,12 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
     }
     console.log(`inbound ${req.method} ${req.url} mcp=${mcp.method || '(none)'} token=${userToken ? 'yes' : 'no'}`);
 
-    if (mcp.method === 'initialize') {
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
-        protocolVersion: '2025-11-25',
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'lark-approval-mcp', version: '1.0.0' },
-      } });
+    const early = protocol.lifecycle(mcp, SERVER_INFO);
+    if (early) {
+      if (!early.body) { res.writeHead(early.status); res.end(); return; }
+      return sse(res, early.body, early.status);
     }
-    if (mcp.method === 'notifications/initialized') { res.writeHead(202); res.end(); return; }
+    const send = (payload) => sse(res, protocol.reply(mcp, payload, SERVER_INFO));
     // Listed without a token, deliberately: the model should know what it could do
     // once the user consents, and consent is asked for at call time.
     if (mcp.method === 'tools/list') {
@@ -427,19 +429,19 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
         description: t.guarded ? `${t.description}\n\n${policyNote()}` : t.description,
         inputSchema: t.inputSchema,
       }));
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { tools } });
+      return send({ jsonrpc: '2.0', id: mcp.id, result: { tools } });
     }
     if (mcp.method === 'tools/call') {
       const name = mcp.params && mcp.params.name;
       const args = (mcp.params && mcp.params.arguments) || {};
       const tool = TOOLS.find((t) => t.name === name);
-      if (!tool) return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true } });
+      if (!tool) return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true } });
       // Same wording the lark-cli server uses — the agent matches on it to attach a
       // consent link, so the two servers must stay in step.
       if (tool.as === 'user' && !userToken) {
-        return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: 'no user token (authorize first)' }], isError: true } });
+        return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: 'no user token (authorize first)' }], isError: true } });
       }
-      const refuse = (text) => sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text }], isError: true } });
+      const refuse = (text) => send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text }], isError: true } });
       if (tool.ownQueue) {
         const notOwn = await requireConsentOnRecord(userToken, args.user_id);
         if (notOwn) return refuse(notOwn);
@@ -453,7 +455,7 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
           console.log(`refused ${name}: ${who.slice(0, 12)}… is not a participant`);
           return refuse('refused: you did not start this approval and are not an approver or copied on it');
         }
-        return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
+        return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
       }
       // Code-enforced limits before any decision is written back to Lark. Returned
       // as a tool error so the model sees the refusal and can explain it, rather
@@ -468,13 +470,13 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
         const noConsent = await requireConsentOnRecord(userToken, args.user_id);
         if (noConsent) {
           console.log(`guard refused ${name}: no consent on record`);
-          return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: noConsent }], isError: true } });
+          return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: noConsent }], isError: true } });
         }
         const facts = await readInstance(args.instance_code, args.task_id, args.user_id, tenantToken);
         const refusal = facts.error || checkAutoDecisionAllowed(facts);
         if (refusal) {
           console.log(`guard refused ${name}: ${refusal}`);
-          return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: refusal }], isError: true } });
+          return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: refusal }], isError: true } });
         }
         console.log(`guard passed ${name}: code=${facts.approval_code} amount=${facts.amount ?? '-'}`);
         // What Lark acts on is what was checked, not what the model named.
@@ -486,9 +488,9 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
           .filter(Boolean).join(' ');
       }
       const out = await callLark(tool.req(args), tool.as, userToken);
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
+      return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
     }
-    return sse(res, { jsonrpc: '2.0', id: mcp.id || null, error: { code: -32601, message: `method not found: ${mcp.method}` } });
+    return send({ jsonrpc: '2.0', id: mcp.id || null, error: { code: -32601, message: `method not found: ${mcp.method}` } });
   });
 });
 

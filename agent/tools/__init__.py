@@ -20,10 +20,9 @@ import logging
 import os
 from contextlib import AsyncExitStack
 
-from langchain_mcp_adapters.sessions import create_session
-from langchain_mcp_adapters.tools import load_mcp_tools
 
 from tools import code_interpreter
+from tools import mcp_client
 from identity import lark_3lo
 from tools import memory
 from runtime import telemetry
@@ -46,12 +45,10 @@ def _long_term_tools(actor_id: str) -> list:
     return memory.tools_for(actor_id)
 
 
-async def _aopen_tools(stack: AsyncExitStack, connection: dict) -> list:
+async def _aopen_tools(stack: AsyncExitStack, connection: dict, on_refused=None) -> list:
     """Open an MCP session that stays alive for the session's lifetime and return its
     tools. The stack owns the teardown, so one close() releases every server."""
-    session = await stack.enter_async_context(create_session(connection))
-    await session.initialize()
-    return await load_mcp_tools(session)
+    return await mcp_client.open_tools(stack, connection, on_refused)
 
 
 async def assemble(actor_id: str, stack: AsyncExitStack, workload_token: str = "") -> dict:
@@ -83,8 +80,9 @@ async def assemble(actor_id: str, stack: AsyncExitStack, workload_token: str = "
         tool_source.update((t.name, source) for t in opened)
         return opened
 
-    async def _open(connection: dict, idp: str = "", source: str = "") -> list:
-        opened = await _aopen_tools(stack, connection)
+    async def _open(connection: dict, idp: str = "", source: str = "", on_refused=None) -> list:
+        opened = await (_aopen_tools(stack, connection, on_refused) if on_refused
+                        else _aopen_tools(stack, connection))
         if idp:
             tool_idp.update((t.name, idp) for t in opened)
         return _tag(opened, source or idp)
@@ -168,7 +166,14 @@ async def assemble(actor_id: str, stack: AsyncExitStack, workload_token: str = "
                 tool_idp[stand_in.name] = idp
                 tools += _tag([stand_in], idp)
             elif vendor:
-                tools += await _open(vendor[0](d_token, url), idp)
+                def wall(idp=idp) -> str:
+                    # The vendor turned the grant away mid-session (revoked, or expired on
+                    # its side): wall this system's tools from now on, and force the next
+                    # consent past the vault, which still holds the dead grant.
+                    consent[idp] = ""
+                    refused.add(idp)
+                    return grants._NEEDS_TOKEN_MARKER
+                tools += await _open(vendor[0](d_token, url), idp, on_refused=wall)
             else:
                 tools += await _open(lark_3lo.mcp_connection_for(d_token, url=url), idp)
         except Exception:  # noqa: BLE001 — optional, like search

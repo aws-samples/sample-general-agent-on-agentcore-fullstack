@@ -10,7 +10,6 @@ langchain-aws>=1.9.0
 # AgentCoreMemorySaver (graph state, blob events) + AgentCoreMemoryStore (conversational
 # events). Not part of bedrock-agentcore, which ships a Strands integration only.
 langgraph-checkpoint-aws>=1.2.0
-langchain-mcp-adapters>=0.3.0
 # AG-UI for the browser path. fastapi is not in ag-ui-langgraph's declared deps but its
 # __init__ imports it unconditionally, so the package cannot be imported without it; we
 # serve the events from aiohttp, not FastAPI.
@@ -21,7 +20,9 @@ fastapi>=0.115.0
 a2a-sdk[http-server]>=1.1.2
 uvicorn>=0.30.0
 bedrock-agentcore>=0.1.0
-mcp>=1.23.0
+# MCP's 2.x SDK, reached through our own thin adapter (tools/mcp_client.py): langchain-mcp-adapters
+# pins mcp<2, and 1.x is in maintenance, frozen at the 2025-11-25 spec. httpx2 comes with it.
+mcp>=2.3.0,<3
 httpx>=0.27.0
 # Verifies the caller's Cognito access token against the pool's keys (caller.py).
 pyjwt[crypto]>=2.10.0

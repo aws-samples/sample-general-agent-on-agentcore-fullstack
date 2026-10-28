@@ -52,14 +52,6 @@ RUNTIME_SUFFIX=""; DEPLOY_IF=""; REQUIRE_VARS=""; RUNTIME_ENV_MAP=""; IMAGE_TAG=
 . "$DIR/runtime.env"
 : "${RUNTIME_SUFFIX:?$DIR/runtime.env must set RUNTIME_SUFFIX}"
 
-# The tag comes from the server itself (IMAGE_TAG in its runtime.env), so a server
-# that doesn't wrap lark-cli isn't labelled with a CLI version it never installs.
-# SRC_SHA lets such a server tag by content, which also makes "did this deploy
-# actually change anything?" visible at a glance in ECR.
-# shellcheck disable=SC2034  # read by the eval of IMAGE_TAG below
-SRC_SHA="$(find "$DIR" -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-12)"
-TAG="$(eval echo "${IMAGE_TAG:-cli-\$LARK_CLI_VERSION}")"
-
 # A server can declare a variable that gates it. Skipped only for a build-everything
 # run — an explicitly named server is built regardless.
 if [ "$EXPLICIT" = "0" ] && [ -n "$DEPLOY_IF" ] && [ -z "${!DEPLOY_IF:-}" ]; then
@@ -70,13 +62,27 @@ for v in $REQUIRE_VARS; do
   [ -n "${!v:-}" ] || { echo "$SERVER needs $v — set it in .env"; exit 1; }
 done
 
+# The tag comes from the server itself (IMAGE_TAG in its runtime.env), so a server
+# that doesn't wrap lark-cli isn't labelled with a CLI version it never installs.
+# SRC_SHA lets such a server tag by content, which also makes "did this deploy
+# actually change anything?" visible at a glance in ECR.
+# The build context is the server's directory plus the protocol code they all share, so a
+# change to either rebuilds the image.
+CTX="$(mktemp -d)"
+cp -R "$DIR"/. "$CTX"/
+cp mcp-servers/_shared/mcp-protocol.js "$CTX"/
+# shellcheck disable=SC2034  # read by the eval of IMAGE_TAG below
+SRC_SHA="$(cd "$CTX" && find . -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-12)"
+TAG="$(eval echo "${IMAGE_TAG:-cli-\$LARK_CLI_VERSION}")"
+
 REPO="$PREFIX-mcp-$SERVER"
 ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO"
 RUNTIME_NAME="${PREFIX//-/_}_$RUNTIME_SUFFIX"   # AgentCore runtime names use underscores
 printf '\n\033[1;36m### MCP server: %s → %s\033[0m\n' "$SERVER" "$RUNTIME_NAME"
 
 log "Build $REPO:$TAG (CodeBuild, ARM64 native)"
-cb_build "$REPO" "$DIR" "$TAG" --build-arg "LARK_CLI_VERSION=$LARK_CLI_VERSION"
+cb_build "$REPO" "$CTX" "$TAG" --build-arg "LARK_CLI_VERSION=$LARK_CLI_VERSION"
+rm -rf "$CTX"  # safe-rm-ok
 
 log "MCP server Runtime ($RUNTIME_NAME)"
 # The per-user Lark token reaches the container in a custom passthrough header —

@@ -15,8 +15,12 @@
 'use strict';
 
 const http = require('http');
+// In the image it sits beside this file (scripts/build-mcp.sh copies it in); in the repo, in _shared/.
+const protocol = require(require('fs').existsSync(`${__dirname}/mcp-protocol.js`)
+  ? './mcp-protocol' : '../_shared/mcp-protocol');
 const https = require('https');
 
+const SERVER_INFO = { name: 'google-mcp', version: '1.0.0' };
 const PORT = parseInt(process.env.PORT || '8000', 10);
 // Same header the agent sets for the Lark server. Node lowercases header names.
 const TOKEN_HEADER = 'x-amzn-bedrock-agentcore-runtime-custom-lark-token';
@@ -84,8 +88,8 @@ function googleGet(url) {
   });
 }
 
-function sse(res, obj) {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+function sse(res, obj, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   res.end(`event: message\ndata: ${JSON.stringify(obj)}\n\n`);
 }
 
@@ -109,37 +113,35 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
     console.log(`inbound ${req.method} ${req.url} mcp=${mcp.method || '(none)'} `
       + `token=${userToken ? 'yes' : 'no'} auth=${authScheme}`);
 
-    if (mcp.method === 'initialize') {
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
-        protocolVersion: '2025-11-25',
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'google-mcp', version: '1.0.0' },
-      } });
+    const early = protocol.lifecycle(mcp, SERVER_INFO);
+    if (early) {
+      if (!early.body) { res.writeHead(early.status); res.end(); return; }
+      return sse(res, early.body, early.status);
     }
-    if (mcp.method === 'notifications/initialized') { res.writeHead(202); res.end(); return; }
+    const send = (payload) => sse(res, protocol.reply(mcp, payload, SERVER_INFO));
     if (mcp.method === 'tools/list') {
       // Listed without a token, like the Lark server: the token gates calls, not discovery,
       // so an unconsented user still gets a working session and is only asked when a tool
       // is actually reached.
       const tools = TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { tools } });
+      return send({ jsonrpc: '2.0', id: mcp.id, result: { tools } });
     }
     if (mcp.method === 'tools/call') {
       const name = mcp.params && mcp.params.name;
       const tool = TOOLS.find((t) => t.name === name);
       if (!tool) {
-        return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
+        return send({ jsonrpc: '2.0', id: mcp.id, result: {
           content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true } });
       }
       if (!userToken) {
-        return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
+        return send({ jsonrpc: '2.0', id: mcp.id, result: {
           content: [{ type: 'text', text: 'no user token (authorize first)' }], isError: true } });
       }
       const out = await tool.call(mcp.params.arguments || {})(userToken);
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
+      return send({ jsonrpc: '2.0', id: mcp.id, result: {
         content: [{ type: 'text', text: out.text }], isError: out.isError } });
     }
-    return sse(res, { jsonrpc: '2.0', id: mcp.id || null,
+    return send({ jsonrpc: '2.0', id: mcp.id || null,
       error: { code: -32601, message: `method not found: ${mcp.method}` } });
   });
 });

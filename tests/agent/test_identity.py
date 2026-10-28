@@ -82,7 +82,7 @@ def test_a_web_users_lark_is_granted_on_demand_like_google():
     link minted only when they ask to authorise."""
     lark_user_path, opened = [], []
 
-    async def fake_open(stack, connection):
+    async def fake_open(stack, connection, *_):
         opened.append(connection.get("url"))
         return [_dummy_tool]
 
@@ -238,7 +238,7 @@ def test_github_without_a_grant_offers_one_tool_that_asks_for_it():
     have no GitHub tool to reach and never be asked; a stand-in walls on first use instead."""
     opened = []
 
-    async def fake_open(stack, connection):
+    async def fake_open(stack, connection, *_):
         opened.append(connection)
         return [_make_tool("get_me"), _make_tool("list_branches")]
     with mock.patch.dict(grants._DOWNSTREAMS, {"github": ("https://gh/mcp/", "gh-prov", ["repo"])},
@@ -331,7 +331,7 @@ def test_consent_is_asked_for_the_system_the_tool_acts_on():
 def test_downstream_consent_is_recorded_at_build_and_minted_only_when_reached():
     """Minting at build would start a consent flow nobody asked for and kill any link the
     user is already holding; the build only peeks, the wall mints."""
-    async def fake_open(stack, connection):
+    async def fake_open(stack, connection, *_):
         return [_make_tool("google_whoami")] if connection["url"] else [_dummy_tool]
 
     with mock.patch.dict(grants._DOWNSTREAMS, {"google": ("https://g", "p", ["openid"])},

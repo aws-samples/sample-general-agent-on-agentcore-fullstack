@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY server.js /app/server.js
+COPY server.js mcp-protocol.js /app/
 
 EXPOSE 8000
 

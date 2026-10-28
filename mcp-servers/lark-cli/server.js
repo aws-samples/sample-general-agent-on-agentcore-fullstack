@@ -11,8 +11,12 @@
 // the agent sets (no sidecar needed — we read it directly).
 
 const http = require('http');
+// In the image it sits beside this file (scripts/build-mcp.sh copies it in); in the repo, in _shared/.
+const protocol = require(require('fs').existsSync(`${__dirname}/mcp-protocol.js`)
+  ? './mcp-protocol' : '../_shared/mcp-protocol');
 const { execFile } = require('child_process');
 
+const SERVER_INFO = { name: 'lark-cli-mcp', version: '1.0.0' };
 const PORT = parseInt(process.env.PORT || '8000', 10);
 const APP_ID = process.env.APP_ID || '';
 const APP_SECRET = process.env.APP_SECRET || '';
@@ -76,8 +80,8 @@ function runLarkCli(cliArgs, userToken) {
   });
 }
 
-function sse(res, obj) {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+function sse(res, obj, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   res.end(`event: message\ndata: ${JSON.stringify(obj)}\n\n`);
 }
 
@@ -107,28 +111,26 @@ const server = http.createServer((req, res) => {  // nosemgrep: using-http-serve
     console.log(`inbound ${req.method} ${req.url} mcp=${mcp.method || '(none)'} `
       + `token=${userToken ? 'yes' : 'no'} auth=${authScheme}`);
 
-    if (mcp.method === 'initialize') {
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
-        protocolVersion: '2025-11-25',
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'lark-cli-mcp', version: '1.0.0' },
-      } });
+    const early = protocol.lifecycle(mcp, SERVER_INFO);
+    if (early) {
+      if (!early.body) { res.writeHead(early.status); res.end(); return; }
+      return sse(res, early.body, early.status);
     }
-    if (mcp.method === 'notifications/initialized') { res.writeHead(202); res.end(); return; }
+    const send = (payload) => sse(res, protocol.reply(mcp, payload, SERVER_INFO));
     if (mcp.method === 'tools/list') {
       const tools = TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { tools } });
+      return send({ jsonrpc: '2.0', id: mcp.id, result: { tools } });
     }
     if (mcp.method === 'tools/call') {
       const name = mcp.params && mcp.params.name;
       const args = (mcp.params && mcp.params.arguments) || {};
       const tool = TOOLS.find((t) => t.name === name);
-      if (!tool) return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true } });
-      if (!userToken) return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: 'no user token (authorize first)' }], isError: true } });
+      if (!tool) return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true } });
+      if (!userToken) return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: 'no user token (authorize first)' }], isError: true } });
       const out = await runLarkCli(tool.cli(args), userToken);
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
+      return send({ jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
     }
-    return sse(res, { jsonrpc: '2.0', id: mcp.id || null, error: { code: -32601, message: `method not found: ${mcp.method}` } });
+    return send({ jsonrpc: '2.0', id: mcp.id || null, error: { code: -32601, message: `method not found: ${mcp.method}` } });
   });
 });
 

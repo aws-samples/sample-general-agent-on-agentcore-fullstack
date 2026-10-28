@@ -667,7 +667,9 @@ print(json.dumps({
     "name": e["ACP_NAME"],
     "protocolType": "MCP",
     "protocolConfiguration": {"mcp": {
-        "supportedVersions": ["2025-11-25"],
+        # 2026-07-28 first, the handshake kept for older clients. The gateway serves only
+        # the versions listed; asked for another, it answers 400 / -32022.
+        "supportedVersions": ["2026-07-28", "2025-11-25"],
         # Without this the gateway issues no Mcp-Session-Id and every tools/call
         # cold-starts a fresh downstream microVM (measured; see docs).
         "sessionConfiguration": {"sessionTimeoutInSeconds": 3600}}},
@@ -704,6 +706,14 @@ print(json.dumps({
   if [ -z "$gid" ] || [ "$gid" = "None" ]; then
     echo "  creating gateway"
     gid="$(acp create_gateway "$gw_params" "$ws_region" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["gatewayId"])')"
+  elif [ "$(aws bedrock-agentcore-control get-gateway --region "$ws_region" --gateway-identifier "$gid" \
+            --query "join(',', protocolConfiguration.mcp.supportedVersions)" --output text)" != "2026-07-28,2025-11-25" ]; then
+    # A gateway created with the handshake only. An account not enabled for MCP version
+    # updates refuses this; the agent then reaches the gateway through the handshake anyway.
+    echo "  updating gateway $gid to serve MCP 2026-07-28"
+    acp update_gateway "$(GW_PARAMS="$gw_params" GID="$gid" uv run python -c 'import json,os
+print(json.dumps({**json.loads(os.environ["GW_PARAMS"]), "gatewayIdentifier": os.environ["GID"]}))')" \
+      "$ws_region" >/dev/null || echo "  (version update refused; the gateway keeps the handshake)"
   fi
   # A gateway is briefly CREATING/UPDATING; targets can't be added until it settles.
   for _ in $(seq 1 30); do

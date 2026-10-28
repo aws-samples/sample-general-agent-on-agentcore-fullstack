@@ -27,7 +27,6 @@ from identity import lark_3lo
 log = logging.getLogger("agent.websearch")
 
 _GATEWAY_URL = os.environ.get("WEBSEARCH_GATEWAY_URL", "")
-_MCP_VERSION = "2025-11-25"  # the version the gateway was created with
 
 
 def available() -> bool:
@@ -49,9 +48,6 @@ def connection_for(actor_id: str) -> dict:
     return {
         "transport": "streamable_http",
         "url": _GATEWAY_URL,
-        # The Gateway is stateless and returns no session id; without this header it
-        # negotiates 2025-03-26 and rejects the request (-32022).
-        "headers": {"MCP-Protocol-Version": _MCP_VERSION},
         "auth": lark_3lo._SigV4HTTPXAuth(creds, "bedrock-agentcore", region),
         "timeout": timedelta(seconds=60),
     }

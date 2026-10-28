@@ -23,9 +23,13 @@
 'use strict';
 
 const http = require('http');
+// In the image it sits beside this file (scripts/build-mcp.sh copies it in); in the repo, in _shared/.
+const protocol = require(require('fs').existsSync(`${__dirname}/mcp-protocol.js`)
+  ? './mcp-protocol' : '../_shared/mcp-protocol');
 const fs = require('fs');
 const crypto = require('crypto');
 
+const SERVER_INFO = { name: 'probe-mcp', version: '1.0.0' };
 const PORT = parseInt(process.env.PORT || '8000', 10);
 const STARTUP_ID = crypto.randomBytes(4).toString('hex');
 const MARKER = `/tmp/probe-${STARTUP_ID}`;
@@ -68,8 +72,8 @@ const TOOL = {
   inputSchema: { type: 'object', properties: {} },
 };
 
-function sse(res, obj) {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+function sse(res, obj, status = 200) {
+  res.writeHead(status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   res.end(`event: message\ndata: ${JSON.stringify(obj)}\n\n`);
 }
 
@@ -79,14 +83,14 @@ http.createServer((req, res) => {  // nosemgrep: using-http-server — TLS termi
   req.on('data', (c) => (body += c));
   req.on('end', () => {
     let mcp; try { mcp = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
-    if (mcp.method === 'initialize') {
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
-        protocolVersion: '2025-11-25', capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: 'probe-mcp', version: '1.0.0' } } });
+    const early = protocol.lifecycle(mcp, SERVER_INFO);
+    if (early) {
+      if (!early.body) { res.writeHead(early.status); res.end(); return; }
+      return sse(res, early.body, early.status);
     }
-    if (mcp.method === 'notifications/initialized') { res.writeHead(202); res.end(); return; }
+    const send = (payload) => sse(res, protocol.reply(mcp, payload, SERVER_INFO));
     if (mcp.method === 'tools/list') {
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { tools: [TOOL] } });
+      return send({ jsonrpc: '2.0', id: mcp.id, result: { tools: [TOOL] } });
     }
     // Plain POST with no MCP method: the HTTP-protocol shape, which is how the agent
     // runtime itself is invoked. Session affinity is a property of that shape, not of a
@@ -101,10 +105,10 @@ http.createServer((req, res) => {  // nosemgrep: using-http-server — TLS termi
     if (mcp.method === 'tools/call') {
       const obs = observe(req.headers);
       console.log('probe ' + JSON.stringify(obs));
-      return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
+      return send({ jsonrpc: '2.0', id: mcp.id, result: {
         content: [{ type: 'text', text: JSON.stringify(obs) }] } });
     }
-    return sse(res, { jsonrpc: '2.0', id: mcp.id || null, error: { code: -32601, message: `method not found: ${mcp.method}` } });
+    return send({ jsonrpc: '2.0', id: mcp.id || null, error: { code: -32601, message: `method not found: ${mcp.method}` } });
   });
 }).listen(PORT, '0.0.0.0', () => {  // nosec B104 # nosemgrep: avoid-bind-to-all-interfaces — the Runtime routes to this port
   console.log(`probe-mcp on :${PORT} startupId=${STARTUP_ID} node=${process.version}`);

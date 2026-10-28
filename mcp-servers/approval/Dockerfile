@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 
 WORKDIR /app
-COPY server.js /app/server.js
+COPY server.js mcp-protocol.js /app/
 
 EXPOSE 8000
 

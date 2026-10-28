@@ -28,7 +28,7 @@ RUN npx -y @larksuite/cli@${LARK_CLI_VERSION} install 2>/dev/null || npm install
 RUN npx -y skills add larksuite/cli -y -g 2>/dev/null || true
 
 WORKDIR /app
-COPY server.js /app/server.js
+COPY server.js mcp-protocol.js /app/
 
 EXPOSE 8000
 
