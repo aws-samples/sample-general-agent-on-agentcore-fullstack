@@ -43,6 +43,8 @@ mint_jwt() { # actor_id
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
   COGNITO_USER_POOL_ID="$(sec_out UserPoolId)" \
   COGNITO_CLIENT_ID="$(sec_out UserPoolClientId)" \
+  IDENTITY_TABLE_NAME="$(aws cloudformation describe-stacks --stack-name "$PREFIX-router" \
+      --query "Stacks[0].Outputs[?OutputKey=='IdentityTableName'].OutputValue" --output text)" \
   COGNITO_PASSWORD_SECRET_ID="$(aws cloudformation describe-stack-resources \
       --stack-name "$PREFIX-security" \
       --query "StackResources[?starts_with(LogicalResourceId,'CognitoPasswordSecret')].PhysicalResourceId" \
