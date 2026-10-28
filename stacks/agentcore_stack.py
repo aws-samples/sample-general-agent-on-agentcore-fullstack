@@ -220,6 +220,17 @@ class AgentCoreStack(Stack):
                 resources=[f"arn:aws:bedrock-agentcore:{region}:{account}:*code-interpreter*/{rt_prefix}_*"],
             )
         )
+        # The web browser: AWS's own aws.browser.v1, whose ARN carries the account "aws". Granted
+        # whether BROWSER is on or not, so switching it needs no stack update. No
+        # ListBrowserSessions: a session id is all that separates two users' browsers.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock-agentcore:StartBrowserSession",
+                         "bedrock-agentcore:StopBrowserSession",
+                         "bedrock-agentcore:ConnectBrowserAutomationStream"],
+                resources=[f"arn:aws:bedrock-agentcore:{region}:aws:browser/aws.browser.v1"],
+            )
+        )
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 # TagResource because creating an Access Point tags it with its actor, and

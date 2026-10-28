@@ -27,15 +27,17 @@ class Delivery(ABC):
     """One surface's answer to "can this file reach the person, and how"."""
 
     @abstractmethod
-    def refusal(self, name: str, size: int) -> str | None:
+    def refusal(self, name: str, size: int, *, in_workspace: bool = True) -> str | None:
         """Why this file cannot be sent, or None if it can.
 
         Asked before the bytes are read so an impossible send costs one `stat` rather
-        than pushing tens of megabytes of base64 across the control plane."""
+        than pushing tens of megabytes of base64 across the control plane. `in_workspace`
+        is whether a copy stays there — false for a browser screenshot — so no sentence
+        points the model at a file that does not exist."""
 
     @abstractmethod
-    def send_file(self, name: str, data: bytes,
-                  cover: Callable[[], bytes | None]) -> str:
+    def send_file(self, name: str, data: bytes, cover: Callable[[], bytes | None],
+                  *, in_workspace: bool = True) -> str:
         """Send it, and report in a sentence the model can repeat to the user — or (sentence,
         artifact), the artifact being what the tool message keeps out of the model's sight,
         such as a stored file's key, for a surface that shows it again later.
@@ -57,7 +59,7 @@ class LarkDelivery(Delivery):
         # in — lark_card._rid_type reads which it is.
         self.target = target
 
-    def refusal(self, name: str, size: int) -> str | None:
+    def refusal(self, name: str, size: int, *, in_workspace: bool = True) -> str | None:
         if size > self.MAX_BYTES:
             return (f"{name} is {size / 1e6:.1f} MB and Lark accepts 30 MB. "
                     "Compress it or split it, then send again.")
@@ -67,8 +69,8 @@ class LarkDelivery(Delivery):
     # is something the user has to download before they can look at it.
     _IMAGES = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 
-    def send_file(self, name: str, data: bytes,
-                  cover: Callable[[], bytes | None]) -> str:
+    def send_file(self, name: str, data: bytes, cover: Callable[[], bytes | None],
+                  *, in_workspace: bool = True) -> str:
         suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         if suffix in self._IMAGES:
             try:
@@ -123,14 +125,14 @@ class WebDelivery(Delivery):
         self.out = out
         self.actor_id = actor_id
 
-    def refusal(self, name: str, size: int) -> str | None:
+    def refusal(self, name: str, size: int, *, in_workspace: bool = True) -> str | None:
         if size > self.MAX_BYTES:
             return (f"{name} is {size / 1e6:.1f} MB and the web page takes 8 MB. "
                     "Compress it or split it, then send again.")
         return None
 
-    def send_file(self, name: str, data: bytes,
-                  cover: Callable[[], bytes | None]) -> str | tuple[str, dict]:
+    def send_file(self, name: str, data: bytes, cover: Callable[[], bytes | None],
+                  *, in_workspace: bool = True) -> str | tuple[str, dict]:
         # The key is returned, not kept on this object: one run's tool calls can run in
         # parallel, and a shared slot lost a file's record when two were sent at once.
         if web_files.configured() and self.actor_id:
@@ -147,7 +149,7 @@ class WebDelivery(Delivery):
             "name": name, "size": len(data), "data": base64.b64encode(data).decode()}})
         # The stream is the only copy: what the model tells the user has to say so.
         return (f"Sent {name} to the page, where it shows while the page stays open; it is "
-                "not kept there, but stays in the workspace.")
+                "not kept there" + (", but stays in the workspace." if in_workspace else "."))
 
 
 class NoDelivery(Delivery):
@@ -160,14 +162,17 @@ class NoDelivery(Delivery):
     def __init__(self, surface: str = "this surface") -> None:
         self.surface = surface
 
-    def refusal(self, name: str, size: int) -> str | None:
+    def refusal(self, name: str, size: int, *, in_workspace: bool = True) -> str | None:
+        if not in_workspace:
+            return (f"{name} was not sent: {self.surface} cannot receive files yet. "
+                    "Do not claim it was sent.")
         return (f"{name} ({size / 1e3:.0f} kB) stays in the workspace: {self.surface} "
                 "cannot receive files yet. Say where it is and that it persists, or "
                 "offer to show its contents. Do not claim it was sent.")
 
-    def send_file(self, name: str, data: bytes,
-                  cover: Callable[[], bytes | None]) -> str:
-        return self.refusal(name, len(data)) or ""
+    def send_file(self, name: str, data: bytes, cover: Callable[[], bytes | None],
+                  *, in_workspace: bool = True) -> str:
+        return self.refusal(name, len(data), in_workspace=in_workspace) or ""
 
 
 def for_run(config: dict | None) -> Delivery:

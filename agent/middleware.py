@@ -9,7 +9,7 @@ import logging
 import os
 import time
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from channels import images
 from runtime import telemetry
@@ -62,6 +62,8 @@ def _thread_of(runtime) -> str:  # noqa: ANN001 — the framework's own type
 # Bedrock's per-request image limit is about 20; a turn that has had pictures steered into
 # it can gather more than that.
 _MAX_IMAGES_PER_REQUEST = 20
+# A tool's screenshots ride on every later model call of the turn, so only the newest few do.
+_MAX_SCREENSHOTS_PER_REQUEST = 2
 
 
 class _ImageMiddleware:
@@ -79,10 +81,21 @@ class _ImageMiddleware:
         pixels = images.pixels_for(_thread_of(request.runtime))
         if not pixels or not request.messages:
             return request
-        out, room = [], _MAX_IMAGES_PER_REQUEST
+        out, room, shots = [], _MAX_IMAGES_PER_REQUEST, _MAX_SCREENSHOTS_PER_REQUEST
         # Newest first, so if a turn has gathered more pictures than one request may carry,
         # the ones dropped are the oldest.
         for m in reversed(request.messages):
+            if isinstance(m, ToolMessage):
+                blocks = pixels.get("tool:" + (m.tool_call_id or ""))
+                if blocks and shots > 0 and room > 0:
+                    blocks = blocks[:room]
+                    shots, room = shots - 1, room - len(blocks)
+                    text = m.content if isinstance(m.content, str) else ""
+                    # A copy, so the result keeps its tool_call_id and stays paired with the
+                    # call; the stored one keeps only its text.
+                    m = m.model_copy(update={"content": [{"type": "text", "text": text}] + list(blocks)})
+                out.append(m)
+                continue
             blocks = pixels.get(getattr(m, "id", None)) if isinstance(m, HumanMessage) else None
             blocks = (blocks or [])[:max(room, 0)]
             room -= len(blocks)

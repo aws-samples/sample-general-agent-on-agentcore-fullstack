@@ -120,6 +120,8 @@ probe iam            aws iam list-roles --max-items 1
 # Files storage reaches three services nothing else here touches, and s3files is new
 # enough that an old CLI simply has no such command — which is worth catching before a
 # deploy that creates a VPC.
+[ "${BROWSER:-false}" != "true" ] || probe browser \
+  aws bedrock-agentcore list-browser-sessions --browser-identifier aws.browser.v1 --max-results 1
 if [ "${FILES_STORAGE:-false}" = "true" ]; then
   # boto3, not `aws s3files`: that subcommand is absent from AWS CLI 2.34, so probing it
   # through the CLI reports a denial where the real problem is the CLI's vocabulary.
@@ -163,6 +165,7 @@ echo "  model   : $MODEL_ID"
 echo "  lark    : $([ "$LARK" = "true" ] && echo "$LARK_API_DOMAIN" || echo 'off  (web page only)')"
 echo "  build   : $AGENT_BUILD$([ "$AGENT_BUILD" = "local" ] && echo '  (local Docker)' || echo '  (CodeBuild, ARM64 native)')"
 echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"
+echo "  browser : ${BROWSER:-false}$([ "${BROWSER:-false}" = "true" ] && echo '  (AgentCore Browser, per second while one runs)' || true)"
 echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && echo "  (creates a VPC + S3 Files)" || true)"
 if [ "${FILES_STORAGE:-false}" = "true" ]; then
   echo "  nat     : ${NAT_GATEWAY:-false}$([ "${NAT_GATEWAY:-false}" = "true" ] && echo '  (code sandbox gets internet; NAT is a fixed hourly cost)' || true)"

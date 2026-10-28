@@ -10,7 +10,7 @@ import pytest
 import tools
 from identity import grants, lark_3lo
 from runtime import sessions
-from tools import code_interpreter, mcp_client, memory, web_search
+from tools import browser, code_interpreter, mcp_client, memory, web_search
 
 from support import _dummy_tool, _make_tool
 
@@ -54,7 +54,7 @@ def test_unauthorized_session_passes_an_empty_token_and_still_gets_tools():
 
 
 def test_every_configured_component_reaches_the_session_as_tools():
-    """Search, memory, whoami and code execution are each one branch of tools.assemble; a
+    """Search, memory, whoami, code and browser are each one branch of tools.assemble; a
     branch that stops adding its tools leaves the agent without them and nothing fails."""
     async def fake_open(stack, connection):
         return [_make_tool("WebSearch___WebSearch")]
@@ -67,11 +67,15 @@ def test_every_configured_component_reaches_the_session_as_tools():
          mock.patch.object(memory, "tools_for", return_value=[_make_tool("remember")]), \
          mock.patch.object(code_interpreter, "available", return_value=True), \
          mock.patch.object(code_interpreter, "_Sandbox", return_value=sandbox), \
-         mock.patch.object(code_interpreter, "tools_for", return_value=[_make_tool("run_code")]):
+         mock.patch.object(code_interpreter, "tools_for", return_value=[_make_tool("run_code")]), \
+         mock.patch.object(browser, "available", return_value=True), \
+         mock.patch.object(browser, "tools_for", return_value=[_make_tool("browser_open")]), \
+         mock.patch.object(browser, "for_conversation") as for_conversation:
         s = sessions._build_session("web:s-1", "", "mem-all")
     assert s["tool_source"] == {"WebSearch___WebSearch": "web_search", "remember": "memory",
-                                "whoami": "identity", "run_code": "code"}
+                                "whoami": "identity", "run_code": "code", "browser_open": "browser"}
     assert s["sandbox"] is sandbox      # kept, so closing the session stops it
+    for_conversation.assert_called_with("web:s-1", "mem-all")   # the page outlives the session
 
 
 # Two tools, not automatic extraction. The isolation that matters is the namespace: it is

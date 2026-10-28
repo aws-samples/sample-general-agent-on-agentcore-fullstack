@@ -161,6 +161,16 @@ def register(thread_id: str, handles: list[dict], blocks: list[dict]) -> tuple[s
     return "\n".join(marks), message_id
 
 
+def add_tool_pixels(thread_id: str, tool_call_id: str, blocks: list[dict]) -> None:
+    """Pixels a tool produced — a browser screenshot — for this turn's model calls only, bound
+    to the tool call, so the stored result keeps its text and is not billed again later."""
+    if not (thread_id and tool_call_id and blocks):
+        return
+    with _lock:
+        _turns.setdefault(thread_id, {"pixels": {}, "handles": []})["pixels"][
+            "tool:" + tool_call_id] = list(blocks)
+
+
 def from_page(content: list) -> tuple[str, list[dict], list[dict]]:
     """A web message's AG-UI content as (text, handles, blocks): the page sends pictures
     inline, and like a Lark picture each is shown to the model on its own turn only — kept

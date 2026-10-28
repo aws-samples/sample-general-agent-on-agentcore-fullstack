@@ -21,6 +21,7 @@ import os
 from contextlib import AsyncExitStack
 
 
+from tools import browser
 from tools import code_interpreter
 from tools import mcp_client
 from identity import lark_3lo
@@ -51,7 +52,8 @@ async def _aopen_tools(stack: AsyncExitStack, connection: dict, on_refused=None)
     return await mcp_client.open_tools(stack, connection, on_refused)
 
 
-async def assemble(actor_id: str, stack: AsyncExitStack, workload_token: str = "") -> dict:
+async def assemble(actor_id: str, stack: AsyncExitStack, workload_token: str = "",
+                   thread_id: str = "") -> dict:
     """The tools this user's session gets, and what the consent wall needs to know
     about them. Agent-side 3LO: fetch the user's vaulted Lark
     token if there is one and open MCP sessions to the tool servers (SigV4 + the token
@@ -198,6 +200,11 @@ async def assemble(actor_id: str, stack: AsyncExitStack, workload_token: str = "
     sandbox = code_interpreter._Sandbox(actor_id) if code_interpreter.available() else None
     if sandbox is not None:
         tools += _tag(code_interpreter.tools_for(actor_id, sandbox), "code")
+
+    # A web browser, when enabled: this conversation's, from browser's own registry rather than
+    # this session, which is rebuilt far more often than a page should be lost.
+    if browser.available():
+        tools += _tag(browser.tools_for(browser.for_conversation(actor_id, thread_id)), "browser")
     return {"tools": tools, "sandbox": sandbox,
             "auth_url": auth_url, "identity_error": identity_error,
             "consent": consent, "refused": refused, "tool_idp": tool_idp,

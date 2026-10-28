@@ -335,6 +335,8 @@ env = {
     "WORKSPACE_PATH": "/mnt/workspace" if e["CI_ID"] else "",
     # Tells the code tools whether to promise installs; the NAT is what makes it true.
     "CODE_INTERNET": e["CODE_NET"],
+    # The browser tools; the role's grant on aws.browser.v1 is unconditional.
+    "BROWSER_ENABLED": os.environ.get("BROWSER", ""),
 }
 # The Runtime is never in the VPC: it must keep reaching Bedrock, Lark and a cross-region
 # Gateway, and that is what used to force a NAT. Only the sandbox goes in.

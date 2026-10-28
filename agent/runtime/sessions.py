@@ -36,6 +36,7 @@ import core
 from identity import grants
 import middleware
 import tools
+from tools import browser
 from runtime import turns
 
 log = logging.getLogger("agent.sessions")
@@ -298,7 +299,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     """Build a session for this user: its tools (tools.assemble), the agent over them
     (core.build), and the conversation's checkpoint, repaired if its last turn was cut off."""
     stack = AsyncExitStack()
-    kit = await tools.assemble(actor_id, stack, workload_token)
+    kit = await tools.assemble(actor_id, stack, workload_token, thread_id=mem_sid)
     graph = core.build(kit["tools"], _checkpointer())
     # thread_id is the whole checkpoint address (chosen by the router, so /reset can
     # rotate it) — DynamoDBSaver derives its partition key from it alone, and since it is
@@ -355,6 +356,8 @@ def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
     expiry. A pending-authorization session (no token yet) is NOT cached — so the next
     turn re-checks the vault and picks up a freshly consented token."""
     cache_key = f"{actor_id}|{mem_sid}"
+    if browser.available():
+        browser.sweep()      # browsers outlive sessions, so idle ones are stopped from here
     log.info("session lookup: key=%s cached=%s fresh=%s",
              cache_key[-28:], cache_key in _sessions, fresh)
     with _lock:
@@ -542,6 +545,8 @@ def clear_history(actor_id: str, mem_sid: str = "") -> dict:
     history does not mean "except the parts extracted from it"."""
     config = _thread_config(actor_id, mem_sid)
     thread_id = config["configurable"]["thread_id"]
+    if browser.available():
+        browser.close(actor_id, thread_id)
     with _lock:
         for key in [k for k in _sessions if k.endswith(f"|{thread_id}")]:
             s = _sessions.pop(key, None)
