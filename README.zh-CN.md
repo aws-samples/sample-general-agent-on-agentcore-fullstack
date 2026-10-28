@@ -60,13 +60,13 @@
 | **会话状态** | 一次对话*内部*记住什么 | DynamoDB checkpoint,每个 superstep 都写入,因此在 15 分钟上限处被截断的一轮对话可以续接 |
 | **长期记忆** | *跨*对话记住什么 | **AgentCore Memory**,通过 `remember`/`recall`——只有当模型判断某个事实值得跨对话保留时才写入 |
 | **持久化存储** | 什么内容在容器之外仍然存在、归谁所有 | **S3 Files**,每个用户一个 Access Point,挂载到 `/mnt/workspace`;隔离边界是 microVM,而不是 Agent 代码 |
-| **工具(Tools)** | 它能做什么、以谁的身份做 | 各自独立 Runtime 上的 **MCP server**——`lark-cli` 和 `google` 以调用者本人身份行事,审批相关操作用应用身份;**Gateway** 提供网络搜索;**Code Interpreter** 运行生成的代码,并用 `deliver_file` 把产物发进聊天、用 `save_attachment` 打开用户发来的文件 |
+| **工具(Tools)** | 它能做什么、以谁的身份做 | 各自独立 Runtime 上的 **MCP server**——`lark-cli` 和 `google` 以调用者本人身份行事,审批相关操作用应用身份;**Gateway** 提供网络搜索;**Code Interpreter** 运行生成的代码,并用 `deliver_file` 把产物发进聊天、用 `save_attachment` 打开用户发来的文件;**Browser** 打开需要 JavaScript 的网页,每个对话一个浏览器 |
 | **可观测性** | 它做了什么、是否成功 | **AgentCore Observability** 提供 trace 和日志;一个 CloudWatch dashboard 叠加平台指标与 Agent 自身指标——对话结果、按名称统计的工具调用、自我修复次数 |
 | **运维(Operations)** | 如何部署与销毁 | CloudFormation 覆盖的部分用 CDK,其余用控制面 API 调用,两者都由同一个 `./deploy.sh` 按顺序编排 |
 
-有意不使用两个 AgentCore 原语:Browser(这里不需要无头浏览器)和 Evaluations——回答质量是一个独立课题,有自己的项目 [cs-agent-eval-loop](https://github.com/aleck31/cs-agent-eval-loop),本仓库只衡量"机制本身是否跑通"。
+有意不使用一个 AgentCore 原语:Evaluations——回答质量是一个独立课题,有自己的项目 [cs-agent-eval-loop](https://github.com/aleck31/cs-agent-eval-loop),本仓库只衡量"机制本身是否跑通"。
 
-四个层默认关闭,因为各自会带来额外成本或控制台配置工作:`WEB_SEARCH`、`WEBUI`、`A2A`、以及带存储的代码执行(`FILES_STORAGE`)。不开启任何一个,Agent 依然能正常运行。
+五个层默认关闭,因为各自会带来额外成本或控制台配置工作:`WEB_SEARCH`、`WEBUI`、`A2A`、`BROWSER`、以及带存储的代码执行(`FILES_STORAGE`)。不开启任何一个,Agent 依然能正常运行。
 
 ## 目录结构
 
@@ -98,6 +98,8 @@
 | `tools/` | **Agent 能做什么**:`__init__.py` 里的 `assemble()` 把各个组件接成工具 | |
 | ├ `memory.py` | `remember` / `recall` | Memory |
 | ├ `code_interpreter.py` | 在每个用户自己的工作区里运行生成的代码;`deliver_file`、`save_attachment` | Code Interpreter |
+| ├ `browser.py` | 每个对话一个网页浏览器:`browser_open`、`_snapshot`、`_click`、`_type`、`_screenshot` | Browser |
+| ├ `mcp_client.py` | 把 MCP server 的工具转成 LangChain 工具,基于 MCP 2.x SDK,两代协议都支持 | |
 | └ `web_search.py` | Web 搜索 | Gateway |
 | `identity/` | **调用者是谁,工具用谁的凭证** | Identity |
 | ├ `caller.py` | 验证过的 Cognito token | |

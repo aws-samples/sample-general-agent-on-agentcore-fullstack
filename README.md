@@ -61,13 +61,13 @@ Ten layers, each with a real implementation rather than a stub — that is the "
 | **Session state** | what it remembers *within* a conversation | DynamoDB checkpoints, written per superstep, so a turn cut off at the 15-minute cap resumes |
 | **Long-term memory** | what it remembers *across* conversations | **AgentCore Memory** via `remember`/`recall` — written only when the model decides a fact should outlast the chat |
 | **Persistent storage** | what survives the container, and whose it is | **S3 Files**, one Access Point per user, mounted at `/mnt/workspace`; isolated at the microVM boundary, not by agent code |
-| **Tools** | what it can do, and as whom | **MCP servers** on their own Runtimes — `lark-cli` and `google` as the calling user, approvals on the app identity; **Gateway** for web search; **Code Interpreter** for generated code, with `deliver_file` to send a result into the chat and `save_attachment` to open what the user sent |
+| **Tools** | what it can do, and as whom | **MCP servers** on their own Runtimes — `lark-cli` and `google` as the calling user, approvals on the app identity; **Gateway** for web search; **Code Interpreter** for generated code, with `deliver_file` to send a result into the chat and `save_attachment` to open what the user sent; **Browser** for pages that need JavaScript, one browser per conversation |
 | **Observability** | what it did, and whether it worked | **AgentCore Observability** for traces and logs; a CloudWatch dashboard over platform metrics plus the agent's own — turn outcomes, tool calls by name, self-repairs |
 | **Operations** | how it deploys and tears down | CDK for what CloudFormation covers, control-plane calls for the rest, both ordered by one `./deploy.sh` |
 
-Two AgentCore primitives are deliberately **not** used: Browser (nothing here needs a headless one) and Evaluations — answer quality is a separate concern with its own project, [cs-agent-eval-loop](https://github.com/aleck31/cs-agent-eval-loop), so this repo measures only whether the machinery ran.
+One AgentCore primitive is deliberately **not** used: Evaluations — answer quality is a separate concern with its own project, [cs-agent-eval-loop](https://github.com/aleck31/cs-agent-eval-loop), so this repo measures only whether the machinery ran.
 
-Four layers ship switched off, because each adds cost or console work: `WEB_SEARCH`, `WEBUI`, `A2A`, and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
+Five layers ship switched off, because each adds cost or console work: `WEB_SEARCH`, `WEBUI`, `A2A`, `BROWSER`, and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
 
 Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and the deploy serves the web page alone: users sign in at its hosted login, the admin invites them on its 管理 view, and Lark, Google and GitHub are downstream systems each user authorizes from the chat when a tool first needs one → [docs/deploy.md](docs/deploy.md#without-lark).
 
@@ -101,6 +101,8 @@ Start at `core.py`: it is the agent itself. Each directory around it answers one
 | `tools/` | **what the agent can do**: `assemble()` in `__init__.py` plugs each component in | |
 | ├ `memory.py` | `remember` / `recall` | Memory |
 | ├ `code_interpreter.py` | generated code in a per-user workspace; `deliver_file`, `save_attachment` | Code Interpreter |
+| ├ `browser.py` | a web browser per conversation: `browser_open`, `_snapshot`, `_click`, `_type`, `_screenshot` | Browser |
+| ├ `mcp_client.py` | an MCP server's tools as LangChain tools, over the MCP 2.x SDK; either protocol era | |
 | └ `web_search.py` | web search | Gateway |
 | `identity/` | **who is calling, and whose credentials the tools use** | Identity |
 | ├ `caller.py` | the verified Cognito token | |

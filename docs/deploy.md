@@ -44,6 +44,8 @@ Leave `LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_ENCRYPT_KEY`, `LARK_VERIFICATION_T
 
 Optional web search: set `WEB_SEARCH=true` in `.env` before deploying (or run `./deploy.sh gateway` then `./deploy.sh runtime`). That provisions a Gateway fronting AgentCore's built-in Web Search connector — **in us-east-1, the only region offering it**, so the agent calls it cross-region. Search carries no end-user identity, so it uses `GATEWAY_IAM_ROLE` and never touches the per-user 3LO path the Lark tools have to avoid. Off by default; the agent just runs without the tool.
 
+Optional web browser: set `BROWSER=true` and run `./deploy.sh runtime`. The agent uses AWS's managed `aws.browser.v1`, so nothing is created; the execution role's grant on it is always there, so switching the flag needs no stack update. Read the trade-off in [architecture.md](architecture.md#the-web-browser) first.
+
 ### Tear down
 
 ```bash
@@ -81,6 +83,7 @@ This deploys billable AWS resources. All the always-on pieces are consumption- o
 - **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. No dynamic per-user secrets.
 - **Web search (optional)** — only when `WEB_SEARCH=true`: an AgentCore Gateway plus per-query connector charges. The gateway sits in us-east-1, so its traffic is cross-region.
 - **Code execution (optional, `FILES_STORAGE=true`)** — **no NAT.** A mount needs a VPC, but only the Code Interpreter session goes in there, and it only has to reach S3, which a free gateway endpoint does. So the fixed cost is a VPC (free), an S3 gateway endpoint (free) and mount targets (free); what is metered is sandbox session time and the S3 storage the workspace uses. Off by default because it still adds resources you should not create by accident.
+- **Web browser (optional, `BROWSER=true`)** — per second of CPU and memory while a browser session runs. A conversation's browser stops after 15 minutes unused, and in any case at its 1-hour session timeout.
 - **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume.
 
 `scripts/destroy.sh` removes everything `deploy.sh` created, including the OAuth credential provider and both gateways. Costs are usage-driven; an idle deployment still accrues the two microVMs' memory-time and the two static per-secret charges.
