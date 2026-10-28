@@ -78,15 +78,44 @@ Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and th
 | `app.py`, `cdk.json` | CDK app (uv-managed deps). Deployment state goes to `.cdk-state.<DEPLOYMENT_NAME>.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
 | `stacks/` | security, agentcore, router, shim, gateway, observability, plus sandbox and webui when their flags are on |
-| `agent/` | the agent container: HTTP contract + DynamoDB checkpoints + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`). `code_tools.py` runs generated code in a per-user sandbox; `agui.py` serves the browser off the same Runtime; `a2a_server.py` is a second entrypoint on the same image (`SERVER_MODE=a2a`) |
+| `agent/` | the agent container, file by file below |
 | `webui/` | the web chat page and the admin page (`admin.html`, who may sign in) — static files sharing `login.js`, no build step; deploy-time values arrive as `config.js` |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-servers/` | One directory per MCP server, one Runtime each: `lark-cli/` acts as the user against Lark, `google/` does the same against Google (the second system, added to test that the identity chain is not Lark-specific), `approval/` runs approval decisions on the app identity. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
 | `scripts/` | step implementations: preflight / provision (base/memory/code/runtime/gateway/a2a/webui) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
-| `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
+| `tests/` | unit suites per component (`agent/`, `router/`, `shim/`, `mcp/`), run by `run.sh`; `e2e/` needs a deployed stack |
 | `mcp-servers/probe/` | a measurement MCP server, not part of the deployed agent — how the findings in `docs/agentcore-behavior.md` were established |
+
+### `agent/`, by role
+
+Start at `core.py`: it is the agent itself. Each directory around it answers one question.
+
+| Path | Role | AgentCore |
+|---|---|---|
+| `core.py` | **The agent**: system prompt, model and prompt caching, the middleware it runs, `build()` — LangGraph `create_agent` over a session's tools | |
+| `middleware.py` | around each model call: steering a mid-turn message in, pictures on the request only, timestamps, summarisation | |
+| `server.py` | **the Runtime contract**: `GET /ping`, `POST /invocations` on 8080 — with `Dockerfile` (ARM64) and `entrypoint.sh` (`opentelemetry-instrument`) | Runtime |
+| `a2a_server.py` | the Runtime's A2A contract on 9000 (`SERVER_MODE=a2a`), for peer agents | Runtime |
+| `tools/` | **what the agent can do**: `assemble()` in `__init__.py` plugs each component in | |
+| ├ `memory.py` | `remember` / `recall` | Memory |
+| ├ `code_interpreter.py` | generated code in a per-user workspace; `deliver_file`, `save_attachment` | Code Interpreter |
+| └ `web_search.py` | web search | Gateway |
+| `identity/` | **who is calling, and whose credentials the tools use** | Identity |
+| ├ `caller.py` | the verified Cognito token | |
+| ├ `grants.py` | per-user grants to downstream systems (`_DOWNSTREAMS`), the consent wall, `/auth`, `whoami` | |
+| └ `lark_3lo.py` | vault reads and consent links; the Lark MCP connection | |
+| `runtime/` | **one built agent per conversation, one turn at a time** | |
+| ├ `sessions.py` | the session cache; DynamoDB checkpoints; history, `/clear`, `/compact` | |
+| ├ `turns.py` | claims, the steering queue, the event loop MCP sessions live on | |
+| └ `telemetry.py` | agent-level metrics the platform cannot see | Observability |
+| `channels/` | **how a turn arrives and the answer leaves** | |
+| ├ `lark.py`, `lark_card.py` | Lark: a message answered into a streaming card; the synchronous reply | |
+| ├ `agui.py` | the web page, AG-UI over SSE | |
+| └ `delivery.py`, `web_files.py`, `images.py` | where a produced file goes per surface; files stored for the web page; pictures and attachments in | |
+
+To change the prompt, set `AGENT_SYSTEM_PROMPT` (default in `core.py`); the model, `MODEL_ID`. A new component goes into `tools/`, wired in `tools.assemble()`; a new downstream system into `identity/grants.py` `_DOWNSTREAMS` → [docs/per-user-oauth.md](docs/per-user-oauth.md).
 
 ## Quick start
 

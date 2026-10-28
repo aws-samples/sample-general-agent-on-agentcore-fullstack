@@ -59,6 +59,22 @@
 - Agent Runtime 是公网模式，不在 VPC 里，直接访问 Bedrock、AgentCore 各服务和 GitHub。
 - 只有 Code Interpreter 的会话在沙箱 VPC 里。它通过免费的 S3 gateway endpoint 访问工作区，通过 NAT gateway 访问互联网。
 
+## 代码在哪里
+
+Agent 的代码都在 `agent/` 目录，从 `core.py` 看起。
+
+| 想看 | 文件 |
+|---|---|
+| Agent 本体：system prompt、模型、`create_agent` | `agent/core.py` |
+| 各个组件怎么接成工具 | `agent/tools/`：`__init__.py` 里的 `assemble()` 负责接入；Memory 在 `memory.py`，Code Interpreter 在 `code_interpreter.py`，Gateway 在 `web_search.py` |
+| 调用者是谁、工具用谁的凭证（Identity） | `agent/identity/` |
+| 会话和并发 | `agent/runtime/` |
+| 入口：Lark、网页 | `agent/channels/`，网页本身在 `webui/` |
+| AgentCore Runtime 的接口规范 | `agent/server.py`：8080 端口的 `/ping` 和 `/invocations` |
+| 基础设施和部署 | `stacks/`（CDK）、`scripts/` |
+
+逐个文件的说明见仓库 README 的 [`agent/` 按角色分](https://github.com/aws-samples/sample-general-agent-on-agentcore-fullstack/blob/main/README.zh-CN.md#agent-按角色分)。
+
 ## 数据存在哪里
 
 | 数据 | 位置 | 隔离方式 |

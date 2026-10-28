@@ -75,15 +75,44 @@
 | `app.py`、`cdk.json` | CDK 应用(依赖由 uv 管理)。部署状态写入 `.cdk-state.<DEPLOYMENT_NAME>.json`,不在这里 |
 | `.env` | 部署目标(`PROFILE`/`REGION`/`MODEL_ID`)+ Lark 凭证——已加入 .gitignore,每个脚本都会读取 |
 | `stacks/` | security、agentcore、router、shim、gateway、observability,以及开启对应 flag 时的 storage 和 webui |
-| `agent/` | Agent 容器:HTTP 契约 + DynamoDB checkpoint + 按用户的 3LO(`lark_3lo`)+ 面向 lark-cli server 的 MCP 客户端,以及可选的网络搜索(`websearch`);在后台运行每一轮对话,并将答案流式写入卡片(`lark_notify`)。`code_tools.py` 在按用户隔离的沙箱中运行生成的代码;`agui.py` 在同一个 Runtime 上为浏览器提供服务;`a2a_server.py` 是同一镜像上的第二个入口(`SERVER_MODE=a2a`) |
+| `agent/` | Agent 容器,逐个文件见下表 |
 | `webui/` | 网页聊天页面——单个静态文件,无需构建步骤;部署时的配置值写入 `config.js` |
 | `lambda/router/` | Lark webhook:校验/解密/租户 token/发送 + 3LO 授权等待 + 聊天命令。也是唯一签发按用户 JWT 的组件(`cognito.py`) |
 | `lambda/shim/` | Lark OAuth 的 RFC-6749 适配层 + 3LO 回调端点(`CompleteResourceTokenAuth`,随后给用户发私信) |
 | `mcp-servers/` | 每个 MCP server 一个目录,各自一个 Runtime:`lark-cli/` 以用户身份操作 Lark,`google/` 对 Google 做同样的事(第二个下游系统,用于验证身份链并非 Lark 专属),`approval/` 以应用身份执行审批决策。每个 server 在 `runtime.env` 中自描述构建/运行配置,因此新增一个 server 不需要改脚本 |
 | `deploy.sh` | 部署入口——按顺序编排 `scripts/` 里的各个步骤 |
 | `scripts/` | 各步骤的具体实现:preflight / provision(base/memory/code/runtime/gateway/a2a/webui)/ build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
-| `tests/` | `run.sh`(全部单元测试套件)+ 需要已部署环境的端到端 smoke test |
+| `tests/` | 按组件分的单元测试(`agent/`、`router/`、`shim/`、`mcp/`),由 `run.sh` 运行;`e2e/` 需要已部署的环境 |
 | `mcp-servers/probe/` | 一个仅用于测量的 MCP server,不是产品部署的一部分——`docs/agentcore-behavior.md` 里的结论就是靠它建立的 |
+
+### `agent/` 按角色分
+
+从 `core.py` 看起:它就是 agent 本体。周围的每个目录各回答一个问题。
+
+| 路径 | 作用 | AgentCore |
+|---|---|---|
+| `core.py` | **Agent 本体**:system prompt、模型与 prompt cache、挂载的中间件、`build()`——用 LangGraph `create_agent` 把它们和会话的工具组装起来 | |
+| `middleware.py` | 每次模型调用前后:把中途插话放进当前这一轮、图片只附在请求里、记录时间、自动摘要 | |
+| `server.py` | **Runtime 接口规范**:8080 端口的 `GET /ping`、`POST /invocations`,配合 `Dockerfile`(ARM64)和 `entrypoint.sh`(`opentelemetry-instrument`) | Runtime |
+| `a2a_server.py` | Runtime 的 A2A 接口规范,端口 9000(`SERVER_MODE=a2a`),给其他 agent 调用 | Runtime |
+| `tools/` | **Agent 能做什么**:`__init__.py` 里的 `assemble()` 把各个组件接成工具 | |
+| ├ `memory.py` | `remember` / `recall` | Memory |
+| ├ `code_interpreter.py` | 在每个用户自己的工作区里运行生成的代码;`deliver_file`、`save_attachment` | Code Interpreter |
+| └ `web_search.py` | Web 搜索 | Gateway |
+| `identity/` | **调用者是谁,工具用谁的凭证** | Identity |
+| ├ `caller.py` | 验证过的 Cognito token | |
+| ├ `grants.py` | 每个用户对下游系统的授权(`_DOWNSTREAMS`)、授权墙、`/auth`、`whoami` | |
+| └ `lark_3lo.py` | 读 Token Vault、生成授权链接;Lark 的 MCP 连接 | |
+| `runtime/` | **每段对话一个组装好的 agent,同一时间只跑一轮** | |
+| ├ `sessions.py` | 会话缓存;DynamoDB checkpoint;历史、`/clear`、`/compact` | |
+| ├ `turns.py` | 占用对话、插话队列、MCP 会话所在的事件循环 | |
+| └ `telemetry.py` | 平台指标看不到的 agent 指标 | Observability |
+| `channels/` | **一轮对话怎么进来、回答怎么出去** | |
+| ├ `lark.py`、`lark_card.py` | Lark:回答写进流式卡片;以及同步回复 | |
+| ├ `agui.py` | 网页,AG-UI over SSE | |
+| └ `delivery.py`、`web_files.py`、`images.py` | 生成的文件按入口发到哪里;网页上的文件存储;图片和附件 | |
+
+改 prompt 设 `AGENT_SYSTEM_PROMPT`(默认值在 `core.py`);换模型设 `MODEL_ID`。新组件放进 `tools/`,在 `tools.assemble()` 里接入;新的下游系统加在 `identity/grants.py` 的 `_DOWNSTREAMS` → [docs/per-user-oauth.md](docs/per-user-oauth.md)。
 
 ## 快速开始
 
