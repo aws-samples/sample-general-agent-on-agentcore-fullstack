@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import re
 import urllib.parse
 import uuid
 
@@ -44,6 +45,20 @@ _REGION = os.environ.get("AWS_REGION", "us-west-2")
 # What a peer sees when it discovers this agent. Overridable from .env, because a tenant
 # running two of these needs to tell them apart.
 _AGENT_NAME = os.environ.get("A2A_AGENT_NAME", "agentcore-general-agent")
+
+
+def _refused(e: Exception) -> bool:
+    """Whether the agent turned the caller away. Through InvokeAgentRuntime the container's
+    401/403 arrives as 424 Failed Dependency, its own status kept only in the message
+    ("Received error (403) from runtime", measured)."""
+    r = getattr(e, "response", None)
+    status = getattr(r, "status_code", 0)
+    if status in (401, 403):
+        return True
+    try:
+        return status == 424 and re.search(r"\((401|403)\)", r.text or "") is not None
+    except Exception:  # noqa: BLE001 — an unreadable body is a failure, not a refusal
+        return False
 
 
 async def _invoke_agent(bearer: str, text: str, actor_id: str = "") -> str:
@@ -95,7 +110,7 @@ def build_app():
             try:
                 reply = await _invoke_agent(bearer, context.get_user_input(), actor)
             except Exception as e:  # noqa: BLE001
-                if getattr(getattr(e, "response", None), "status_code", 0) in (401, 403):
+                if _refused(e):
                     await event_queue.enqueue_event(_reply(
                         "Refused: the bearer does not belong to the user this task names, "
                         "so nothing was done and nobody's data was read."))

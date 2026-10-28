@@ -101,6 +101,16 @@ def test_the_callers_bearer_is_forwarded_unchanged():
     assert call["json"]["action"] == "chat"
 
 
+def test_a_refusal_the_runtime_wraps_is_still_reported_as_a_refusal():
+    """The agent answers a mismatched actor with 403, which reaches this adapter as 424 with
+    the 403 only in the message — read as a plain failure, the peer was told to retry."""
+    fail = lambda status, text="": mock.Mock(response=mock.Mock(status_code=status, text=text))
+    assert a2a_server._refused(fail(403)) and a2a_server._refused(fail(401))
+    assert a2a_server._refused(fail(424, '{"message":"Received error (403) from runtime."}'))
+    assert not a2a_server._refused(fail(424, '{"message":"Received error (500) from runtime."}'))
+    assert not a2a_server._refused(fail(500)) and not a2a_server._refused(RuntimeError("x"))
+
+
 def test_each_delegated_task_gets_its_own_runtime_session():
     """A shared session id would land two peers' tasks on the same microVM and, worse,
     make them look like one conversation. AgentCore also requires 33+ characters."""
