@@ -67,7 +67,7 @@ Ten layers, each with a real implementation rather than a stub — that is the "
 
 One AgentCore primitive is deliberately **not** used: Evaluations — answer quality is a separate concern with its own project, [cs-agent-eval-loop](https://github.com/aleck31/cs-agent-eval-loop), so this repo measures only whether the machinery ran.
 
-Five layers ship switched off, because each adds cost or console work: `WEB_SEARCH`, `WEBUI`, `A2A`, `BROWSER`, and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
+Five layers ship switched off, because each adds cost or console work: `WEB_SEARCH`, `WEBUI`, `A2A`, `BROWSER`, and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them. Separately, `AGENT_NETWORK=vpc` puts the agent Runtime in a VPC — yours, or one created with a NAT for a fixed outbound IP and flow logs — chosen at the first deploy → [docs/architecture.md](docs/architecture.md#the-agents-network).
 
 Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and the deploy serves the web page alone: users sign in at its hosted login, the admin invites them on its 管理 view, and Lark, Google and GitHub are downstream systems each user authorizes from the chat when a tool first needs one → [docs/deploy.md](docs/deploy.md#without-lark).
 
@@ -77,7 +77,7 @@ Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and th
 |---|---|
 | `app.py`, `cdk.json` | CDK app (uv-managed deps). Deployment state goes to `.cdk-state.<DEPLOYMENT_NAME>.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
-| `stacks/` | security, agentcore, router, shim, gateway, observability, plus sandbox and webui when their flags are on |
+| `stacks/` | security, agentcore, router, shim, gateway, observability, plus sandbox, webui and network when their flags are on |
 | `agent/` | the agent container, file by file below |
 | `webui/` | the web chat page and the admin page (`admin.html`, who may sign in) — static files sharing `login.js`, no build step; deploy-time values arrive as `config.js` |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |

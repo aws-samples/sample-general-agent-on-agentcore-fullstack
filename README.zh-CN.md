@@ -66,7 +66,7 @@
 
 有意不使用一个 AgentCore 原语:Evaluations——回答质量是一个独立课题,有自己的项目 [cs-agent-eval-loop](https://github.com/aleck31/cs-agent-eval-loop),本仓库只衡量"机制本身是否跑通"。
 
-五个层默认关闭,因为各自会带来额外成本或控制台配置工作:`WEB_SEARCH`、`WEBUI`、`A2A`、`BROWSER`、以及带存储的代码执行(`FILES_STORAGE`)。不开启任何一个,Agent 依然能正常运行。
+五个层默认关闭,因为各自会带来额外成本或控制台配置工作:`WEB_SEARCH`、`WEBUI`、`A2A`、`BROWSER`、以及带存储的代码执行(`FILES_STORAGE`)。不开启任何一个,Agent 依然能正常运行。另外,`AGENT_NETWORK=vpc` 让 agent Runtime 运行在 VPC 里——用你自己的子网,或新建一个带 NAT(固定出口 IP)和流日志的 VPC——在首次部署时选定 → [docs/architecture.md](docs/architecture.md#the-agents-network)。
 
 ## 目录结构
 
@@ -74,7 +74,7 @@
 |---|---|
 | `app.py`、`cdk.json` | CDK 应用(依赖由 uv 管理)。部署状态写入 `.cdk-state.<DEPLOYMENT_NAME>.json`,不在这里 |
 | `.env` | 部署目标(`PROFILE`/`REGION`/`MODEL_ID`)+ Lark 凭证——已加入 .gitignore,每个脚本都会读取 |
-| `stacks/` | security、agentcore、router、shim、gateway、observability,以及开启对应 flag 时的 storage 和 webui |
+| `stacks/` | security、agentcore、router、shim、gateway、observability,以及开启对应 flag 时的 sandbox、webui 和 network |
 | `agent/` | Agent 容器,逐个文件见下表 |
 | `webui/` | 网页聊天页面——单个静态文件,无需构建步骤;部署时的配置值写入 `config.js` |
 | `lambda/router/` | Lark webhook:校验/解密/租户 token/发送 + 3LO 授权等待 + 聊天命令。也是唯一签发按用户 JWT 的组件(`cognito.py`) |
