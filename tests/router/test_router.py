@@ -1157,6 +1157,17 @@ def test_a_lark_users_token_is_shared_and_renewed_by_a_conditional_write():
         assert cognito.user_jwt("lark:ou_x") == "tok-winner"     # lost the race: the winner's
     kw = table.put_item.call_args.kwargs
     assert kw["Item"]["previous"] == "tok-a" and kw["ExpressionAttributeValues"] == {":seen": "tok-a"}
+    # TTL deleted the expired record between the read and the write: nobody won, so the
+    # renewed token is written as the first one rather than read back from a missing item.
+    table.reset_mock()
+    table.get_item.side_effect = [{"Item": stale}, {}]
+    table.put_item.side_effect = [ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem"), {}]
+    with mock.patch.object(cognito, "_table", table), \
+         mock.patch.object(cognito, "configured", return_value=True), \
+         mock.patch.object(cognito, "_mint", return_value="x.eyJleHAiOjk5OTk5OTk5OTl9.y"):
+        assert cognito.user_jwt("lark:ou_x") == "x.eyJleHAiOjk5OTk5OTk5OTl9.y"
+    assert table.put_item.call_args.kwargs["ConditionExpression"] == "attribute_not_exists(PK)"
+    table.put_item.side_effect = None
     table.get_item.side_effect = None
     table.get_item.return_value = {"Item": {"current": "c", "currentExp": int(_t.time()) + 100,
                                             "previous": "p", "previousExp": int(_t.time()) - 1}}

@@ -139,21 +139,28 @@ def user_jwt(actor_id: str) -> str:
         return item["current"]
     token = _mint(actor_id)
     exp = _exp(token)
-    try:
-        _table.put_item(
-            Item={**_key(actor_id), "current": token, "currentExp": int(exp),
-                  "previous": item.get("current", ""), "previousExp": int(item.get("currentExp", 0)),
-                  "ttl": int(exp)},
-            ConditionExpression=("attribute_not_exists(PK)" if not item.get("current")
-                                 else "#c = :seen"),
-            **({"ExpressionAttributeNames": {"#c": "current"},
-                "ExpressionAttributeValues": {":seen": item["current"]}}
-               if item.get("current") else {}))
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
-        return _stored(actor_id)["current"]
-    return token
+    # Twice at most: a failed condition is either another container's renewal, whose token is
+    # then used, or TTL deleting the expired record between the read and the write — measured
+    # on a user idle past the token's hour — after which nobody has won and this one is written.
+    for _ in range(2):
+        try:
+            _table.put_item(
+                Item={**_key(actor_id), "current": token, "currentExp": int(exp),
+                      "previous": item.get("current", ""), "previousExp": int(item.get("currentExp", 0)),
+                      "ttl": int(exp)},
+                ConditionExpression=("attribute_not_exists(PK)" if not item.get("current")
+                                     else "#c = :seen"),
+                **({"ExpressionAttributeNames": {"#c": "current"},
+                    "ExpressionAttributeValues": {":seen": item["current"]}}
+                   if item.get("current") else {}))
+            return token
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            item = _stored(actor_id)
+            if item.get("current"):
+                return item["current"]
+    raise RuntimeError(f"could not store a renewed token for {actor_id}")
 
 
 def consent_tokens(actor_id: str) -> list[str]:
