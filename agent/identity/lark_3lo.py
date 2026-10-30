@@ -103,6 +103,26 @@ def _token_owner(token: str) -> str:
         return ""
 
 
+def titles_of(token: str, resources: list) -> dict:
+    """{resource token: {"title", "url"}} for Drive documents and folders ([{kind, token}]),
+    read with this Lark token; what it cannot see is left out. Drive's metadata API takes up to
+    200 per call and needs no scope beyond drive:drive."""
+    docs = [{"doc_token": r["token"], "doc_type": "folder" if r.get("kind") == "folder" else "docx"}
+            for r in resources[:200] if r.get("token")]
+    if not docs:
+        return {}
+    try:
+        r = httpx.post(f"{_API_DOMAIN}/open-apis/drive/v1/metas/batch_query",
+                       headers={"Authorization": f"Bearer {token}"},
+                       json={"request_docs": docs, "with_url": True}, timeout=10)
+        metas = (r.json().get("data") or {}).get("metas") or []
+    except Exception as e:  # noqa: BLE001 — a missing title must not cost the rule
+        log.warning("could not read titles: %s", type(e).__name__)
+        return {}
+    return {m["doc_token"]: {"title": m.get("title", ""), "url": m.get("url", "")}
+            for m in metas if m.get("doc_token")}
+
+
 def _belongs_to(token: str, actor_id: str) -> bool:
     """Whether this token is really the actor's own.
 

@@ -1,1 +1,3 @@
 cryptography>=42.0.0
+# The runtime's bundled boto3 drops a Gateway target's `connector` configuration (websearch.py).
+boto3>=1.43.92

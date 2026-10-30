@@ -48,6 +48,7 @@ class RouterStack(Stack):
         web_client_id: str = "",
         cognito_issuer_url: str = "",
         lark_enabled: bool = True,
+        protection=None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -117,6 +118,14 @@ class RouterStack(Stack):
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
                 # The hosted login's client: its tokens are web users' (see index.py).
                 "COGNITO_WEB_CLIENT_ID": web_client_id,
+                # Where protection rules are written (stacks/protection_stack.py); empty without Lark.
+                "POLICY_STORE_ID": protection.store.attr_policy_store_id if protection else "",
+                "PROTECT_ADMIN_TEMPLATE_ID": protection.admin_template.attr_policy_template_id if protection else "",
+                "PROTECT_USER_TEMPLATE_ID": protection.user_template.attr_policy_template_id if protection else "",
+                # The Web Search gateway's blocked domains (websearch.py), by the names provision.sh gives.
+                "WEB_SEARCH_GATEWAY_NAME": f"{prefix}-websearch-gw",
+                "WEB_SEARCH_POLICY_ENGINE_NAME": f"{prefix.replace('-', '_')}_websearch",
+                "WEB_SEARCH_REGION": "us-east-1",
             },
             log_group=log_group,
         )
@@ -163,6 +172,13 @@ class RouterStack(Stack):
             for path in ("/web/session", "/web/command", "/web/consent"):
                 self.http_api.add_routes(path=path, methods=[apigwv2.HttpMethod.POST],
                                          integration=integration, authorizer=authorizer)
+            # Protection rules: the caller's own, and (admins group, checked by the handler)
+            # the ones that hold for everyone.
+            for path in ("/web/protection", "/web/admin/protection", "/web/admin/websearch"):
+                self.http_api.add_routes(
+                    path=path,
+                    methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST, apigwv2.HttpMethod.DELETE],
+                    integration=integration, authorizer=authorizer)
             # The admin page; the handler checks the admins group on the verified token.
             self.http_api.add_routes(
                 path="/web/admin/users",
@@ -184,6 +200,31 @@ class RouterStack(Stack):
         # own JWT, and a CUSTOM_JWT runtime refuses SigV4 anyway. Authorization for that
         # hop is the token, not this role.
         self.identity_table.grant_read_write_data(self.router_fn)
+        # The only writer of protection rules: the commands and the page come through here,
+        # and no tool does. Rules are template-linked, so this role never writes Cedar text.
+        if protection:
+            self.router_fn.add_to_role_policy(iam.PolicyStatement(
+                actions=["verifiedpermissions:CreatePolicy", "verifiedpermissions:DeletePolicy",
+                         "verifiedpermissions:GetPolicy", "verifiedpermissions:ListPolicies"],
+                resources=[protection.store.attr_arn]))
+
+        # The Web Search gateway's blocked domains: its target's exclude list and the forbid in
+        # its policy engine. Never the gateway itself, so no PassRole and no mode change.
+        ws = f"arn:aws:bedrock-agentcore:us-east-1:{account}"
+        rt_prefix = prefix.replace("-", "_")
+        self.router_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["bedrock-agentcore:ListGateways", "bedrock-agentcore:ListPolicyEngines"], resources=["*"]))
+        self.router_fn.add_to_role_policy(iam.PolicyStatement(
+            # Create/UpdatePolicy also need ManageResourceScopedPolicy and InvokeGateway on the gateway a
+            # policy names: the engine validates the statement against it as the caller.
+            actions=["bedrock-agentcore:GetGateway", "bedrock-agentcore:ListGatewayTargets",
+                     "bedrock-agentcore:GetGatewayTarget", "bedrock-agentcore:UpdateGatewayTarget",
+                     "bedrock-agentcore:ManageResourceScopedPolicy", "bedrock-agentcore:InvokeGateway"],
+            resources=[f"{ws}:gateway/{prefix}-websearch-gw-*"]))
+        self.router_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["bedrock-agentcore:ListPolicies", "bedrock-agentcore:GetPolicy", "bedrock-agentcore:CreatePolicy",
+                     "bedrock-agentcore:UpdatePolicy", "bedrock-agentcore:DeletePolicy"],
+            resources=[f"{ws}:policy-engine/{rt_prefix}_websearch-*"]))
 
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(

@@ -67,8 +67,8 @@ class SecurityStack(Stack):
         self.web_login_domain = ""
         if webui:
             page = (web_origin.rstrip("/") + "/") if web_origin else "https://localhost/"
-            # Every page that signs in comes back to itself: the chat and the admin page.
-            pages = [page, page + "index.html", page + "admin.html"]
+            # Every page that signs in comes back to itself: the chat, the admin and the access pages.
+            pages = [page, page + "index.html", page + "admin.html", page + "access.html"]
             domain = self.user_pool.add_domain(
                 "WebLogin",
                 # Unique per region across all accounts, hence the account in it.

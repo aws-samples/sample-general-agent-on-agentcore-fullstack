@@ -1173,3 +1173,354 @@ def test_a_lark_users_token_is_shared_and_renewed_by_a_conditional_write():
                                             "previous": "p", "previousExp": int(_t.time()) - 1}}
     with mock.patch.object(cognito, "_table", table):
         assert cognito.consent_tokens("lark:ou_x") == ["c"]      # an expired one is not tried
+
+
+# --------------------------- protection rules -----------------------------------
+# A rule is a template-linked policy in the AVP store; whose it is comes from the caller's
+# verified identity and the stored principal, never from the request.
+
+class _FakeAvp:
+    class exceptions:
+        class ResourceNotFoundException(Exception):
+            pass
+
+    def __init__(self):
+        self.policies = {}
+
+    def list_policies(self, policyStoreId, filter, nextToken=None):
+        out = []
+        for pid, linked in self.policies.items():
+            if linked["policyTemplateId"] != filter["policyTemplateId"]:
+                continue
+            if "principal" in filter and linked.get("principal") != filter["principal"]["identifier"]:
+                continue
+            out.append({"policyId": pid, "resource": linked["resource"], "createdDate": "2026-10-29"})
+        return {"policies": out}
+
+    def create_policy(self, policyStoreId, definition):
+        pid = f"p{len(self.policies) + 1}"
+        self.policies[pid] = definition["templateLinked"]
+        return {"policyId": pid}
+
+    def get_policy(self, policyStoreId, policyId):
+        if policyId not in self.policies:
+            raise self.exceptions.ResourceNotFoundException()
+        return {"definition": {"templateLinked": self.policies[policyId]}}
+
+    def delete_policy(self, policyStoreId, policyId):
+        del self.policies[policyId]
+
+
+class _FakeNotes:
+    """The identity table, as protection.py uses it for each rule's title, link and author."""
+    name = "identity"
+
+    def __init__(self):
+        self.items = {}
+        outer = self
+
+        class _Client:
+            def batch_get_item(self, RequestItems):
+                keys = RequestItems[outer.name]["Keys"]
+                return {"Responses": {outer.name: [outer.items[k["SK"]] for k in keys if k["SK"] in outer.items]}}
+        self.meta = type("M", (), {"client": _Client()})()
+
+    def put_item(self, Item):
+        self.items[Item["SK"]] = Item
+
+    def delete_item(self, Key):
+        self.items.pop(Key["SK"], None)
+
+
+@pytest.fixture
+def avp():
+    import protection
+    fake, notes = _FakeAvp(), _FakeNotes()
+    fake.notes = notes
+    with mock.patch.object(protection, "_avp", fake), mock.patch.object(protection, "_notes", notes), \
+         mock.patch.object(protection, "_STORE", "ps"), \
+         mock.patch.object(protection, "_ADMIN", "t-admin"), mock.patch.object(protection, "_USER", "t-user"):
+        yield fake
+
+
+def test_only_drive_document_and_folder_links_become_rules():
+    import protection
+    assert protection.parse_link("https://acme.jp.larksuite.com/docx/WZPgdYfr3ovG2wxXJNjjiVIRpGk") == \
+        ("document", "WZPgdYfr3ovG2wxXJNjjiVIRpGk")
+    assert protection.parse_link("https://x.feishu.cn/drive/folder/BwzCfk9ohlstzJdejkNjXZDJppg?from=a") == \
+        ("folder", "BwzCfk9ohlstzJdejkNjXZDJppg")
+    for bad in ["https://evil.example/docx/WZPgdYfr3ovG2wxXJNjjiVIRpGk", "http://x.larksuite.com/docx/WZPgdYfr3ovG2wxX",
+                "https://x.larksuite.com/wiki/WZPgdYfr3ovG2wxXJNjjiVIRpGk", "WZPgdYfr3ovG2wxXJNjjiVIRpGk", ""]:
+        assert protection.parse_link(bad) is None, bad
+
+
+def test_a_rule_can_only_be_removed_by_its_owner_and_admin_rules_by_the_admin_view(avp):
+    import protection
+    alice, bob = protection.principal("cli_x", "ou_a"), protection.principal("cli_x", "ou_b")
+    mine = protection.protect(alice, "document", "docAAAAAAAA", by="lark:ou_a")
+    assert protection.protect(alice, "document", "docAAAAAAAA", by="lark:ou_a") == mine   # no duplicate
+    org = protection.protect(None, "folder", "fldAAAAAAAA", by="web:admin")
+    assert avp.policies[org] == {"policyTemplateId": "t-admin",
+                                 "resource": {"entityType": "Lark::Folder", "entityId": "fldAAAAAAAA"}}
+    assert protection.unprotect(bob, mine, by="lark:ou_b") is False        # not Bob's
+    assert protection.unprotect(alice, org, by="lark:ou_a") is False       # an admin rule, from a user view
+    assert protection.unprotect(None, mine, by="web:admin") is False       # a user rule, from the admin view
+    assert protection.unprotect(alice, mine, by="lark:ou_a") is True and mine not in avp.policies
+    assert protection.unprotect(alice, "p-missing", by="lark:ou_a") is False
+
+
+def test_protect_commands_bind_the_rule_to_the_callers_own_lark_account(avp, lark_mod):
+    import index, identity
+    link = "https://acme.jp.larksuite.com/docx/WZPgdYfr3ovG2wxXJNjjiVIRpGk"
+    titles = {"titles": {"WZPgdYfr3ovG2wxXJNjjiVIRpGk": {"title": "季度预算", "url": link}}}
+    with mock.patch.object(index, "invoke_agent", return_value=titles) as agent, \
+         mock.patch.object(identity, "get_or_create_session", return_value="rt"):
+        out = index.run_command(f"/protect {link}", "u1", "lark:ou_alice")
+        assert agent.call_args.kwargs["resources"] == [{"kind": "document", "token": "WZPgdYfr3ovG2wxXJNjjiVIRpGk"}]
+    assert "已保护" in out["text"]
+    (linked,) = avp.policies.values()
+    assert linked["principal"] == {"entityType": "Lark::User", "entityId": "cli_x/ou_alice"}
+    assert "《季度预算》" in index.run_command("/protected", "u1", "lark:ou_alice")["text"]
+    assert "没有保护过" in index.run_command(f"/unprotect {link}", "u2", "lark:ou_bob")["text"]
+    assert "已取消" in index.run_command(f"/unprotect {link}", "u1", "lark:ou_alice")["text"]
+    assert avp.policies == {}
+    assert "链接" in index.run_command("/protect not-a-link", "u1", "lark:ou_alice")["text"]
+
+
+def test_a_web_users_rules_are_their_lark_grants_and_the_admin_view_needs_the_group(avp, lark_mod):
+    import index, identity
+    claims = {"sub": "s-1", "client_id": "web-client", "username": "carol@example.com"}
+    calls = []
+
+    def agent(*a, **k):
+        calls.append(k.get("action"))
+        return {"open_id": "ou_carol"}
+    with mock.patch.object(index, "_WEB_CLIENT_ID", "web-client"), \
+         mock.patch.object(identity, "resolve_user", return_value=("u-web", True)), \
+         mock.patch.object(identity, "get_or_create_session", return_value="rt"), \
+         mock.patch.object(index, "invoke_agent", side_effect=agent):
+        ev = _web_event(claims)
+        r = index._web_protection(ev, "POST", json.dumps({"link": "https://x.larksuite.com/docx/WZPgdYfr3ovG2wxXJNjjiVIRpGk"}), admin=False)
+        assert r["statusCode"] == 200 and calls == ["lark_account"]
+        assert list(avp.policies.values())[0]["principal"]["entityId"] == "cli_x/ou_carol"
+        assert index._web_protection(ev, "GET", "", admin=True)["statusCode"] == 403
+        admin_ev = _web_event({**claims, "cognito:groups": "[admins]"})
+        r = index._web_protection(admin_ev, "POST", json.dumps({"link": "https://x.larksuite.com/drive/folder/BwzCfk9ohlstzJdejkNjXZDJppg"}), admin=True)
+        assert r["statusCode"] == 200 and "principal" not in avp.policies[json.loads(r["body"])["policyId"]]
+        assert avp.notes.items[json.loads(r["body"])["policyId"]]["by"] == "carol@example.com"
+
+
+def test_a_stored_rule_without_a_title_gets_one_when_listed(avp, lark_mod):
+    """Rules that predate titles, or whose title could not be read when added, are named the
+    next time their owner lists them, with the owner's own grant, and keep the name."""
+    import index, identity, protection
+    alice = protection.principal("cli_x", "ou_alice")
+    pid = protection.protect(alice, "folder", "fldAAAAAAAA", by="lark:ou_alice")
+    named = {"titles": {"fldAAAAAAAA": {"title": "财务", "url": "https://x.larksuite.com/drive/folder/fldAAAAAAAA"}}}
+    with mock.patch.object(index, "invoke_agent", return_value=named), \
+         mock.patch.object(identity, "get_or_create_session", return_value="rt"):
+        assert "《财务》" in index.run_command("/protected", "u1", "lark:ou_alice")["text"]
+    assert avp.notes.items[pid]["title"] == "财务"
+
+
+# --------------------------- web search domains ---------------------------------
+# The admin page's blocked domains: the target's exclude list is the record, and the forbid in
+# the gateway's policy engine follows it.
+
+class _FakeControl:
+    """The Web Search gateway's control plane. A policy write is asynchronous: it stays in its
+    *ING status for `settle` reads, and another write meanwhile is a ConflictException."""
+    class exceptions:
+        class ResourceNotFoundException(Exception):
+            pass
+
+        class ConflictException(Exception):
+            pass
+
+    def __init__(self, exclude=(), settle=0):
+        self.target = {"targetId": "t1", "name": "web-search-tool", "credentialProviderConfigurations": [{"x": 1}],
+                       "targetConfiguration": {"mcp": {"connector": {"configurations": [
+                           {"parameterValues": {"domainFilter": {"exclude": list(exclude)}} if exclude else {}}]}}}}
+        self.policies = {}                  # name → statement
+        self.pending = {}                   # name → (status, reads left)
+        self.settle = settle
+        self.writes = []
+
+    def list_gateways(self, **_):
+        return {"items": [{"name": "dep-websearch-gw", "gatewayId": "g1"}]}
+
+    def get_gateway(self, gatewayIdentifier):
+        return {"gatewayId": "g1", "gatewayArn": "arn:gw/g1", "policyEngineConfiguration": {"arn": "pe", "mode": "ENFORCE"}}
+
+    def list_gateway_targets(self, gatewayIdentifier, **_):
+        return {"items": [{"name": "web-search-tool", "targetId": "t1"}]}
+
+    def get_gateway_target(self, gatewayIdentifier, targetId):
+        # Changed long enough ago that a mismatch is real, unless a test says otherwise.
+        return {**json.loads(json.dumps(self.target)), "status": "READY", "updatedAt": self.updated_at}
+
+    updated_at = __import__("datetime").datetime(2026, 1, 1, tzinfo=__import__("datetime").timezone.utc)
+
+    def update_gateway_target(self, **kw):
+        self.writes.append("target")
+        self.target["targetConfiguration"] = kw["targetConfiguration"]
+
+    def list_policy_engines(self, **_):
+        return {"policyEngines": [{"name": "dep_websearch", "policyEngineId": "pe1"}]}
+
+    def list_policies(self, policyEngineId, **_):
+        return {"policies": [{"name": n, "policyId": n} for n in self.policies]}
+
+    def _status(self, name):
+        status, left = self.pending.get(name, ("ACTIVE", 0))
+        if left <= 0:
+            self.pending.pop(name, None)
+            if status == "DELETING":
+                del self.policies[name]
+                raise self.exceptions.ResourceNotFoundException()
+            return "ACTIVE"
+        self.pending[name] = (status, left - 1)
+        return status
+
+    def get_policy(self, policyEngineId, policyId):
+        if policyId not in self.policies:
+            raise self.exceptions.ResourceNotFoundException()
+        return {"policyId": policyId, "status": self._status(policyId), "statusReasons": [],
+                "definition": {"cedar": {"statement": self.policies[policyId]}}}
+
+    def _write(self, name, status):
+        if name in self.pending:
+            raise self.exceptions.ConflictException(f"Policy cannot be updated while it is in {self.pending[name][0]} status")
+        self.writes.append(status)
+        self.pending[name] = (status, self.settle)
+
+    def create_policy(self, policyEngineId, name, definition, validationMode):
+        if name in self.policies:
+            raise self.exceptions.ConflictException("Policy with the same name already exists")
+        self._write(name, "CREATING")
+        self.policies[name] = definition["cedar"]["statement"]
+        return {"policyId": name}
+
+    def update_policy(self, policyEngineId, policyId, definition, validationMode):
+        self._write(policyId, "UPDATING")
+        self.policies[policyId] = definition["cedar"]["statement"]
+
+    def delete_policy(self, policyEngineId, policyId):
+        self._write(policyId, "DELETING")
+        if not self.settle:
+            del self.policies[policyId]
+            self.pending.pop(policyId, None)
+
+
+@pytest.fixture
+def control():
+    import websearch
+    fake, notes = _FakeControl(), _FakeNotes()
+    notes.get_item = lambda Key: {"Item": notes.items[Key["SK"]]} if Key["SK"] in notes.items else {}
+    clock = [0.0]
+
+    def sleep(sec):
+        clock[0] += sec
+    with mock.patch.object(websearch, "_c", fake), mock.patch.object(websearch, "_notes", notes), \
+         mock.patch.object(websearch, "_GATEWAY", "dep-websearch-gw"), mock.patch.object(websearch, "_ENGINE", "dep_websearch"), \
+         mock.patch.object(websearch.time, "time", lambda: clock[0]), mock.patch.object(websearch.time, "sleep", sleep):
+        yield fake
+
+
+def test_a_blocked_domain_is_normalised_and_only_a_host_name_reaches_cedar():
+    import websearch
+    assert websearch.normalise(" https://www.Scribd.com/doc/1 ") == "scribd.com"
+    assert websearch.normalise("例子.xn--p1ai") is None and websearch.normalise("shop.xn--p1ai") == "shop.xn--p1ai"
+    for bad in ['a" || true || "', "localhost", "*.example.com", "", "1.2.3.4/x y"]:
+        assert websearch.normalise(bad) is None, bad
+
+
+def test_admins_block_and_unblock_domains_on_both_layers(control, lark_mod):
+    import index, identity
+    claims = {"sub": "s-1", "client_id": "web-client", "username": "carol@example.com"}
+    with mock.patch.object(index, "_WEB_CLIENT_ID", "web-client"), \
+         mock.patch.object(identity, "resolve_user", return_value=("u-web", True)):
+        assert index._web_websearch(_web_event(claims), "GET", "")["statusCode"] == 403
+        ev = _web_event({**claims, "cognito:groups": "[admins]"})
+        assert index._web_websearch(ev, "POST", json.dumps({"domain": "not a domain"}))["statusCode"] == 400
+        r = index._web_websearch(ev, "POST", json.dumps({"domain": "https://www.scribd.com/x"}))
+        assert r["statusCode"] == 200 and json.loads(r["body"])["domain"] == "scribd.com"
+        index._web_websearch(ev, "POST", json.dumps({"domain": "ietf.org"}))
+        assert control.target["targetConfiguration"]["mcp"]["connector"]["configurations"][0]["parameterValues"] == \
+            {"domainFilter": {"exclude": ["ietf.org", "scribd.com"]}}
+        rule = control.policies["forbid_blocked_domains"]
+        assert '"* scribd.com*"' in rule and '"*.scribd.com*"' in rule and "arn:gw/g1" in rule
+        listed = json.loads(index._web_websearch(ev, "GET", "")["body"])
+        assert listed["mode"] == "ENFORCE" and listed["policy"]["status"] == "ACTIVE"
+        assert [(d["domain"], d["by"]) for d in listed["domains"]] == [("ietf.org", "carol@example.com"), ("scribd.com", "carol@example.com")]
+        # Adding what is there writes nothing.
+        control.writes.clear()
+        index._web_websearch(ev, "POST", json.dumps({"domain": "scribd.com"}))
+        assert control.writes == []
+        for d in ("ietf.org", "scribd.com"):
+            assert index._web_websearch(ev, "DELETE", json.dumps({"domain": d}))["statusCode"] == 200
+        assert index._web_websearch(ev, "DELETE", json.dumps({"domain": "scribd.com"}))["statusCode"] == 404
+    assert control.policies == {}
+    assert control.target["targetConfiguration"]["mcp"]["connector"]["configurations"][0]["parameterValues"] == {}
+
+
+def test_a_partly_applied_change_shows_out_of_sync_and_is_finished_by_a_retry(control, lark_mod):
+    import websearch
+    real = control.create_policy
+    control.create_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+    with pytest.raises(RuntimeError):
+        websearch.block("scribd.com", by="a")
+    # The exclude list, which holds on results, went first; the page sees the forbid missing.
+    listed = websearch.blocked()
+    assert [d["domain"] for d in listed["domains"]] == ["scribd.com"] and listed["policy"]["status"] == "OUT_OF_SYNC"
+    control.create_policy = real
+    websearch.sync(by="a")
+    assert websearch.blocked()["policy"]["status"] == "ACTIVE"
+
+
+def test_a_mismatch_right_after_a_change_is_the_change_being_applied(control, lark_mod):
+    import datetime
+    import websearch
+    control.create_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+    with pytest.raises(RuntimeError):
+        websearch.block("scribd.com", by="a")
+    control.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    assert websearch.blocked()["policy"]["status"] == "APPLYING"
+
+
+def test_a_removal_whose_rule_update_failed_is_finished_by_removing_again(control, lark_mod):
+    import websearch
+    websearch.block("scribd.com", by="a")
+    control.delete_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+    with pytest.raises(RuntimeError):
+        websearch.unblock("scribd.com", by="a")
+    assert websearch.blocked()["domains"] == [] and websearch.blocked()["policy"]["status"] == "OUT_OF_SYNC"
+    del control.delete_policy
+    assert websearch.unblock("scribd.com", by="a") is False         # already off the list, but applied
+    assert control.policies == {} and websearch.blocked()["policy"]["status"] == "NONE"
+
+
+def test_a_change_waits_for_the_previous_one_and_says_so_when_it_cannot(control, lark_mod):
+    import websearch
+    control.settle = 5                                    # reads before a write settles
+    websearch.block("scribd.com", by="a")
+    websearch.block("ietf.org", by="a")                   # waits out CREATING, then updates
+    assert control.writes == ["target", "CREATING", "target", "UPDATING"]
+    assert '"*.ietf.org*"' in control.policies["forbid_blocked_domains"]
+    control.settle = 10_000                               # never settles within the deadline
+    control.pending["forbid_blocked_domains"] = ("UPDATING", 10_000)
+    with pytest.raises(websearch.Busy):
+        websearch.block("example.org", by="a")
+    assert websearch.blocked()["policy"]["status"] == "UPDATING"
+
+
+def test_an_entry_set_outside_the_page_stays_out_of_the_rule_and_can_be_removed(control, lark_mod):
+    import websearch
+    control.target["targetConfiguration"]["mcp"]["connector"]["configurations"][0]["parameterValues"] = \
+        {"domainFilter": {"exclude": ["*.bad", "scribd.com"]}}
+    websearch.sync(by="a")
+    rule = control.policies["forbid_blocked_domains"]
+    assert "*.bad" not in rule and "scribd.com" in rule
+    assert [(d["domain"], d["valid"]) for d in websearch.blocked()["domains"]] == [("*.bad", False), ("scribd.com", True)]
+    assert websearch.unblock("*.bad", by="a") is True
+    assert [d["domain"] for d in websearch.blocked()["domains"]] == ["scribd.com"]

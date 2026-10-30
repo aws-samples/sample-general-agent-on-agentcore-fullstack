@@ -49,5 +49,19 @@ class GatewayStack(Stack):
                 resources=[f"arn:aws:bedrock-agentcore:{ws_region}:aws:tool/web-search.v1"],
             )
         )
+        # AgentCore Policy on the gateway (scripts/websearch_policy.py). Measured: attaching a
+        # policy engine needs GetPolicyEngine on the engine, and every decision AuthorizeAction
+        # on the gateway itself — without either, UpdateGateway refuses the attachment.
+        rt_prefix = prefix.replace("-", "_")
+        self.gateway_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock-agentcore:GetPolicyEngine", "bedrock-agentcore:AuthorizeAction",
+                         "bedrock-agentcore:PartiallyAuthorizeActions"],
+                resources=[
+                    f"arn:aws:bedrock-agentcore:{ws_region}:{account}:policy-engine/{rt_prefix}_websearch-*",
+                    f"arn:aws:bedrock-agentcore:{ws_region}:{account}:gateway/{prefix}-websearch-gw-*",
+                ],
+            )
+        )
 
         CfnOutput(self, "GatewayRoleArn", value=self.gateway_role.role_arn)

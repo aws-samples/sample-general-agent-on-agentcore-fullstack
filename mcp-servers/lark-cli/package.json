@@ -1,0 +1,8 @@
+{
+  "name": "lark-cli-mcp",
+  "private": true,
+  "description": "Lark MCP server on AgentCore Runtime; document access checked against Cedar policies in Amazon Verified Permissions",
+  "dependencies": {
+    "@aws-sdk/client-verifiedpermissions": "^3.900.0"
+  }
+}

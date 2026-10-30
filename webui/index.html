@@ -126,7 +126,7 @@
 </style>
 </head>
 <body>
-<header>General Agent on AgentCore <small id="who">connecting…</small><span style="flex:1"></span><a id="admin" class="ghost" href="admin.html" hidden>管理</a><button type="button" id="logout" class="ghost" hidden>退出</button></header>
+<header>General Agent on AgentCore <small id="who">connecting…</small><span style="flex:1"></span><a id="access" class="ghost" href="access.html" hidden>访问控制</a><a id="admin" class="ghost" href="admin.html" hidden>管理</a><button type="button" id="logout" class="ghost" hidden>退出</button></header>
 <div id="log"></div>
 <div id="pending"></div>
 <form id="f">
@@ -234,6 +234,9 @@ async function connect() {
       $('logout').hidden = false;
       // Same tab, so the admin page keeps this tab's sign-in.
       $('admin').hidden = !login.groups().includes('admins');
+      // What the agent's tools may not touch: Lark documents where there is Lark, and (admins)
+      // the Web Search domains.
+      $('access').hidden = !window.LARK_APP_ID && !login.groups().includes('admins');
     }
     session = await fetchSession();
     // Input stays disabled until the transcript has landed: a message sent mid-restore

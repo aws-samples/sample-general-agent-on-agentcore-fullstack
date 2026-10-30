@@ -144,6 +144,8 @@ base_cdk_stacks() {
   log "Base — CDK stacks"
   local stacks=("$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router"
                 "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability")
+  # Protection rules for Lark documents exist only with Lark (app.py skips the stack otherwise).
+  [ -z "${LARK_APP_ID:-}" ] || stacks+=("$PREFIX-protection")
   ctx_set agent_network "$NETWORK_KIND"
   # Kept, so dropping it from .env later does not quietly move the NAT to a new address.
   [ -z "${EIP_ALLOCATION_ID:-}" ] || ctx_set eip_allocation_id "$EIP_ALLOCATION_ID"
@@ -788,6 +790,10 @@ print(json.dumps({
 }))')" "$ws_region" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["targetId"])')"
   fi
   echo "  target: $tid"
+
+  # AgentCore Policy on the gateway; admins set the blocked domains on the access page.
+  PREFIX="$PREFIX" GID="$gid" REGION="$ws_region" WEB_SEARCH_POLICY_MODE="${WEB_SEARCH_POLICY_MODE:-enforce}" \
+    uv run --with 'boto3>=1.43.92' python scripts/websearch_policy.py
 
   local gurl
   gurl="$(aws bedrock-agentcore-control get-gateway --region "$ws_region" \

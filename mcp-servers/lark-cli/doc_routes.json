@@ -1,0 +1,923 @@
+{
+ "source": "@larksuiteoapi/node-sdk",
+ "families": [
+  "base",
+  "bitable",
+  "board",
+  "doc",
+  "docs",
+  "docx",
+  "drive",
+  "minutes",
+  "search",
+  "sheets",
+  "suite",
+  "wiki"
+ ],
+ "routes": [
+  {
+   "method": "DELETE",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles/:role_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles/:role_id/members/:member_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields/:field_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/:record_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/views/:view_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/board/v1/whiteboards/:whiteboard_id/nodes/batch_delete"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/docx/v1/chats/:chat_id/announcement/blocks/:block_id/children/batch_delete"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks/:block_id/children/batch_delete"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/v1/files/:file_token"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies/:reply_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/v1/files/:file_token/delete_subscribe"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/v1/files/:file_token/versions/:version_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/v1/permissions/:token/members/:member_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/v1/permissions/:token/public/password"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/v1/user/remove_subscription"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/search/v2/data_sources/:data_source_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/search/v2/data_sources/:data_source_id/items/:item_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/search/v2/schemas/:schema_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id/conditions/:condition_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/float_images/:float_image_id"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/members/:member_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/base/v2/apps/:app_token/roles"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/block_workflows"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/dashboards"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles/:role_id/members"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/forms/:form_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/forms/:form_id/fields"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/:record_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/views"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/views/:view_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/bitable/v1/apps/:app_token/workflows"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/board/v1/whiteboards/:whiteboard_id/download_as_image"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/board/v1/whiteboards/:whiteboard_id/nodes"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/board/v1/whiteboards/:whiteboard_id/theme"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docs/v1/content"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/chats/:chat_id/announcement"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/chats/:chat_id/announcement/blocks"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/chats/:chat_id/announcement/blocks/:block_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/chats/:chat_id/announcement/blocks/:block_id/children"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/documents/:document_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks/:block_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks/:block_id/children"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/docx/v1/documents/:document_id/raw_content"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/export_tasks/:ticket"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/export_tasks/file/:file_token/download"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/comments"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/comments/:comment_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/download"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/get_subscribe"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/statistics"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/subscriptions/:subscription_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/versions"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/versions/:version_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/:file_token/view_records"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/files/task_check"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/import_tasks/:ticket"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/medias/:file_token/download"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/medias/batch_get_tmp_download_url"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/permissions/:token/members"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/permissions/:token/members/auth"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/permissions/:token/public"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v1/user/subscription_status"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v2/files/:file_token/likes"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/v2/permissions/:token/public"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/minutes/v1/minutes/:minute_token"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/minutes/v1/minutes/:minute_token/artifacts"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/minutes/v1/minutes/:minute_token/media"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/minutes/v1/minutes/:minute_token/statistics"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/minutes/v1/minutes/:minute_token/transcript"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/search/v2/data_sources"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/search/v2/data_sources/:data_source_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/search/v2/data_sources/:data_source_id/items/:item_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/search/v2/schemas/:schema_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id/conditions/:condition_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id/conditions/query"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/query"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/float_images/:float_image_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/float_images/query"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/query"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/wiki/v2/spaces"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/wiki/v2/spaces/:space_id"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/members"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/nodes"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/wiki/v2/spaces/get_node"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/wiki/v2/tasks/:task_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/forms/:form_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/forms/:form_id/fields/:field_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/views/:view_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/docx/v1/chats/:chat_id/announcement/blocks/batch_update"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks/:block_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks/batch_update"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/drive/v1/files/:file_token/comments/:comment_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/drive/v1/files/:file_token/subscriptions/:subscription_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/drive/v1/permissions/:token/public"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/drive/v2/permissions/:token/public"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/search/v2/data_sources/:data_source_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/search/v2/schemas/:schema_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id"
+  },
+  {
+   "method": "PATCH",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/float_images/:float_image_id"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/base/v2/apps/:app_token/roles"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/copy"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/dashboards/:block_id/copy"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles/:role_id/members"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles/:role_id/members/batch_create"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles/:role_id/members/batch_delete"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/field_groups"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/forms/:form_id/upgrade"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_create"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_delete"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_get"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_update"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/search"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/views"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/batch_create"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/batch_delete"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/board/v1/whiteboards/:whiteboard_id/nodes"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/board/v1/whiteboards/:whiteboard_id/nodes/plantuml"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/board/v1/whiteboards/:whiteboard_id/update_theme"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/docx/v1/chats/:chat_id/announcement/blocks/:block_id/children"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/docx/v1/documents"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks/:block_id/children"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/docx/v1/documents/:document_id/blocks/:block_id/descendant"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/docx/v1/documents/blocks/convert"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/export_tasks"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/comments"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/comments/batch_query"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/copy"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/move"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/subscribe"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/subscriptions"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/:file_token/versions"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/create_folder"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/create_shortcut"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/upload_all"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/upload_finish"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/upload_part"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/files/upload_prepare"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/import_tasks"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/medias/upload_all"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/medias/upload_finish"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/medias/upload_part"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/medias/upload_prepare"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/metas/batch_query"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/permissions/:token/members"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/permissions/:token/members/batch_create"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/permissions/:token/members/transfer_owner"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/permissions/:token/public/password"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v1/user/subscription"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/v2/files/:file_token/comments/reaction"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/minutes/v1/minutes/search"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/minutes/v1/minutes/subscription"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/minutes/v1/minutes/unsubscription"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/search/v2/app"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/search/v2/data_sources"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/search/v2/data_sources/:data_source_id/items"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/search/v2/doc_wiki/search"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/search/v2/message"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/search/v2/schemas"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id/conditions"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/find"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/float_images"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/move_dimension"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/replace"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v1/nodes/search"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v2/spaces"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/members"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/nodes"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/nodes/:node_token/copy"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/nodes/:node_token/move"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/nodes/:node_token/update_title"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/nodes/move_docs_to_wiki"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/base/v2/apps/:app_token/roles/:role_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/bitable/v1/apps/:app_token"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/bitable/v1/apps/:app_token/roles/:role_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields/:field_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/:record_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/bitable/v1/apps/:app_token/workflows/:workflow_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies/:reply_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/drive/v1/permissions/:token/members/:member_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/drive/v1/permissions/:token/public/password"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/:sheet_id/filter_views/:filter_view_id/conditions/:condition_id"
+  },
+  {
+   "method": "PUT",
+   "template": "/open-apis/wiki/v2/spaces/:space_id/setting"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/suite/docs-api/search/object"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/suite/docs-api/meta"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/search/v1/user"
+  },
+  {
+   "method": "*",
+   "template": "/open-apis/sheets/v2/spreadsheets/:spreadsheet_token/*"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/sheets/v2/import"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/sheets/v2/import/result"
+  },
+  {
+   "method": "*",
+   "template": "/open-apis/doc/v2/:doc_token/*"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/doc/v2/meta/:doc_token"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/doc/v2/create"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/explorer/v2/root_folder/meta"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/explorer/v2/folder/:folder_token/meta"
+  },
+  {
+   "method": "GET",
+   "template": "/open-apis/drive/explorer/v2/folder/:folder_token/children"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/explorer/v2/folder/:folder_token"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/explorer/v2/file/:folder_token"
+  },
+  {
+   "method": "POST",
+   "template": "/open-apis/drive/explorer/v2/file/copy/files/:file_token"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/explorer/v2/file/docs/:doc_token"
+  },
+  {
+   "method": "DELETE",
+   "template": "/open-apis/drive/explorer/v2/file/spreadsheets/:spreadsheet_token"
+  }
+ ]
+}

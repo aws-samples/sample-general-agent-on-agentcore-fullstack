@@ -7,7 +7,7 @@
                    (messageId/reactionId: the router's progress marker, cleared at the end)
       warmup     : {action} -> {ready:true}
       status     : {action} -> {ready, instance, uptime, sessionAge, model, + clock diags}
-      history_stats / clear_history / transcript / auth_status / reauth
+      history_stats / clear_history / transcript / auth_status / lark_account / reauth
       no `action` -> AG-UI, answered as an SSE event stream (see channels/agui.py)
 """
 
@@ -287,6 +287,15 @@ async def handle_invocations(request: web.Request) -> web.Response:
         except Exception as e:
             log.exception("auth_status failed")
             return web.json_response({"error": str(e)})
+
+    if action == "lark_account":
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        try:
+            return web.json_response(await asyncio.get_event_loop().run_in_executor(
+                None, grants.lark_account, actor_id, workload_token, payload.get("resources") or None))
+        except Exception as e:
+            log.exception("lark_account failed")
+            return web.json_response({"open_id": "", "error": str(e)})
 
     # After a consent completes, so the next turn is built with the new grant rather than
     # the cached session's empty one. Precise rather than a short TTL for everyone.

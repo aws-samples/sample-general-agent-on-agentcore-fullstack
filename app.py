@@ -26,6 +26,7 @@ from stacks.gateway_stack import GatewayStack
 from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.network_stack import NetworkStack
+from stacks.protection_stack import ProtectionStack
 from stacks.sandbox_stack import SandboxStack
 from stacks.webui_stack import WebUiStack
 
@@ -124,6 +125,13 @@ if _flag("files_storage"):
         env=env,
     )
 
+# --- Protection: which Lark documents and folders the agent may not touch (Cedar, in AVP) ---
+# With Lark only: the lark-cli server checks every document call against it. See docs/architecture.md.
+protection = None
+if _flag("lark"):
+    protection = ProtectionStack(app, f"{prefix}-protection",
+                                 enforcer_role=agentcore.execution_role, env=env)
+
 # --- Router: Lark webhook ingestion (HTTP API + Lambda + DynamoDB identity) ---
 router = RouterStack(
     app,
@@ -145,6 +153,7 @@ router = RouterStack(
     user_pool_arn=security.user_pool_arn,
     user_pool_client_id=security.user_pool_client_id,
     cognito_password_secret_name=security.cognito_password_secret.secret_name,
+    protection=protection,
     env=env,
 )
 

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<!--
+  What the agent's tools may not touch, set per tool on two levels: global restrictions hold for
+  everyone and only admins (the admins group) change them; a user's own hold for them alone.
+  Lark documents and folders are enforced by the lark-cli server before every document call; Web
+  Search domains by the Web Search Gateway (global only). The router decides whose restrictions a
+  request may see or change, from the verified token — this page only lays them out.
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<title>访问控制 · General Agent on AgentCore</title>
+<script src="config.js"></script>
+<script src="login.js"></script>
+<style>
+  :root { color-scheme: light dark; --edge: color-mix(in oklab, currentColor 14%, transparent);
+          --accent: #2563eb; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }   /* else `form { display: flex }` wins over it */
+  body { margin: 0; font: 15px/1.6 -apple-system, "Segoe UI", "PingFang SC", sans-serif; }
+  header { padding: .7rem 1rem; border-bottom: 1px solid var(--edge); font-weight: 600;
+           display: flex; gap: .6rem; align-items: baseline; }
+  header small { font-weight: 400; opacity: .6; }
+  header a { font-size: 13px; font-weight: 400; color: inherit; text-decoration: none;
+             border: 1px solid var(--edge); border-radius: .6rem; padding: .25rem .6rem; }
+  /* Wide enough for a title, its token and four short columns on one line each. */
+  main { max-width: 72rem; margin: 1.5rem auto; padding: 0 1.5rem; }
+  h2 { font-size: 17px; margin: 2.2rem 0 .3rem; padding-top: 1.2rem; border-top: 1px solid var(--edge); }
+  h2 small, h3 small { font-weight: 400; font-size: 13px; opacity: .65; margin-left: .4rem; }
+  h3 { font-size: 15px; margin: 1.4rem 0 .5rem; }
+  form { display: flex; gap: .5rem; }
+  input { flex: 1; padding: .55rem .8rem; border-radius: .6rem; border: 1px solid var(--edge);
+          background: transparent; color: inherit; font: inherit; min-width: 0; }
+  button { padding: .55rem 1rem; border-radius: .6rem; border: 0; font: inherit;
+           background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap; }
+  button.ghost { background: transparent; color: #c0392b; border: 1px solid var(--edge);
+                 padding: .2rem .7rem; font-size: 13px; }
+  button[disabled] { opacity: .45; cursor: default; }
+  table { width: 100%; border-collapse: collapse; margin-top: .6rem; }
+  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--edge); }
+  /* The name takes the room; type, author, date and the action stay on one line. */
+  td:not(:first-child), th:not(:first-child) { white-space: nowrap; width: 1%; }
+  th { font-size: 13px; font-weight: 500; opacity: .6; }
+  td code { font-size: 12px; opacity: .6; }
+  td a { color: inherit; }
+  .note { font-size: 13px; opacity: .65; margin-top: .4rem; }
+  .msg { min-height: 1.4em; font-size: 14px; margin-top: .6rem; }
+  .msg.err { color: #c0392b; }
+</style>
+</head>
+<body>
+<header>访问控制 <small id="who">正在登录…</small><span style="flex:1"></span><a href="./">返回对话</a></header>
+<main id="main" hidden>
+  <p class="note">按工具设置 agent 不能访问的内容。每个工具分两层：<b>全局</b>限制对所有人生效，只有管理员能改；<b>仅我自己</b>的限制只对你生效。限制在工具层执行：调用会被直接拒绝，而不是提醒 agent 别去。</p>
+
+  <section id="lark">
+    <h2>Lark 工具<small>文档和文件夹</small></h2>
+    <p class="note">受限的文档或文件夹（含其下所有内容），agent 读不到、改不了、列不出、也搜不到。几秒内生效，文件夹里新增或移入的内容一分钟内覆盖；之前已经读到的内容不受影响。</p>
+
+    <h3>全局<small>对所有人生效 · 管理员设置</small></h3>
+    <div id="org">
+      <form id="org-add">
+        <input id="org-link" placeholder="粘贴 Lark 文档或文件夹的链接" required autocomplete="off">
+        <button>添加</button>
+      </form>
+      <div id="org-msg" class="msg"></div>
+      <table><thead><tr><th>名称</th><th>类型</th><th>添加者</th><th>添加于</th><th></th></tr></thead><tbody id="orgs"></tbody></table>
+    </div>
+    <div id="global-count" class="note" hidden></div>
+
+    <h3>仅我自己<small id="account"></small></h3>
+    <form id="mine-add">
+      <input id="mine-link" placeholder="粘贴 Lark 文档或文件夹的链接" required autocomplete="off">
+      <button>添加</button>
+    </form>
+    <div id="mine-msg" class="msg"></div>
+    <table id="mine-table"><thead><tr><th>名称</th><th>类型</th><th>添加于</th><th></th></tr></thead><tbody id="mine"></tbody></table>
+  </section>
+
+  <section id="web" hidden>
+    <h2>Web Search 工具<small>域名</small><small id="web-mode"></small></h2>
+    <p class="note">受限域名及其子域名的结果不会返回，几秒内生效；查询或指定来源里点名这些域名的搜索，会在执行前被 Gateway 拒绝，规则校验约半分钟完成。</p>
+
+    <h3>全局<small>对所有人生效 · 管理员设置</small></h3>
+    <form id="web-add">
+      <input id="web-domain" placeholder="域名，例如 example.com" required autocomplete="off">
+      <button>添加</button>
+    </form>
+    <div id="web-msg" class="msg"></div>
+    <div id="web-policy" class="note"></div>
+    <button id="web-sync" class="ghost" hidden>重新应用</button>
+    <table><thead><tr><th>域名</th><th>添加者</th><th>添加于</th><th></th></tr></thead><tbody id="webs"></tbody></table>
+
+    <h3>仅我自己</h3>
+    <p class="note">Web Search 只有全局限制：它不读取任何人自己的数据。</p>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const ROUTER = window.ROUTER_BASE || '';
+const KIND = {document: '文档', folder: '文件夹（含其下所有内容）'};
+
+async function api(path, method, body) {
+  const r = await fetch(ROUTER + path, {
+    method, headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + await login.token()},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(data.error || r.status); e.status = r.status; throw e; }
+  return data;
+}
+
+function note(id, text, isError = false) { $(id).textContent = text; $(id).className = 'msg' + (isError ? ' err' : ''); }
+
+// The name is the resource's Lark title, linked to it, read when the rule was added; a rule whose
+// title could not be read shows its token, which is still what the rule matches.
+function nameCell(r) {
+  const td = document.createElement('td');
+  const label = r.title || r.token;
+  if (r.url) { const a = document.createElement('a'); a.href = r.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = label; td.append(a); }
+  else td.textContent = label;
+  if (r.title) { td.append(document.createElement('br')); const c = document.createElement('code'); c.textContent = r.token; td.append(c); }
+  return td;
+}
+
+function textCell(v) { const td = document.createElement('td'); td.textContent = v; return td; }
+
+function table(id, rules, path, msg, withAuthor = false) {
+  $(id).replaceChildren(...rules.map((r) => {
+    const tr = document.createElement('tr');
+    const cells = [nameCell(r), textCell(KIND[r.kind] || r.kind),
+                   ...(withAuthor ? [textCell(r.by || '')] : []),
+                   textCell((r.createdDate || '').slice(0, 10))];
+    const act = document.createElement('td');
+    const b = document.createElement('button');
+    b.className = 'ghost'; b.textContent = '移除';
+    b.onclick = async () => {
+      b.disabled = true;
+      try { await api(path, 'DELETE', {policyId: r.policyId}); note(msg, '已移除。'); await load(); }
+      catch (e) { note(msg, '移除失败：' + e.message, true); b.disabled = false; }
+    };
+    act.append(b);
+    tr.append(...cells, act);
+    return tr;
+  }));
+}
+
+function adder(form, input, path, msg) {
+  $(form).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const link = $(input).value.trim();
+    if (!link) return;
+    try { await api(path, 'POST', {link}); note(msg, '已添加，几秒内生效。'); $(input).value = ''; await load(); }
+    catch (err) { note(msg, err.status === 400 ? '请粘贴 Lark 云文档（/docx/…）或文件夹（/drive/folder/…）的链接' : '添加失败：' + err.message, true); }
+  });
+}
+
+// Mode is the deployment's WEB_SEARCH_POLICY_MODE: in LOG_ONLY the gateway records denials and runs the search.
+const MODE = {ENFORCE: 'Policy 模式：拒绝执行', LOG_ONLY: 'Policy 模式：仅记录不拦截（结果仍会过滤）'};
+// Each layer is applied asynchronously; the page polls while one is in flight, and offers a
+// re-apply when the forbid does not match the list or failed.
+let webPoll = null;
+
+function policyLine(w) {
+  const p = w.policy || {};
+  if (w.target && w.target !== 'READY') return [`结果过滤：正在应用（${w.target}）。`, false, false];
+  if (p.status === 'ACTIVE') return ['拦截规则：已生效。', false, false];
+  if (p.status === 'NONE') return ['', false, false];
+  if (p.status === 'OUT_OF_SYNC') return ['拦截规则与列表不一致（结果过滤已按列表生效）。', true, true];
+  if (p.status.endsWith('FAILED')) return [`拦截规则未生效：${p.reason || p.status}。结果过滤已按列表生效。`, true, true];
+  return ['拦截规则：正在应用，约半分钟内生效；结果过滤已经生效。', false, false];
+}
+
+async function loadWeb() {
+  let w;
+  try { w = await api('/web/admin/websearch', 'GET'); }
+  catch (e) {
+    if (e.status === 404) return;                  // no Web Search gateway in this deployment
+    $('web').hidden = false; note('web-msg', '无法读取限制列表：' + e.message, true); return;
+  }
+  $('web').hidden = false;
+  $('web-mode').textContent = w.mode ? MODE[w.mode] || w.mode : '';
+  const [line, bad, retry] = policyLine(w);
+  $('web-policy').textContent = line; $('web-policy').style.color = bad ? '#c0392b' : '';
+  $('web-sync').hidden = !retry;
+  clearTimeout(webPoll);
+  if (/ING$/.test((w.policy || {}).status || '') || (w.target && w.target !== 'READY')) webPoll = setTimeout(loadWeb, 3000);
+  $('webs').replaceChildren(...w.domains.map((d) => {
+    const tr = document.createElement('tr');
+    const act = document.createElement('td');
+    const b = document.createElement('button');
+    b.className = 'ghost'; b.textContent = '移除';
+    b.onclick = () => change(b, 'DELETE', {domain: d.domain}, '已移除。');
+    act.append(b);
+    // An entry set outside this page that is not a plain domain filters results but is left out of the rule.
+    tr.append(textCell(d.domain + (d.valid ? '' : '（不是有效域名，仅用于结果过滤）')), textCell(d.by || ''),
+              textCell((d.at || '').slice(0, 10)), act);
+    return tr;
+  }));
+}
+
+// One change, then the list read back whether or not it went through: a failed change may have
+// applied the exclude list already.
+async function change(button, method, body, done) {
+  button.disabled = true;
+  try { const r = await api('/web/admin/websearch', method, body); note('web-msg', typeof done === 'function' ? done(r) : done); return true; }
+  catch (e) { note('web-msg', (method === 'DELETE' ? '移除' : body.sync ? '重新应用' : '添加') + '失败：' + e.message, true); return false; }
+  finally { button.disabled = false; await loadWeb(); }
+}
+
+$('web-add').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const domain = $('web-domain').value.trim();
+  if (!domain) return;
+  if (await change($('web-add').querySelector('button'), 'POST', {domain}, (r) => `已添加 ${r.domain}。`)) $('web-domain').value = '';
+});
+$('web-sync').addEventListener('click', () => change($('web-sync'), 'POST', {sync: true}, '已重新应用。'));
+
+async function load() {
+  // An admin manages the global restrictions whether or not they have authorized Lark
+  // themselves; their own need their own Lark account.
+  const admin = login.groups().includes('admins');
+  if (admin) await loadWeb();   // never throws: its errors show in its own section
+  if (!window.LARK_APP_ID) { $('lark').hidden = true; return; }
+  $('org').hidden = !admin;
+  if (admin) table('orgs', (await api('/web/admin/protection', 'GET')).rules, '/web/admin/protection', 'org-msg', true);
+  try {
+    const mine = await api('/web/protection', 'GET');
+    $('account').textContent = mine.account ? `Lark 账号 ${mine.account}` : '';
+    table('mine', mine.rules, '/web/protection', 'mine-msg');
+    $('global-count').hidden = admin;
+    $('global-count').textContent = mine.globalCount ? `共 ${mine.globalCount} 条，由管理员设置。` : '暂无。';
+    $('mine-add').hidden = false; $('mine-table').hidden = false;
+  } catch (e) {
+    if (e.status !== 409) throw e;
+    $('mine-add').hidden = true; $('mine-table').hidden = true;
+    note('mine-msg', '先在对话里用 /auth lark 授权 Lark，才能设置只对你自己生效的限制。');
+  }
+}
+
+adder('mine-add', 'mine-link', '/web/protection', 'mine-msg');
+adder('org-add', 'org-link', '/web/admin/protection', 'org-msg');
+
+(async () => {
+  try {
+    await login.ready();
+    $('who').textContent = login.email();
+    $('main').hidden = false;
+    await load();
+  } catch (e) {
+    $('main').hidden = true;
+    $('who').textContent = '无法加载：' + e.message;
+  }
+})();
+</script>
+</body>
+</html>

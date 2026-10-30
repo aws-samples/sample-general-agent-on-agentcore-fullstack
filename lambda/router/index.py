@@ -31,6 +31,8 @@ from botocore.exceptions import ReadTimeoutError
 import cognito
 import lark
 import identity
+import protection
+import websearch
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -95,7 +97,8 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
                  budget: float | None = None, chat_id: str = "",
                  message_id: str = "", reaction_id: str = "",
                  fresh_session: bool = False,
-                 images: list | None = None) -> dict:
+                 images: list | None = None,
+                 resources: list | None = None) -> dict:
     """Invoke the agent once. Returns the parsed response dict
     {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON).
 
@@ -117,6 +120,8 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
         "freshSession": fresh_session,
         # [{message_id, image_key}] — the agent reads the pixels from Lark itself.
         "images": images or [],
+        # [{kind, token}] — Lark resources whose titles a protection rule shows (lark_account).
+        **({"resources": resources} if resources else {}),
     }).encode()
     req = urllib.request.Request(
         _RUNTIME_URL, data=payload, method="POST",
@@ -702,6 +707,9 @@ _HELP = "\n".join([
     "  /reset       重置对话记录（运行实例不变）",
     "  /clear       清除对话记录（运行实例不变）",
     "  /reconnect   切换运行实例（对话记录保留）",
+    "  /protect <链接>    不让 agent 以你的身份访问这个 Lark 文档或文件夹",
+    "  /unprotect <链接>  取消这条保护",
+    "  /protected   你设置的保护规则",
 ])
 
 
@@ -750,6 +758,13 @@ def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
         logger.info("runtime session dropped (memory kept) for %s", actor_id)
         return {"text": f"已切换运行实例，对话记录保留（{n} 轮对话）"
                         "——对话状态存放在 DynamoDB，不随容器生命周期消失。"}
+
+    if cmd in ("/protected", "/protect", "/unprotect") or cmd.startswith(("/protect ", "/unprotect ")):
+        try:
+            return _protection_command(message, user_id, actor_id)
+        except Exception:  # noqa: BLE001 — the user still gets an answer
+            logger.exception("protection command failed for %s", actor_id)
+            return {"text": "保护规则暂时无法读写，请稍后再试。"}
 
     # Authorization is per-IdP (one OAuth provider per downstream system). Bare /auth lists
     # each IdP; /auth <idp> consents to one not yet granted. Another account: revoke first.
@@ -1168,6 +1183,192 @@ def _web_consent(event: dict, body: str) -> dict:
 _EMAIL = re.compile(r"^[^@\s:]+@[^@\s]+\.[^@\s]+$")
 
 
+# --- protection rules (protection.py): commands, and the page's own and admin views ---
+
+def _lark_lookup(user_id: str, actor_id: str, resources: list | None = None) -> tuple[dict | None, dict]:
+    """(the caller's Lark account as a rule principal, {token: {title, url}} for `resources`).
+    None without a Lark grant. A Lark user's account is their actor; a web user's grant can be
+    any Lark account, and titles need the grant either way, so the agent — which holds it — asks."""
+    app_id = lark.get_credentials()[0]
+    open_id, titles = (actor_id[len("lark:"):] if actor_id.startswith("lark:") else ""), {}
+    if resources or not open_id:
+        r = invoke_agent(identity.get_or_create_session(user_id), user_id, actor_id, "",
+                         action="lark_account", resources=resources)
+        open_id, titles = open_id or (r.get("open_id") or ""), r.get("titles") or {}
+    return (protection.principal(app_id, open_id) if app_id and open_id else None), titles
+
+
+def _named(user_id: str, actor_id: str, found: list[dict]) -> list[dict]:
+    """Rules without a title get one now, read with the caller's own grant, and keep it."""
+    untitled = [r for r in found if not r.get("title")]
+    if untitled:
+        _, titles = _lark_lookup(user_id, actor_id, [{"kind": r["kind"], "token": r["token"]} for r in untitled])
+        for r in untitled:
+            t = titles.get(r["token"])
+            if t:
+                r.update(title=t["title"], url=t["url"])
+                protection.note(r["policyId"], r["kind"], r["token"], t["title"], t["url"], r.get("by", ""))
+    return found
+
+
+def _lark_principal(user_id: str, actor_id: str) -> dict | None:
+    return _lark_lookup(user_id, actor_id)[0]
+
+
+_KIND = {"document": "文档", "folder": "文件夹"}
+
+
+def _protection_command(message: str, user_id: str, actor_id: str) -> dict:
+    if not protection.configured():
+        return {"text": "这个部署没有配置资源保护。"}
+    owner = _lark_principal(user_id, actor_id)
+    if not owner:
+        return {"text": "还没有授权 Lark，先用 /auth lark 授权，再设置保护。"}
+    verb, _, arg = message.strip().partition(" ")
+    verb = verb.lower()
+    if verb == "/protected":
+        mine = _named(user_id, actor_id, protection.rules(owner))
+        n_global = len(protection.rules(None))
+        lines = ["你设置的保护（agent 以你的身份不能访问）："] if mine else ["你还没有设置保护。"]
+        lines += [f"  {_KIND[r['kind']]}《{r['title']}》" if r.get("title") else f"  {_KIND[r['kind']]} {r['token']}"
+                  for r in mine]
+        if n_global:
+            lines.append(f"另有 {n_global} 条组织级保护，对所有人生效。")
+        return {"text": "\n".join(lines)}
+    target = protection.parse_link(arg)
+    if not target:
+        return {"text": f"请附上 Lark 云文档或文件夹的链接，例如 {verb} https://xxx.larksuite.com/docx/…"}
+    kind, token = target
+    if verb == "/protect":
+        _, titles = _lark_lookup(user_id, actor_id, [{"kind": kind, "token": token}])
+        t = titles.get(token) or {}
+        protection.protect(owner, kind, token, by=actor_id, title=t.get("title", ""), url=t.get("url") or arg.strip())
+        beneath = "及其下所有内容" if kind == "folder" else ""
+        later = "，其下新增或移入的内容一分钟内覆盖" if kind == "folder" else ""
+        return {"text": f"已保护：agent 以你的身份不能再访问这个{_KIND[kind]}{beneath}。几秒内生效{later}；之前已读到的内容不受影响。"}
+    # Every matching rule: two quick /protect calls can each create one before either is
+    # listed, the store being eventually consistent, and one left behind would still hold.
+    removed = [r for r in protection.rules(owner) if r["kind"] == kind and r["token"] == token
+               and protection.unprotect(owner, r["policyId"], by=actor_id)]
+    return {"text": f"已取消对这个{_KIND[kind]}的保护。" if removed else f"你没有保护过这个{_KIND[kind]}。"}
+
+
+def _is_admin(event: dict) -> bool:
+    claims = event["requestContext"]["authorizer"]["jwt"]["claims"]
+    # API Gateway hands a list claim over as a string such as "[admins]".
+    groups = str(claims.get("cognito:groups", "")).strip("[]").replace(",", " ").split()
+    return cognito.ADMINS_GROUP in groups
+
+
+def _web_protection(event: dict, method: str, body: str, admin: bool) -> dict:
+    """The page's protection rules. GET lists, POST {link} adds, DELETE {policyId} removes.
+    The user view is the caller's own Lark account's rules; the admin view (admins group) is
+    the rules that hold for everyone. Neither takes an owner from the request."""
+    try:
+        return _web_protection_unguarded(event, method, body, admin)
+    except Exception:  # noqa: BLE001 — a JSON error the page can show, CORS headers included
+        logger.exception("protection request failed")
+        return _resp(503, {"error": "protection rules are unavailable right now"})
+
+
+def _web_protection_unguarded(event: dict, method: str, body: str, admin: bool) -> dict:
+    user_id, actor_id, bearer, err = _web_caller(event)
+    if err:
+        return err
+    if admin and not _is_admin(event):
+        logger.warning("admin protection request refused for %s", actor_id)
+        return _resp(403, {"error": "admins only"})
+    if not protection.configured():
+        return _resp(404, {"error": "resource protection is not configured"})
+    tok = _caller_bearer.set(bearer)
+    try:
+        return _web_protection_as(event, method, body, admin, user_id, actor_id)
+    finally:
+        _caller_bearer.reset(tok)
+
+
+def _web_protection_as(event: dict, method: str, body: str, admin: bool, user_id: str, actor_id: str) -> dict:
+    payload, err = ({}, None) if method == "GET" else _json_body(body)
+    if err:
+        return err
+    target = protection.parse_link(str(payload.get("link") or "")) if method == "POST" else None
+    if method == "POST" and not target:
+        return _resp(400, {"error": "a Lark document or folder link is required"})
+    # One trip to the agent for both what is needed: the caller's Lark account (the owner of a
+    # user rule) and, when adding, the resource's title as that account sees it.
+    wanted = [{"kind": target[0], "token": target[1]}] if target else None
+    owner, titles = None, {}
+    if not admin or wanted:
+        try:
+            owner, titles = _lark_lookup(user_id, actor_id, wanted)
+        except Exception:  # noqa: BLE001 — an admin rule does not need the admin's own grant
+            if not admin:
+                raise
+            logger.warning("could not read the title for %s", actor_id, exc_info=True)
+        if admin:
+            owner = None
+        elif not owner:
+            return _resp(409, {"error": "authorize Lark first (/auth lark)"})
+    if method == "GET":
+        found = protection.rules(owner)
+        try:
+            found = _named(user_id, actor_id, found)
+        except Exception:  # noqa: BLE001 — titles are for reading; the rules still list
+            logger.warning("could not name protection rules for %s", actor_id, exc_info=True)
+        return _resp(200, {"rules": found,
+                           "account": owner["entityId"].split("/", 1)[1] if owner else "",
+                           "globalCount": len(protection.rules(None)) if owner else None,
+                           "isAdmin": _is_admin(event)})
+    if method == "POST":
+        kind, token = target
+        t = titles.get(token) or {}
+        # Who added it, as a person reads it: the hosted login's username is the email.
+        by = str(event["requestContext"]["authorizer"]["jwt"]["claims"].get("username") or actor_id)
+        return _resp(200, {"policyId": protection.protect(owner, kind, token, by=by, title=t.get("title", ""),
+                                                          url=t.get("url") or str(payload.get("link")).strip())})
+    ok = protection.unprotect(owner, str(payload.get("policyId") or ""), by=actor_id)
+    return _resp(200 if ok else 404, {"ok": ok})
+
+
+def _web_websearch(event: dict, method: str, body: str) -> dict:
+    """Admins' blocked Web Search domains (websearch.py). GET lists, POST {domain} blocks one,
+    DELETE {domain} unblocks it; the gateway enforces each change within seconds."""
+    _, actor_id, _, err = _web_caller(event)
+    if err:
+        return err
+    if not _is_admin(event):
+        logger.warning("web search admin request refused for %s", actor_id)
+        return _resp(403, {"error": "admins only"})
+    payload, err = ({}, None) if method == "GET" else _json_body(body)
+    if err:
+        return err
+    try:
+        if method == "GET":
+            return _resp(200, websearch.blocked())
+        by = str(event["requestContext"]["authorizer"]["jwt"]["claims"].get("username") or actor_id)
+        if method == "POST" and payload.get("sync") is True:
+            websearch.sync(by)
+            return _resp(200, {"ok": True})
+        if method == "DELETE":
+            # As listed: an entry set outside the page may not be a plain domain.
+            ok = websearch.unblock(str(payload.get("domain") or ""), by)
+            return _resp(200 if ok else 404, {"ok": ok})
+        domain = websearch.normalise(payload.get("domain"))
+        if not domain:
+            return _resp(400, {"error": "a domain name such as example.com is required"})
+        websearch.block(domain, by)
+        return _resp(200, {"domain": domain})
+    except websearch.NotDeployed as e:
+        return _resp(404, {"error": str(e)})
+    except websearch.Rejected as e:
+        return _resp(400, {"error": str(e)})
+    except websearch.Busy as e:
+        return _resp(409, {"error": f"{e}; try again in a few seconds"})
+    except Exception:  # noqa: BLE001 — a JSON error the page can show, CORS headers included
+        logger.exception("web search admin request failed")
+        return _resp(503, {"error": "web search rules are unavailable right now"})
+
+
 def _web_admin(event: dict, method: str, body: str) -> dict:
     """The admin page's user management: GET lists web users, POST {email} invites one,
     DELETE {email} removes one. A page, not a chat command, so nobody mistakes it for the
@@ -1258,6 +1459,12 @@ def handler(event, context):
         return _web_command(event, body)
     if path.endswith("/web/consent") and method == "POST":
         return _web_consent(event, body)
+    if path.endswith("/web/protection") and method in ("GET", "POST", "DELETE"):
+        return _web_protection(event, method, body, admin=False)
+    if path.endswith("/web/admin/protection") and method in ("GET", "POST", "DELETE"):
+        return _web_protection(event, method, body, admin=True)
+    if path.endswith("/web/admin/websearch") and method in ("GET", "POST", "DELETE"):
+        return _web_websearch(event, method, body)
     if path.endswith("/web/admin/users") and method in ("GET", "POST", "DELETE"):
         return _web_admin(event, method, body)
 

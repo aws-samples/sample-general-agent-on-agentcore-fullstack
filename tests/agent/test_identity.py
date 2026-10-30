@@ -351,3 +351,39 @@ def test_downstream_consent_is_recorded_at_build_and_minted_only_when_reached():
         mint.assert_not_called()
         assert grants._consent_link(s, "google") == "https://google-consent"
         mint.assert_called_once()
+
+
+def test_the_lark_account_behind_a_grant_is_read_from_lark_and_never_starts_a_consent():
+    """Protection rules are keyed by the Lark account a grant belongs to (lambda/router/protection.py),
+    and a web user's grant may be any account they signed in with."""
+    with mock.patch.object(lark_3lo, "configured", return_value=True), \
+         mock.patch.object(lark_3lo, "lark_provider", return_value=("p-3lo", ["drive:drive"])), \
+         mock.patch.object(lark_3lo, "peek_user_token_for", return_value="u-tok") as peek, \
+         mock.patch.object(lark_3lo, "_token_owner", return_value="ou_carol") as owner:
+        assert grants.lark_account("web:s-1") == {"open_id": "ou_carol", "titles": {}}
+        owner.assert_called_once_with("u-tok")
+        peek.return_value = ""
+        assert grants.lark_account("web:s-1") == {"open_id": "", "titles": {}}     # no grant: nothing asked of Lark
+    with mock.patch.object(lark_3lo, "configured", return_value=True), \
+         mock.patch.object(lark_3lo, "get_user_lark_token", return_value=("auth_url", "https://consent")), \
+         mock.patch.object(lark_3lo, "_token_owner", side_effect=AssertionError("asked")):
+        assert grants.lark_account("lark:ou_x") == {"open_id": "", "titles": {}}   # a consent link is not an account
+
+
+def test_titles_are_read_with_the_users_grant_and_what_they_cannot_see_is_left_out():
+    sent = {}
+
+    class _R:
+        def json(self):
+            return {"data": {"metas": [{"doc_token": "docAAAAAAAA", "title": "季度预算", "url": "https://x/docx/docAAAAAAAA"}]}}
+
+    def post(url, headers, json, timeout):
+        sent.update(url=url, auth=headers["Authorization"], body=json)
+        return _R()
+    with mock.patch.object(lark_3lo.httpx, "post", side_effect=post):
+        out = lark_3lo.titles_of("u-tok", [{"kind": "document", "token": "docAAAAAAAA"},
+                                           {"kind": "folder", "token": "fldHIDDENXX"}])
+    assert out == {"docAAAAAAAA": {"title": "季度预算", "url": "https://x/docx/docAAAAAAAA"}}
+    assert sent["auth"] == "Bearer u-tok" and sent["url"].endswith("/open-apis/drive/v1/metas/batch_query")
+    assert sent["body"]["request_docs"] == [{"doc_token": "docAAAAAAAA", "doc_type": "docx"},
+                                            {"doc_token": "fldHIDDENXX", "doc_type": "folder"}]

@@ -31,6 +31,10 @@ lambda_py python -m pytest tests/shim/test_shim.py -q
 echo "== mcp protocol, both eras (node) =="
 node --test tests/mcp/test_protocol.mjs
 
+echo "== lark-cli protection guard (node) =="
+# guard.js and routes.js are plain modules; server.js, which listens on load, is not imported.
+node --test tests/mcp/test_lark_guard.mjs
+
 echo "== google mcp (node) =="
 # Node's own runner: this server has no dependencies, so a toolchain for one file would be
 # the wrong trade. Pointed at the file — the server listens on import.

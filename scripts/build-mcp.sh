@@ -92,6 +92,16 @@ ROLE_ARN="$(aws cloudformation describe-stacks --stack-name "$PREFIX-agentcore" 
 [ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ] || {
   echo "execution role not found — run ./deploy.sh base first"; exit 1; }
 
+# The protection policy store (stacks/protection_stack.py), for a server that checks documents
+# against it. Read from its outputs like the role, because RUNTIME_ENV_MAP reads the environment.
+for pair in POLICY_STORE_ID=PolicyStoreId PROTECT_ADMIN_TEMPLATE_ID=AdminTemplateId \
+            PROTECT_USER_TEMPLATE_ID=UserTemplateId; do
+  v="$(aws cloudformation describe-stacks --stack-name "$PREFIX-protection" \
+    --query "Stacks[0].Outputs[?OutputKey=='${pair#*=}'].OutputValue" --output text 2>/dev/null || true)"
+  [ "$v" != "None" ] || v=""
+  export "${pair%%=*}=$v"
+done
+
 ARTIFACT="{\"containerConfiguration\":{\"containerUri\":\"$ECR:$TAG\"}}"
 HEADERS='{"requestHeaderAllowlist":["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"]}'
 # Container env from the server's RUNTIME_ENV_MAP ("CONTAINER_KEY=SOURCE_VAR" pairs).
@@ -116,6 +126,17 @@ if [ -n "$RID" ] && [ "$RID" != "None" ]; then
     --environment-variables "$ENVVARS" \
     --request-header-configuration "$HEADERS" >/dev/null
   echo "  updated $RUNTIME_NAME ($RID)"
+  # An agent session keeps its MCP connection, and the server microVM behind it, for up to 50
+  # minutes. Dropping the stored session ids sends each user's next message to a fresh agent
+  # session, which connects to this version — as the agent's own deploy does (provision.sh).
+  n=0
+  for pk in $(aws dynamodb scan --table-name "$PREFIX-identity" --filter-expression "SK = :s" \
+      --expression-attribute-values '{":s":{"S":"SESSION"}}' --projection-expression "PK" \
+      --query 'Items[].PK.S' --output text 2>/dev/null); do
+    aws dynamodb delete-item --table-name "$PREFIX-identity" \
+      --key "{\"PK\":{\"S\":\"$pk\"},\"SK\":{\"S\":\"SESSION\"}}" >/dev/null 2>&1 && n=$((n+1))
+  done
+  echo "  dropped $n agent session(s), so the next message uses this version"
 else
   RID="$(aws bedrock-agentcore-control create-agent-runtime --agent-runtime-name "$RUNTIME_NAME" \
     --agent-runtime-artifact "$ARTIFACT" --role-arn "$ROLE_ARN" \

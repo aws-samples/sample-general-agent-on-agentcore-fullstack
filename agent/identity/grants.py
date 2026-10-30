@@ -202,6 +202,28 @@ def auth_status(actor_id: str, workload_token: str = "") -> dict:
     return status
 
 
+def lark_account(actor_id: str, workload_token: str = "", resources: list | None = None) -> dict:
+    """The Lark open_id this user's vaulted grant belongs to → {"open_id", "titles"}; "" when
+    there is none. `resources` ([{kind, token}]) also asks Lark, with the same grant, for each
+    one's title and link, which is how a protection rule is shown to the person maintaining it.
+
+    What protection rules are keyed by (lambda/router/protection.py): the router cannot read the
+    vault, and a web user's grant may be any Lark account they signed in with, so it is read
+    from Lark with the grant itself. Never starts a consent."""
+    if not lark_3lo.configured():
+        return {"open_id": "", "titles": {}}
+    if actor_id.startswith("lark:"):
+        kind, token = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
+        token = token if kind == "token" else ""
+    else:
+        provider, scopes = lark_3lo.lark_provider()
+        token = lark_3lo.peek_user_token_for(actor_id, provider, scopes, workload_token)
+    if not token:
+        return {"open_id": "", "titles": {}}
+    return {"open_id": lark_3lo._token_owner(token),
+            "titles": lark_3lo.titles_of(token, resources) if resources else {}}
+
+
 def _whoami_tool(actor_id: str, workload_token: str):
     """Who the person in this conversation is, for the model to answer from rather than
     guess: how they signed in, as whom, and which systems they have authorised as whom. The

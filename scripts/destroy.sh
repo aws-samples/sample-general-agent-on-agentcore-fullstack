@@ -120,6 +120,22 @@ for gid in $(aws bedrock-agentcore-control list-gateways --region "$WS_REGION" \
   aws bedrock-agentcore-control delete-gateway --region "$WS_REGION" --gateway-identifier "$gid" >/dev/null 2>&1 \
     && echo "  deleted gateway $gid" || warn "  (gateway $gid delete failed)"
 done
+# Its policy engine (scripts/websearch_policy.py): policies first, as an engine holding any
+# cannot be deleted. Exactly this deployment's name, never a prefix match.
+uv run --with 'boto3>=1.43.92' python - "${U}_websearch" "$WS_REGION" <<'PYEOF' || warn "  (policy engine cleanup failed)"
+import sys, time, boto3
+name, region = sys.argv[1], sys.argv[2]
+c = boto3.client("bedrock-agentcore-control", region_name=region)
+for pe in [p for p in c.list_policy_engines().get("policyEngines", []) if p["name"] == name]:
+    for p in c.list_policies(policyEngineId=pe["policyEngineId"]).get("policies", []):
+        c.delete_policy(policyEngineId=pe["policyEngineId"], policyId=p["policyId"])
+    for _ in range(40):
+        if not c.list_policies(policyEngineId=pe["policyEngineId"]).get("policies"):
+            break
+        time.sleep(3)
+    c.delete_policy_engine(policyEngineId=pe["policyEngineId"])
+    print(f"  deleted policy engine {pe['policyEngineId']}")
+PYEOF
 
 # --- 1b. Memory, ECR, CodeBuild (created by the deploy scripts) -----------
 # None of these belong to a stack, and leaving them behind is not harmless: the
@@ -218,13 +234,13 @@ fi
 # /aws/lambda/<function>, a group their stack does not own. CDK truncates the stack name in
 # those function names, so they are read from the stacks before the stacks go, not guessed.
 CDK_FUNCS=()
-for s in security agentcore shim network sandbox router webui gateway observability; do
+for s in security agentcore shim network sandbox router webui gateway observability protection; do
   # shellcheck disable=SC2207 # function names have no spaces
   CDK_FUNCS+=($(aws cloudformation list-stack-resources --stack-name "$PREFIX-$s" \
     --query "StackResourceSummaries[?ResourceType=='AWS::Lambda::Function'].PhysicalResourceId" \
     --output text 2>/dev/null || true))
 done
-CDK_CTX=(-c "deployment_name=$PREFIX" -c files_storage=true -c webui=true
+CDK_CTX=(-c "deployment_name=$PREFIX" -c files_storage=true -c webui=true -c lark=true
          -c "lark_api_domain=${LARK_API_DOMAIN:?set LARK_API_DOMAIN in .env}" --output "$CDK_OUT")
 # The network stack joins the app only when it exists, whatever .env or the state file say now
 # (a re-run finds the state file gone). Its AZs only have to be real names in this account
@@ -249,6 +265,15 @@ if [ -n "$vpc" ] && [ "$vpc" != "None" ]; then
             --output text 2>/dev/null || true)"
 fi
 KEPT=("$PREFIX-network" "$PREFIX-sandbox" "$PREFIX-agentcore" "$PREFIX-security")
+# The protection store is deletion-protected, so every rule is not lost to a stray stack
+# delete. Tearing the deployment down is the one place that protection is meant to give way.
+store="$(aws cloudformation describe-stacks --stack-name "$PREFIX-protection" \
+  --query "Stacks[0].Outputs[?OutputKey=='PolicyStoreId'].OutputValue" --output text 2>/dev/null || true)"
+if [ -n "$store" ] && [ "$store" != "None" ]; then
+  aws verifiedpermissions update-policy-store --policy-store-id "$store" \
+    --validation-settings mode=STRICT --deletion-protection DISABLED >/dev/null \
+    && echo "  protection store $store: deletion protection off for teardown"
+fi
 if [ -z "$held" ]; then
   log "CDK — destroy every stack of this app"
   $CDK destroy --all "${CDK_CTX[@]}" --force

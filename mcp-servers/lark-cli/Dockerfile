@@ -28,7 +28,10 @@ RUN npx -y @larksuite/cli@${LARK_CLI_VERSION} install 2>/dev/null || npm install
 RUN npx -y skills add larksuite/cli -y -g 2>/dev/null || true
 
 WORKDIR /app
-COPY server.js mcp-protocol.js /app/
+# The AWS SDK for the protection check (guard.js), from the lockfile.
+COPY package.json package-lock.json /app/
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+COPY server.js guard.js routes.js doc_routes.json mcp-protocol.js /app/
 
 EXPOSE 8000
 
