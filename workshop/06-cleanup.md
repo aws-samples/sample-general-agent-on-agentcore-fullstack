@@ -10,7 +10,7 @@ scripts/destroy.sh
 
 脚本先列出要删除的内容，然后要求你输入 AWS 账号 ID 确认。不想确认时用 `scripts/destroy.sh --yes`。
 
-它按依赖顺序删除 `./deploy.sh` 创建的全部资源，包括：Agent Runtime、Code Interpreter、AgentCore Memory（含所有长期记忆）、`us-east-1` 的 Web 搜索网关、所有 CDK 栈、ECR 镜像和 CodeBuild 项目，以及 GitHub 的 OAuth provider 和 vault 里所有用户的 token。脚本可以重复运行，已删除的资源会被跳过。
+它按依赖顺序删除 `./deploy.sh` 创建的全部资源，包括：Agent Runtime、Code Interpreter、AgentCore Memory（含所有长期记忆）、`us-east-1` 的 Web 搜索网关和它的 Policy 引擎、所有 CDK 栈、ECR 镜像和 CodeBuild 项目，以及 GitHub 的 OAuth provider 和 vault 里所有用户的 token。脚本可以重复运行，已删除的资源会被跳过。
 
 **可能需要再运行一次。** 代码沙箱运行在 VPC 里，AgentCore 在沙箱子网里创建的网络接口要由 AgentCore 自己释放，最长需要 8 小时。释放之前，`<DEPLOYMENT_NAME>-sandbox`、`<DEPLOYMENT_NAME>-agentcore`、`<DEPLOYMENT_NAME>-security` 三个栈删不掉，脚本会保留它们，并在结尾提示：
 

@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1290" height="1000" viewBox="0 0 1290 1000" font-family="Helvetica,Arial,'PingFang SC','Hiragino Sans GB','Noto Sans CJK SC',sans-serif" role="img" aria-labelledby="t"><title id="t">workshop 部署架构与一次访问的数据流</title><rect width="1290" height="1000" fill="#ffffff"/>
 <defs><marker id="a-4a5568" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#4a5568"/></marker><marker id="a-7d3ac1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#7d3ac1"/></marker><marker id="a-d13212" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#d13212"/></marker><marker id="a-9aa5b1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#9aa5b1"/></marker></defs>
 <text x="34" y="42" font-size="19" font-weight="700" fill="#16191f">General Agent on AgentCore — workshop 部署架构</text>
-<text x="34" y="62" font-size="11.5" fill="#5f6b7a">Web 页面 + GitHub + Web 搜索 + 代码执行，不接 Lark 和 Google。红线是带着用户自己 token 的调用。</text>
+<text x="34" y="62" font-size="11.5" fill="#5f6b7a">Web 页面 + GitHub + Web 搜索（带访问限制）+ 代码执行，不接 Lark 和 Google。红线是带着用户自己 token 的调用。</text>
 <rect x="160" y="86" width="925" height="820" rx="10" fill="#ffffff" stroke="#232f3e" stroke-width="1.6"/>
 <text x="174" y="107" font-size="11" font-weight="700" fill="#232f3e">AWS Cloud · 部署区域 us-west-2</text>
 <rect x="185" y="150" width="285" height="350" rx="10" fill="#f1f6fb" stroke="#2b6cb0" stroke-width="1" stroke-dasharray="4 4"/>
@@ -46,6 +46,9 @@
 <path id="p_mem" d="M766,330 L784,330" stroke="#4a5568" stroke-width="1.6" fill="none" marker-end="url(#a-4a5568)"/>
 <path id="p_gw" d="M766,410 L776,410 L776,500 L784,500" stroke="#4a5568" stroke-width="1.6" fill="none" marker-end="url(#a-4a5568)"/>
 <text x="800" y="455" text-anchor="start" font-size="9.5" fill="#4a5568" font-weight="500" paint-order="stroke" stroke="#ffffff" stroke-width="3.5">SigV4</text>
+<path id="p_pol" d="M910,536 L910,564" stroke="#4a5568" stroke-width="1.6" fill="none" marker-end="url(#a-4a5568)"/>
+<text x="960" y="554" text-anchor="middle" font-size="9.5" fill="#4a5568" font-weight="500" paint-order="stroke" stroke="#ffffff" stroke-width="3.5">每次调用先判定</text>
+<text x="910" y="645" text-anchor="middle" font-size="9.5" fill="#5f6b7a" font-weight="500" paint-order="stroke" stroke="#ffffff" stroke-width="3.5">域名由管理员在访问控制页设置，经 Router 写入</text>
 <path id="p_code" d="M640,426 L640,554" stroke="#4a5568" stroke-width="1.6" fill="none" marker-end="url(#a-4a5568)"/>
 <text x="610" y="490" text-anchor="middle" font-size="9.5" fill="#4a5568" font-weight="500" paint-order="stroke" stroke="#ffffff" stroke-width="3.5">运行代码</text>
 <path id="p_files" d="M640,626 L640,745" stroke="#4a5568" stroke-width="1.6" fill="none" marker-end="url(#a-4a5568)"/>
@@ -218,6 +221,9 @@
 <rect x="520" y="560" width="240" height="60" rx="7" fill="#ffffff" stroke="#01a88d" stroke-width="1.2"/>
 <text x="640.0" y="586.0" text-anchor="middle" font-size="11" font-weight="700" fill="#16191f">AgentCore Code Interpreter</text>
 <text x="640.0" y="603.0" text-anchor="middle" font-size="9.5" fill="#5f6b7a">代码沙箱 · /mnt/workspace</text>
+<rect x="790" y="570" width="240" height="60" rx="7" fill="#ffffff" stroke="#01a88d" stroke-width="1.2"/>
+<text x="910.0" y="596.0" text-anchor="middle" font-size="11" font-weight="700" fill="#16191f">AgentCore Policy</text>
+<text x="910.0" y="613.0" text-anchor="middle" font-size="9.5" fill="#5f6b7a">Cedar 规则 · 搜索执行前放行或拒绝</text>
 <path d="M190,978 L216,978" stroke="#4a5568" stroke-width="2.2" fill="none"/>
 <text x="222" y="982" font-size="10" fill="#5f6b7a">请求</text>
 <path d="M270,978 L296,978" stroke="#7d3ac1" stroke-width="2.2" fill="none" stroke-dasharray="5 4"/>
@@ -264,13 +270,16 @@
 <circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+14.50s" dur="0.8s"/><animateMotion begin="clk.begin+14.50s" dur="0.8s" fill="freeze"><mpath href="#p_files"/></animateMotion></circle>
 <circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+14.50s" dur="0.9s"/><animateMotion begin="clk.begin+14.50s" dur="0.9s" fill="freeze"><mpath href="#p_nat"/></animateMotion></circle>
 <circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+15.40s" dur="1.0s"/><animateMotion begin="clk.begin+15.40s" dur="1.0s" fill="freeze"><mpath href="#p_net"/></animateMotion></circle>
-<text x="176" y="939" font-size="13" font-weight="600" fill="#2b6cb0" visibility="hidden">⑥ 联网搜索（us-east-1 的 AgentCore Gateway），读写长期记忆（AgentCore Memory）<set attributeName="visibility" to="visible" begin="clk.begin+17.00s" dur="3.4s"/></text>
+<text x="176" y="939" font-size="13" font-weight="600" fill="#2b6cb0" visibility="hidden">⑥ 联网搜索：Gateway 先由 AgentCore Policy 判定放行再搜索（us-east-1）；读写长期记忆（AgentCore Memory）<set attributeName="visibility" to="visible" begin="clk.begin+17.00s" dur="3.4s"/></text>
 <path d="M766,410 L776,410 L776,500 L784,500" fill="none" stroke="#4a5568" stroke-width="8" stroke-opacity="0.2" stroke-linecap="round" stroke-linejoin="round" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+17.00s" dur="3.4s"/></path>
 <path d="M766,330 L784,330" fill="none" stroke="#4a5568" stroke-width="8" stroke-opacity="0.2" stroke-linecap="round" stroke-linejoin="round" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+17.00s" dur="3.4s"/></path>
+<path d="M910,536 L910,564" fill="none" stroke="#4a5568" stroke-width="8" stroke-opacity="0.2" stroke-linecap="round" stroke-linejoin="round" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+17.00s" dur="3.4s"/></path>
 <circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+17.00s" dur="0.8s"/><animateMotion begin="clk.begin+17.00s" dur="0.8s" fill="freeze"><mpath href="#p_gw"/></animateMotion></circle>
 <circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+17.20s" dur="0.6s"/><animateMotion begin="clk.begin+17.20s" dur="0.6s" fill="freeze"><mpath href="#p_mem"/></animateMotion></circle>
-<circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+18.20s" dur="0.8s"/><animateMotion begin="clk.begin+18.20s" dur="0.8s" fill="freeze" calcMode="linear" keyPoints="1;0" keyTimes="0;1"><mpath href="#p_gw"/></animateMotion></circle>
-<circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+18.20s" dur="0.6s"/><animateMotion begin="clk.begin+18.20s" dur="0.6s" fill="freeze" calcMode="linear" keyPoints="1;0" keyTimes="0;1"><mpath href="#p_mem"/></animateMotion></circle>
+<circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+17.80s" dur="0.5s"/><animateMotion begin="clk.begin+17.80s" dur="0.5s" fill="freeze"><mpath href="#p_pol"/></animateMotion></circle>
+<circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+18.40s" dur="0.5s"/><animateMotion begin="clk.begin+18.40s" dur="0.5s" fill="freeze" calcMode="linear" keyPoints="1;0" keyTimes="0;1"><mpath href="#p_pol"/></animateMotion></circle>
+<circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+19.00s" dur="0.8s"/><animateMotion begin="clk.begin+19.00s" dur="0.8s" fill="freeze" calcMode="linear" keyPoints="1;0" keyTimes="0;1"><mpath href="#p_gw"/></animateMotion></circle>
+<circle r="5.5" fill="#4a5568" stroke="#ffffff" stroke-width="1.6" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+19.00s" dur="0.6s"/><animateMotion begin="clk.begin+19.00s" dur="0.6s" fill="freeze" calcMode="linear" keyPoints="1;0" keyTimes="0;1"><mpath href="#p_mem"/></animateMotion></circle>
 <text x="176" y="939" font-size="13" font-weight="600" fill="#2b6cb0" visibility="hidden">⑦ 回答以 SSE 流回浏览器，对话记录写入 DynamoDB<set attributeName="visibility" to="visible" begin="clk.begin+20.40s" dur="3.4s"/></text>
 <path d="M514,396 L490,396 L490,600 L432,600" fill="none" stroke="#4a5568" stroke-width="8" stroke-opacity="0.2" stroke-linecap="round" stroke-linejoin="round" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+20.40s" dur="3.4s"/></path>
 <path d="M85,281 L85,126 L740,126 L740,314" fill="none" stroke="#1d8102" stroke-width="8" stroke-opacity="0.2" stroke-linecap="round" stroke-linejoin="round" visibility="hidden"><set attributeName="visibility" to="visible" begin="clk.begin+20.40s" dur="3.4s"/></path>

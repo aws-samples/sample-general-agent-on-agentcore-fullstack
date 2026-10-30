@@ -16,7 +16,7 @@
 | `base — CDK stacks` | 部署 7 个 CDK 栈：`security`（Cognito、Secrets Manager）、`agentcore`（执行角色、对话记录表和桶、用户文件桶）、`shim`、`router`、`gateway`、`observability`，以及 `sandbox`（代码沙箱的 VPC、NAT gateway、S3 Files 文件系统和挂载点）。首次部署到一个区域时会先自动执行 `cdk bootstrap` | 约 12 分钟，S3 Files 挂载点最慢（约 5 分钟） |
 | `mcp — MCP servers` | 构建并部署 `mcp-servers/` 下的 MCP server | 全部跳过：GitHub 用的是 GitHub 官方的远程 MCP server |
 | `3lo — Identity + OAuth provider` | 创建 workload identity `<name>-wl`（返回地址指向 Shim），创建 GitHub 的 OAuth credential provider `<name>-github` 并打印它的回调地址，生成 IdP 注册表供 Router 和 Agent 使用 | 1 分钟内 |
-| `gateway — Web Search (optional)` | 在 `us-east-1` 创建 AgentCore Gateway，接入内置的 Web 搜索连接器 | 1 分钟左右 |
+| `gateway — Web Search (optional)` | 在 `us-east-1` 创建 AgentCore Gateway，接入内置的 Web 搜索连接器，并挂上 AgentCore Policy 引擎（拒绝执行模式） | 1 分钟左右 |
 | `code — Code Interpreter for generated code` | 创建 Code Interpreter，接入沙箱 VPC，等它变成 READY | 约 5 分钟 |
 | `runtime — agent` | 创建 AgentCore Memory；在 CodeBuild 里构建 ARM64 的 Agent 镜像并推送到 ECR；创建 Agent Runtime 并等待 READY；用真实的 Runtime ARN 重新部署 Router；清掉旧的会话 id | 约 10 分钟 |
 | `a2a — expose to peer agents` | 供其他 Agent 调用的 A2A Runtime | 跳过（`A2A=false`） |

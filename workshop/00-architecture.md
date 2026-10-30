@@ -6,7 +6,7 @@
 
 ![workshop 部署架构与一次访问的数据流](images/00-architecture.svg)
 
-*动画按顺序循环播放一次访问的 7 个步骤：登录、提问、第一次授权 GitHub、以用户身份调用 GitHub、运行代码、搜索与记忆、回答流回浏览器。静态版：[00-architecture.png](images/00-architecture.png)。*
+*动画按顺序循环播放一次访问的 7 个步骤：登录、提问、第一次授权 GitHub、以用户身份调用 GitHub、运行代码、搜索（先经 AgentCore Policy 判定）与记忆、回答流回浏览器。静态版：[00-architecture.png](images/00-architecture.png)。*
 
 ## 三条请求路径
 
@@ -48,6 +48,7 @@
 | AgentCore Memory | 长期记忆，每个用户一个独立的命名空间 |
 | AgentCore Code Interpreter | 代码沙箱，接入上面的沙箱 VPC；每个用户的会话只挂载自己的工作区 |
 | AgentCore Gateway（us-east-1） | 接入内置的 Web 搜索连接器。这个连接器只在 us-east-1 提供，Agent 跨区域调用它 |
+| AgentCore Policy 引擎（us-east-1） | 挂在 Web 搜索网关上，每次搜索执行前用 Cedar 规则判断放行还是拒绝；管理员在访问控制页上限制的域名写进其中一条规则 |
 | AgentCore Identity | workload identity，以及 GitHub 的 OAuth credential provider `<name>-github` |
 | ECR 仓库、CodeBuild 项目 | 在 CodeBuild 里构建 ARM64 的 Agent 镜像，推送到 ECR |
 | Cognito 管理员用户、Secrets Manager `<name>/web/admin` | 管理员 `admin@agentcore.local` 和它的密码 |
@@ -85,10 +86,11 @@ Agent 的代码都在 `agent/` 目录，从 `core.py` 看起。
 | 代码工作区 | S3 Files，底层是用户文件桶 | 每个用户一个 access point，根目录固定为该用户的目录 |
 | 发到页面的文件 | checkpoint 桶的 `deliveries/` 下 | 路径含用户身份的哈希；页面通过最长一小时的预签名链接访问 |
 | GitHub token | AgentCore Identity 的 Token Vault | 按用户存放，Agent 只能取当前请求那个用户的 token |
+| 被限制的域名 | Web 搜索网关 target 的排除列表，和 Policy 引擎里的一条 Cedar 规则；添加者记在身份表里 | 只有管理员能改，由 Router 写入 |
 
 ## 费用
 
-主要是按用量计费：Bedrock 按 token，AgentCore Runtime 按 microVM 的 CPU 和内存时长，Memory、Gateway、Code Interpreter 按调用量或会话时长。
+主要是按用量计费：Bedrock 按 token，AgentCore Runtime 按 microVM 的 CPU 和内存时长，Memory、Gateway、Policy、Code Interpreter 按调用量或会话时长。
 
 闲置时仍在计费的有：
 

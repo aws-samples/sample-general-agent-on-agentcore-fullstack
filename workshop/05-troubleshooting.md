@@ -73,6 +73,14 @@ export npm_config_registry=https://registry.npmmirror.com
 - **想用另一个 GitHub 账号授权**：先发送 `/auth revoke github`，再到 GitHub 的 **Settings → Applications → Authorized OAuth Apps** 撤销这个 App，然后在浏览器里登录另一个 GitHub 账号再授权。
 - **在 GitHub 那边撤销授权后，回答一直停在「调用工具」**：先刷新页面，再发送 `/new`，然后重新提问，会出现「授权 GitHub」按钮。要在 GitHub 那边撤销授权，先发送 `/auth revoke github` 再去撤销，就不会遇到这个问题。
 
+## 访问限制相关
+
+- **页面右上角没有「访问控制」**：只有 `admins` 组的用户能看到它。`admin@agentcore.local` 在这个组里；你邀请的用户默认不在。
+- **状态行显示「拦截规则与列表不一致」或「拦截规则未生效」**：结果过滤已经按列表生效，只是 Policy 里的规则没跟上，比如上一次修改还在校验时又改了一次。点击 **重新应用**。
+- **添加或移除时提示「the previous change is still being applied」**：上一次修改的规则还在校验，过几秒再试一次。
+- **Agent 说没收到查询词，也没有调用工具**：模型偶尔会这样。发送 `/new` 后再发一次。
+- **D3 的搜索没有被拒**：先确认状态行已经显示「已生效」。规则只在域名能出现的位置匹配，且区分大小写：`ietf.org`、`datatracker.ietf.org` 会被拒，`IETF.ORG` 或紧贴在中文后面的写法不会；这些情况下结果仍会被过滤。
+
 ## 其它
 
 - **忘记管理员密码**：运行 `./deploy.sh urls`，重新打印页面地址和管理员账号。

@@ -4,18 +4,19 @@
 
 ## 实验目标
 
-- **部署**：一条 `./deploy.sh` 完成全部部署，包括 Agent Runtime、Web 聊天页面与 Cognito 登录、AgentCore Memory、Code Interpreter 沙箱、Web 搜索网关和 AgentCore Identity。
+- **部署**：一条 `./deploy.sh` 完成全部部署，包括 Agent Runtime、Web 聊天页面与 Cognito 登录、AgentCore Memory、Code Interpreter 沙箱、Web 搜索网关及其 AgentCore Policy 引擎，以及 AgentCore Identity。
 - **入口与身份**：用户在 Cognito 托管登录页登录，Agent 校验的是用户自己的 token；管理员在页面上管理谁能登录。
 - **会话与对话**：理解 AgentCore Runtime 的会话和 microVM，以及对话记录为什么能在换实例后保留；回答过程中可以继续补充消息。
 - **工具**：Web 搜索（AgentCore Gateway）、代码执行和每个用户的持久工作区（Code Interpreter + S3 Files）、长期记忆（AgentCore Memory）。
 - **以用户身份调用下游系统**：工具第一次需要 GitHub 时，在聊天里完成 OAuth 授权，token 存进 AgentCore Identity 的 Token Vault；之后 Agent 带着你自己的 token 调用 GitHub。
+- **工具层访问限制**：管理员在页面上限制 Web 搜索能访问的域名，由 AgentCore Gateway 上的 AgentCore Policy 在工具执行前拒绝，网关同时过滤结果。
 - **清理**：实验结束后完整删除资源。
 
 本 workshop 不接 Lark 和 Google：它们的 OAuth 应用需要管理员在后台配置。下游系统只用 GitHub，几乎每个开发者都有账号，创建 OAuth App 也不需要审批。Lark 和 Google 的接入方式见 [docs/console-setup.md](https://github.com/aws-samples/sample-general-agent-on-agentcore-fullstack/blob/main/docs/console-setup.md)。
 
 ## 时间安排
 
-Workshop 先有 30 分钟方案介绍，然后是 60 分钟动手实验。60 分钟内完成部署和必做的验证任务；选做任务和清理可以会后继续：Workshop Studio 提供的实验环境保留 2 天。
+Workshop 先有 30 分钟方案介绍，然后是 60 分钟动手实验。60 分钟内完成部署并开始必做的验证任务；没做完的验证任务、选做任务和清理可以会后继续：Workshop Studio 提供的实验环境保留 2 天。
 
 | 时间 | 内容 | 章节 |
 |---|---|---|
@@ -45,7 +46,7 @@ Agent Runtime（AgentCore Runtime，每个会话一个 microVM）
    ├─ 对话记录 ──────── DynamoDB + S3 checkpoint
    ├─ 长期记忆 ──────── AgentCore Memory
    ├─ 代码执行 ──────── AgentCore Code Interpreter + S3 Files 工作区（经 NAT 联网）
-   ├─ Web 搜索 ──────── AgentCore Gateway（us-east-1）
+   ├─ Web 搜索 ──────── AgentCore Gateway（us-east-1），AgentCore Policy 按域名拦截
    └─ GitHub 工具 ───── GitHub 官方 MCP server，带着从 AgentCore Identity 取出的你的 token
 ```
 

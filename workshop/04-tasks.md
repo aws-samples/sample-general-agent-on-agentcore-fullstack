@@ -1,6 +1,6 @@
 # 4. 验证任务
 
-必做部分约 10–15 分钟。以下任务都在 Web 聊天页面里完成，按顺序做。标 **（选做）** 的任务可以会后继续：实验环境保留 2 天。
+必做部分约 15–20 分钟。以下任务在 Web 页面里完成（D6 在终端），按顺序做。标 **（选做）** 的任务可以会后继续：实验环境保留 2 天。
 
 以 `/` 开头的是命令，由 Router 直接回答，不经过模型；其余输入都是发给 Agent 的问题。模型的回答每次措辞不同，下面的预期结果只描述应该出现的内容。
 
@@ -169,7 +169,94 @@ GitHub token 存在 AgentCore Identity 的 Token Vault 里，属于你这个用�
 - `/auth revoke github` 回复「已清除 GitHub 的授权。下次用到时会重新请你授权，可以换一个账号。」，并提示 GitHub 那边的授权记录仍在，可以到 GitHub 的 Settings → Applications 里删除。
 - 再问时，「授权 GitHub」按钮重新出现。点击后 GitHub 不再显示授权页面就直接完成了：你在 GitHub 那边对这个 App 的授权还在。想换一个 GitHub 账号授权，要先在 GitHub 的 **Settings → Applications → Authorized OAuth Apps** 里撤销这个 App。
 
-## D. 更多（选做）
+## D. 工具层访问限制
+
+上面的工具，Agent 想用就能用。企业里还常要规定某些东西工具不能碰，而且要在工具执行的那一层拒绝，而不是在提示词里提醒模型别去。这一节给 Web 搜索加一条全局限制，由挂在 Web 搜索网关上的 AgentCore Policy 执行：每次工具调用执行前，Gateway 用 Cedar 规则判断放行还是拒绝。
+
+### D1. 打开访问控制页
+
+**操作**：点击页面右上角 **访问控制**。
+
+**预期结果**：页面按工具分块，每个工具分两层：
+
+- **全局**：对所有人生效，只有管理员（`admins` 组）能改。
+- **仅我自己**：只对你生效。Web Search 不读取任何人自己的数据，所以这一层写明它只有全局限制。
+
+「Web Search 工具」一块的标题旁写着「域名」和「Policy 模式：拒绝执行」，列表是空的。
+
+### D2. 限制一个域名
+
+**操作**：在「全局」的输入框里填 `ietf.org`，点击 **添加**。
+
+**预期结果**：
+
+- 几秒后提示「已添加 ietf.org。」，列表出现 `ietf.org`，添加者是 `admin@agentcore.local`。
+- 状态行显示「拦截规则：正在应用…」，约 20 秒后变成「拦截规则：已生效。」，再做 D3。
+
+这一下改了网关上的两层，都通过 API 修改，不需要重新部署：
+
+- **结果过滤**：Web 搜索连接器在网关 target 上的排除列表。几秒内生效，来自 `ietf.org` 及其子域名的结果不再返回，调用方无法覆盖。
+- **调用拦截**：Policy 引擎里的 Cedar 规则 `forbid_blocked_domains`。查询词或指定来源里点名这个域名的搜索，在执行前就被拒绝。它比结果过滤慢，因为 Policy 引擎每次修改都先校验规则，包括一轮自动推理分析，约 16 秒。
+
+![限制 ietf.org 之后的访问控制页](images/04-access-control.png)
+
+### D3. 点名被限制的域名：执行前被拒
+
+**操作**：点击右上角 **返回对话**，发送「只调用一次 Web 搜索，查询词原样用：datatracker.ietf.org RFC 2606。被拒绝就停下，告诉我工具返回的原话，不要换查询词重试。」
+
+**预期结果**：Agent 回答这次搜索被策略拒绝，工具返回的原话类似：
+
+```text
+Tool Execution Denied: Tool call not allowed due to policy enforcement [Policy evaluation denied due to forbid_blocked_domains-…]
+```
+
+![点名被限制域名的搜索被 Policy 拒绝](images/04-policy-denied.png)
+
+搜索没有执行：Gateway 在调用连接器之前，用 Cedar 规则评估了这次调用的输入，也就是查询词。
+
+不加最后那句要求时，模型被拒后常会换个查询词再搜一次，不再点名这个域名。这次搜索会通过，但搜索结果里仍然没有 `ietf.org`：这正是 D4 要看的第二层。回答里如果还出现 `ietf.org` 的链接，那是模型凭自己的知识写的，不是搜索结果。
+
+### D4. 不点名：结果被过滤
+
+**操作**：发送「只调用一次 Web 搜索，查询词：RFC 2606 reserved top level domains example test invalid。列出返回结果的全部链接」。
+
+**预期结果**：搜索正常执行，回答列出约 10 个链接，其中没有 `ietf.org` 或它的子域名（如 `datatracker.ietf.org`）。
+
+为什么要两层：Policy 只看调用的输入，看不到结果；一个不点名的查询照样会搜到这个网站，结果要由排除列表过滤。
+
+### D5. 移除限制，对照（选做）
+
+**操作**：在访问控制页点击 `ietf.org` 那一行的 **移除**。等到出现「已移除。」，并且状态行变空（列表里还有别的域名时显示「已生效」），再回到对话发送一次 D4 的问题。
+
+**预期结果**：结果里重新出现几条 `ietf.org` 的链接。这说明 D4 里它们是被过滤掉的，而不是本来就搜不到。
+
+### D6. 查看 Cedar 规则（选做）
+
+**操作**：做过 D5 的，先按 D2 把 `ietf.org` 加回来。然后在终端运行下面的命令。`agentcore_fullstack_websearch` 来自默认的 `DEPLOYMENT_NAME`：改过它的，把 `agentcore_fullstack` 换成你的名字（`-` 换成 `_`）；用 profile 的，每条命令加上 `--profile <PROFILE>`。
+
+```bash
+PE=$(aws bedrock-agentcore-control list-policy-engines --region us-east-1 \
+  --query "policyEngines[?name=='agentcore_fullstack_websearch'].policyEngineId" --output text)
+aws bedrock-agentcore-control list-policies --region us-east-1 --policy-engine-id "$PE" \
+  --query 'policies[].[name,status]' --output text
+aws bedrock-agentcore-control get-policy --region us-east-1 --policy-engine-id "$PE" \
+  --policy-id "$(aws bedrock-agentcore-control list-policies --region us-east-1 --policy-engine-id "$PE" \
+    --query "policies[?name=='forbid_blocked_domains'].policyId" --output text)" \
+  --query 'definition.cedar.statement' --output text
+```
+
+**预期结果**：
+
+- 引擎里有两条规则：`baseline_permit` 和 `forbid_blocked_domains`，状态都是 `ACTIVE`。Policy 引擎默认拒绝一切，`baseline_permit` 先放行这个网关上的调用，`forbid` 再把命中的拿掉：`forbid` 永远优先。
+- `forbid_blocked_domains` 的内容是一条 Cedar `forbid`，动作是 `web-search-tool___WebSearch`，条件是查询词在域名能出现的位置包含 `ietf.org`，或者调用指定的来源里有它。
+
+`.env` 里设 `WEB_SEARCH_POLICY_MODE=log_only` 再部署，引擎就只记录判定、不拒绝。上线新规则前可以先这样观察一段时间。
+
+### 不经过 Gateway 的工具
+
+Lark 的工具不经过 Gateway：Gateway 不能把每个用户自己的 token 交给运行在 Runtime 上的 MCP server。所以 Lark 文档和文件夹的限制用另一套方案：Cedar 规则存在 Amazon Verified Permissions 里，由 lark-cli 的 MCP server 在每次文档调用前检查，支持「文件夹含其下所有内容」和每个用户自己的规则。本实验不接 Lark；接入后，同一个访问控制页会多出「Lark 工具」一块。设计见 [docs/architecture.md](https://github.com/aws-samples/sample-general-agent-on-agentcore-fullstack/blob/main/docs/architecture.md#tool-layer-protection-what-the-agents-tools-may-not-touch)。
+
+## E. 更多（选做）
 
 - **图片输入**：点击输入框左边的 **＋**，选一张图片，问「图里有什么？」。Agent 能看到这张图片，并且只在这一轮看到它，后续轮次不会重复计费。
 - **刷新页面**：刷新后最近的对话、生成的图片和视频仍在。
