@@ -61,7 +61,7 @@ Ten layers, each with a real implementation rather than a stub — that is the "
 | **Session state** | what it remembers *within* a conversation | DynamoDB checkpoints, written per superstep, so a turn cut off at the 15-minute cap resumes |
 | **Long-term memory** | what it remembers *across* conversations | **AgentCore Memory** via `remember`/`recall` — written only when the model decides a fact should outlast the chat |
 | **Persistent storage** | what survives the container, and whose it is | **S3 Files**, one Access Point per user, mounted at `/mnt/workspace`; isolated at the microVM boundary, not by agent code |
-| **Tools** | what it can do, and as whom | **MCP servers** on their own Runtimes — `lark-cli` and `google` as the calling user, approvals on the app identity; **Gateway** for web search; **Code Interpreter** for generated code, with `deliver_file` to send a result into the chat and `save_attachment` to open what the user sent; **Browser** for pages that need JavaScript, one browser per conversation |
+| **Tools** | what it can do, and as whom | **MCP servers** on their own Runtimes — `lark-cli` and `google` as the calling user, approvals on the app identity; **Gateway** for web search; **Code Interpreter** for generated code, with `deliver_file` to send a result into the chat and `save_attachment` to open what the user sent; **Browser** for pages that need JavaScript, one browser per conversation. Lark documents and folders a user or admin protects are off limits to the agent, by Cedar policies in **Verified Permissions** checked before every document call; domains an admin blocks are off limits to web search, by **AgentCore Policy** on the Gateway |
 | **Observability** | what it did, and whether it worked | **AgentCore Observability** for traces and logs; a CloudWatch dashboard over platform metrics plus the agent's own — turn outcomes, tool calls by name, self-repairs |
 | **Operations** | how it deploys and tears down | CDK for what CloudFormation covers, control-plane calls for the rest, both ordered by one `./deploy.sh` |
 
@@ -77,7 +77,7 @@ Lark is optional too. Leave the `LARK_*` keys empty and set `WEBUI=true`, and th
 |---|---|
 | `app.py`, `cdk.json` | CDK app (uv-managed deps). Deployment state goes to `.cdk-state.<DEPLOYMENT_NAME>.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
-| `stacks/` | security, agentcore, router, shim, gateway, observability, plus sandbox, webui and network when their flags are on |
+| `stacks/` | security, agentcore, router, shim, gateway, observability, plus protection with Lark, and sandbox, webui and network when their flags are on |
 | `agent/` | the agent container, file by file below |
 | `webui/` | the web chat page and the admin page (`admin.html`, who may sign in) — static files sharing `login.js`, no build step; deploy-time values arrive as `config.js` |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |

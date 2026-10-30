@@ -161,6 +161,20 @@ This repo has no Gateway `mcpServer` target (its Gateway fronts only the Web Sea
 - Send `MCP-Protocol-Version: <version>` on **every** request after `initialize` (the gateway is otherwise stateless about it and falls back to an older version, 400 `-32042`).
 - Tool names are target-prefixed: `<targetName>___<toolName>`.
 
+## AgentCore Policy on a Gateway
+
+Measured 2026-10-29 in us-east-1 on the Web Search Gateway (`AWS_IAM` inbound):
+
+- **It judges a call's input, before the tool runs, never its result.** Default deny, `forbid` wins. A denial is the JSON-RPC error `-32002 "Tool Execution Denied: … [Policy evaluation denied due to <policy>]"`; `tools/list` is unaffected.
+- **Names:** action `AgentCore::Action::"<targetName>___<toolName>"`, resource `AgentCore::Gateway::"<gateway arn>"`, principal `AgentCore::IamEntity` for an `AWS_IAM` caller. The arguments are `context.input`.
+- **Attaching an engine is an `UpdateGateway`, which replaces the whole configuration:** every field is sent back. The Gateway's role needs `bedrock-agentcore:GetPolicyEngine` on the engine and `AuthorizeAction` / `PartiallyAuthorizeActions` on the Gateway's own ARN, or the update is refused.
+- **Writing a policy needs `ManageResourceScopedPolicy` and `InvokeGateway` on the Gateway it names**, besides `CreatePolicy` / `UpdatePolicy` on the engine. Without the first the call is refused; without the second it is accepted and then fails validation (`UPDATE_FAILED`, "Insufficient permissions to call gateway"), since the engine checks the statement against the Gateway as the caller. The Service Authorization Reference lists neither; the [policy permissions page](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-permissions.html) does.
+- **Validation:** a baseline `permit` fails as "Overly Permissive" unless created with `IGNORE_ALL_FINDINGS`; a `forbid` is "Overly Restrictive" until a `permit` exists, so the permit goes first.
+- **A policy takes effect asynchronously.** Measured 2026-10-30, one-condition `forbid`: create or update to `ACTIVE` in ~16 s with `FAIL_ON_ANY_FINDINGS` and ~6 s with `IGNORE_ALL_FINDINGS` (the extra ~10 s is the automated-reasoning analysis); delete to gone in 4–5 s, and a policy of the same name cannot be created until then. The API calls return in under a second.
+- **Policies change by API with no Gateway update**, so rules can be edited live. An `UpdateGateway` is only needed to attach the engine or change its mode (`ENFORCE` / `LOG_ONLY`).
+- **The Web Search connector's admin `domainFilter.exclude`** (`parameterValues` on the target) is unioned with a caller's filter, covers subdomains, and a caller cannot override it.
+- **A Gateway's authorizer type cannot be updated**; changing it means recreating the Gateway.
+
 ## The credential-delivery limit that shapes this repo
 
 This is the one identity-adjacent finding kept here, because it decides the topology: **a Runtime-hosted MCP server cannot be handed a per-user token by the Gateway.**

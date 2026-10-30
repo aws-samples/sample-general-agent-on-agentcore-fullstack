@@ -131,6 +131,82 @@ The split is forced by where the tool server runs, not by a missing Gateway feat
 
 Web search needs none of it — with no user identity to forward, `GATEWAY_IAM_ROLE` is enough. The connector is only offered in **us-east-1**, so its gateway lives there even when the rest of the stack doesn't. Two IAM actions are required: `InvokeGateway` on the gateway, and `InvokeWebSearch` on `…:aws:tool/web-search.v1`, whose account segment is the literal `aws`, not yours. `WEB_SEARCH=false` skips it entirely and the agent runs without the tool.
 
+## Tool-layer protection: what the agent's tools may not touch
+
+A rule such as "this document is off limits" or "never search this site" is enforced where the tool call is executed, in code, before it runs. A prompt could not carry it. The two tool paths above get one enforcement point each, both written in Cedar:
+
+| | Lark documents and folders | Web Search domains |
+|---|---|---|
+| Path | direct to the lark-cli Runtime | through the AgentCore Gateway |
+| Enforced by | the lark-cli server, against **Amazon Verified Permissions** | the Gateway's **AgentCore Policy** engine |
+| Rules | per user and for everyone; a folder covers what is beneath it | for everyone |
+| Managed on | `/protect` in Lark chat, and the web page's 访问控制 (access control) | the same page, admins only |
+
+**Why two mechanisms:** AgentCore Policy judges a Gateway call's input with no entity hierarchy, so it cannot say "anything inside this folder", and the Lark tools cannot sit behind the Gateway (a Runtime-hosted MCP server cannot be handed a per-user token, see above). Verified Permissions takes the entities, and their parents, from the caller.
+
+### Lark: Cedar in Verified Permissions, checked by the lark-cli server
+
+The agent acts as the user in Lark, and a user token reaches everything that user can see: Lark's scopes are per API type, not per resource.
+
+**Rules are Cedar policies in Amazon Verified Permissions** (`stacks/protection_stack.py`), created only from two templates:
+
+```cedar
+permit(principal, action, resource);                                // baseline: Lark's own permissions still apply
+forbid(principal, action, resource in ?resource);                  // an admin's rule: everyone
+forbid(principal == ?principal, action, resource in ?resource);    // a user's rule: their own Lark account
+```
+
+`forbid` wins, so a user cannot override an admin's rule. The principal is `Lark::User::"<app_id>/<open_id>"`, scoped to the app because an `open_id` is per app. A resource is a `Lark::Document` or a `Lark::Folder`, and `in` covers the resource itself and everything beneath it. The actions are `read`, `list` and `write`.
+
+**The lark-cli server enforces** (`mcp-servers/lark-cli/guard.js`):
+
+- **Who:** the principal comes from Lark's `user_info`, asked with the user's own token, never from the caller.
+- **Where a document sits:** Lark has no "which folder is this document in" API, so each protected folder is listed downward with the caller's token, cached for a minute. The folders above each document become its parent entities. A document created in, or moved into, a protected folder is covered within a minute.
+- **Deciding:** each read, write, listing and search result goes to `BatchIsAuthorized`. Denied entries are dropped from listings and search.
+- **Failing closed:** an error inside a policy counts as a denial, because Cedar skips an erroring policy while the baseline `permit` still matches. AVP unreachable, or a listing failing for a passing reason, refuses the call and says it could not be checked. A protected folder the user cannot list, or that is gone, adds nothing.
+
+**`lark_api`, the raw passthrough, keeps every Lark API** (`mcp-servers/lark-cli/routes.js`):
+
+- **Which calls are checked:** any call into a document family (Drive, Docs, Docx, Sheets, Bitable, Wiki, Minutes, Board, search). `doc_routes.json` lists each such API's method and path, generated from the official Node SDK (`gen_doc_routes.py`) plus older APIs Lark still serves: Sheets v2 (cell reads and writes), legacy Docs and the Drive explorer.
+- **What is checked:** every document or folder token the call names, in the path, the query or anywhere in the body, under any spelling of the field (`folder_token`, `folderToken`). A `GET` is a `read`; anything else, a `write`: editing, creating in a folder, moving, copying, deleting, sharing.
+- **Refused rather than guessed:** a document-family path not in the table, a watched field that does not hold a token, and a path that Lark or lark-cli could rewrite into a different one (`://`, `//`, dot segments, percent-encoding). Everything outside the document families (messages, calendar, contacts) runs untouched.
+- **Listings** a call returns (Drive files, the explorer, Drive search, batch metadata) are filtered like the document tools'.
+
+**Rules are managed outside the model:**
+
+- **In Lark chat:** `/protect <link>`, `/unprotect <link>` and `/protected`.
+- **On the web page:** 访问控制 (access control) shows users their own rules, and admins (`admins` group) the organization's as well.
+- **Ownership:** the router writes rules with the owner taken from the caller's verified identity. A web user's Lark account is read by the agent, which holds the grant. A delete checks the stored principal.
+- **No tool writes:** the execution role every MCP Runtime shares may read the policy store but never write it. No tool, and so no model, changes a rule.
+- **Audit:** every change and every denial is logged with the actor, the Lark account and the resource.
+
+**Limits:**
+
+- A rule takes effect within seconds and is not retroactive: anything read earlier stays in the conversation, memory or workspace.
+- A document shared with the user on its own, inside a folder they cannot list, is not seen as inside that folder.
+- Wiki pages, and sheets or boards embedded in a protected document under their own tokens, are not protectable on their own.
+- This stops the agent fetching a protected document, not content a user pastes into the chat.
+
+### Web Search: AgentCore Policy on the Gateway
+
+Admins block a domain on the access page; the router (`lambda/router/websearch.py`) applies it to two layers of the Web Search Gateway by API call, live within seconds and with no redeploy:
+
+- **Results:** the connector's admin exclude list on the target. Results from the domain or its subdomains never come back, whatever the query, and a caller cannot override it. This list is the record of what is blocked.
+- **Calls:** a Cedar `forbid` in the Gateway's policy engine. A search whose query, or whose `include` filter, names the domain is denied before it runs, with `-32002 Tool Execution Denied`:
+
+```cedar
+forbid(principal, action == AgentCore::Action::"web-search-tool___WebSearch", resource == AgentCore::Gateway::"<arn>") when {
+  context.input.query like "example.com*" || context.input.query like "* example.com*" ||
+  context.input.query like "*.example.com*" || context.input.query like "*/example.com*" || context.input.query like "*@example.com*" ||
+  (context.input has filters && context.input.filters has domainFilter &&
+   context.input.filters.domainFilter has include && context.input.filters.domainFilter.include.containsAny(["example.com"]))
+};
+```
+
+- **Engine:** `scripts/websearch_policy.py` creates it with a baseline `permit` (the engine denies by default) and attaches it in `WEB_SEARCH_POLICY_MODE`: `enforce`, or `log_only`, which records decisions and denies nothing. The router writes only the forbid and the exclude list, never the Gateway, so it needs no `iam:PassRole`.
+- **Sync:** each layer is applied asynchronously (the forbid takes about 16 s to validate) and a policy cannot be written while a write is in flight, so the router waits out the previous one. The page shows when the forbid is still validating, failed, or no longer matches the list, and offers to re-apply it.
+- **Limits:** the call layer matches a domain only where a host name can start (blocking `x.com` leaves `netflix.com` alone), case-sensitively, so it misses `EXAMPLE.COM` and a domain run into other text (`关于x.com`); the results layer is what holds. A domain is validated as a host name before it becomes a Cedar literal; an entry set outside the page that is not one only filters results.
+
 ## Approvals: where the user's identity cannot be passed through
 
 Everything above rests on the downstream call carrying the user's own token. Lark's approval API breaks that, and this demo exists to show what an agent must do when a downstream API refuses an end-user identity — a situation that recurs well beyond Lark.
